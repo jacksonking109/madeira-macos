@@ -741,8 +741,12 @@ int main(void) {
         ID3D12Resource *srctex = NULL, *trt = NULL, *tpix = NULL, *tup = NULL, *tcb = NULL;
         ID3D12Device_CreateCommittedResource(dev, &thp, D3D12_HEAP_FLAG_NONE, &ttd,
                 D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&srctex);
+        /* wine-lab port: an RTV needs ALLOW_RENDER_TARGET (D3D12 rule; Metal maps
+         * it to MTLTextureUsageRenderTarget, which the validation layer requires
+         * of every colour attachment). */
+        ttd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         ID3D12Device_CreateCommittedResource(dev, &thp, D3D12_HEAP_FLAG_NONE, &ttd,
-                D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&trt);
+                D3D12_RESOURCE_STATE_RENDER_TARGET, NULL, &IID_ID3D12Resource, (void **)&trt);
         CHECK(srctex && trt, "sampled texture and render target created");
 
         D3D12_RESOURCE_DESC tbd; ZeroMemory(&tbd, sizeof tbd);
