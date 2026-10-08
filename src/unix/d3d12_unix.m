@@ -22,6 +22,9 @@ typedef NTSTATUS (*unixlib_entry_t)(void *args);
 #define STATUS_NOT_IMPLEMENTED ((NTSTATUS)0xC0000002)
 #include "madeira_ext.h"
 #include "madeira_ir_abi.h"
+#include "madeira_cfg.h"
+
+int madeira_ir_convert(void *args);   /* madeira_ir_unix.mm */
 
 static MTLPixelFormat to_metal_pixel_format(enum WMTPixelFormat format)
 {
@@ -227,9 +230,10 @@ static NTSTATUS new_geometry_emulation_pipeline_state(void *args)
 
 /* ---- control and blits ------------------------------------------------- */
 
-/* Config reads come from the environment: madeira.cfg key "upload-swap" is
- * MADEIRA_UPLOAD_SWAP. Everything else (frame capture, overlay switches,
- * shared perf counters) is off in this port. */
+/* Config reads: an environment override (madeira.cfg key "upload-swap" is
+ * MADEIRA_UPLOAD_SWAP), else madeira.cfg in $MADEIRA_DOCS_DIR (default
+ * ~/Documents). Everything else (frame capture, overlay switches, shared perf
+ * counters) is off in this port. */
 static NTSTATUS ctl(void *args)
 {
     struct madeira_ctl_args *a = args;
@@ -241,8 +245,11 @@ static NTSTATUS ctl(void *args)
         for (k = a->name; *k && q < env + sizeof(env) - 1; k++, q++)
             *q = (*k == '-' || *k == '.') ? '_' : (char)((*k >= 'a' && *k <= 'z') ? *k - 32 : *k);
         *q = 0;
-        if ((v = getenv(env)) && a->ptr && a->len) {
+        if (!a->ptr || !a->len) break;
+        if ((v = getenv(env))) {
             snprintf((char *)(uintptr_t)a->ptr, a->len, "%s", v);
+            a->ret = 1;
+        } else if (madeira_cfg_get(a->name, (char *)(uintptr_t)a->ptr, a->len)) {
             a->ret = 1;
         }
         break;
@@ -265,11 +272,8 @@ static NTSTATUS ctl(void *args)
 
 static NTSTATUS ir_convert(void *args)
 {
-    struct madeira_ir_convert_args *a = args;
-    static int said;
-    if (!said++) fprintf(stderr, "[d3d12.so] Metal Shader Converter service not ported yet\n");
-    (void)a;
-    return STATUS_NOT_IMPLEMENTED;
+    madeira_ir_convert(args);   /* the outcome travels in ret_status */
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS blit_t2b(void *args)

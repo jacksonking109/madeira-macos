@@ -17,7 +17,7 @@
  * arrives in the arguments rather than being read from the local device. */
 #include <dlfcn.h>
 #include <mach-o/loader.h>   /* ml1990: LC_UUID of the converter dylib */
-#include "../../../build/madeira_cfg.h"   /* ml1095: one config file */
+#include "madeira_cfg.h"   /* ml1095: one config file (wine-lab port: local copy) */
 #include <sys/stat.h>
 #include <dirent.h>
 #include <time.h>
@@ -116,9 +116,22 @@ static void ir_load_once(void) {
     if (g_ir.handle) goto bind;
 #endif
     @autoreleasepool {
+#ifdef MADEIRA_WINE_MACOS
+        /* wine-lab port: $MADEIRA_MSC_DYLIB, else the converter next to this
+         * library (lib/wine/x86_64-unix/libmetalirconverter.dylib). */
+        NSString *p = nil;
+        const char *env = getenv("MADEIRA_MSC_DYLIB");
+        Dl_info self_info;
+        if (env) p = [NSString stringWithUTF8String:env];
+        else if (dladdr((const void *)ir_load_once, &self_info) && self_info.dli_fname)
+            p = [[[NSString stringWithUTF8String:self_info.dli_fname] stringByDeletingLastPathComponent]
+                    stringByAppendingPathComponent:@"libmetalirconverter.dylib"];
+        if (p) g_ir.handle = dlopen([p UTF8String], RTLD_NOW | RTLD_LOCAL);
+#else
         NSString *base = [[NSBundle mainBundle] bundlePath];
         NSString *p = [base stringByAppendingPathComponent:@"d3d12/libmetalirconverter.dylib"];
         g_ir.handle = dlopen([p UTF8String], RTLD_NOW | RTLD_LOCAL);
+#endif
         if (!g_ir.handle) {
             /* Also try a plain name: a development build may have it on the
              * loader path rather than in the bundle. Named either way. */
@@ -231,7 +244,9 @@ static IRDescriptorRangeType map_range(uint32_t t) {
  * guesses at it disagreed with the measured layout in opposite directions. The
  * header is already on this file's include path, and the compiler lives in the
  * SAME Mach-O image as this function, so no dlopen and no restated layout. */
+#ifndef MADEIRA_NO_AIRCONV
 #include "airconv_public.h"
+#endif
 
 enum mad_container { MAD_CONTAINER_BAD = 0, MAD_CONTAINER_DXIL, MAD_CONTAINER_SM5 };
 
@@ -315,11 +330,13 @@ static void mad_air_entry_name(const unsigned char *b, size_t len, char *out, si
 extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
                                    char *note, size_t note_cap);
 
+#ifndef MADEIRA_NO_AIRCONV
 extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
                                       const struct madeira_ir_input_layout *L,
                                       struct SM50_IA_INPUT_ELEMENT *out, uint32_t out_cap,
                                       uint32_t *n_out, uint32_t *slot_mask_out,
                                       char *note, size_t note_cap);
+#endif
 
 /* ---------------------------------------------------------------------------
  * ml1020: a disk cache for the DXBC backend.
@@ -595,6 +612,7 @@ static int mad_vsps_fill_enabled(void)
     return cached;
 }
 
+#ifndef MADEIRA_NO_AIRCONV
 /* ml1083: one shader's declaration ranges, in the runtime's record format, with
  * the same refusals mad_airconv_convert has always applied (singletons in
  * register space 0 only). Returns a madeira_ir_status. */
@@ -1212,6 +1230,17 @@ done:
     a->ret_status = (uint32_t)status;
     return status;
 }
+#else /* MADEIRA_NO_AIRCONV */
+/* wine-lab port: built without DXMT's in-tree DXBC compiler (it needs LLVM),
+ * so shader-model 5.x DXBC is refused; DXIL goes through Apple's converter. */
+static int mad_airconv_convert(struct madeira_ir_convert_args *a, const unsigned char *bc, size_t bclen)
+{
+    (void)bc; (void)bclen;
+    snprintf(a->ret_note, sizeof a->ret_note, "DXBC shaders need the airconv backend, not in this build");
+    a->ret_status = MADEIRA_IR_UNSUPPORTED;
+    return MADEIRA_IR_UNSUPPORTED;
+}
+#endif /* MADEIRA_NO_AIRCONV */
 
 /* ---------------------------------------------------------------------------
  * ml1990: DXIL conversion reuse (see madeira_dxil_cache.h for the key).
@@ -1921,3 +1950,14 @@ extern "C" int madeira_ir_convert(void *args) {
     madeira_ir_convert_impl((struct madeira_ir_convert_args *)args);
     return 0;   /* the call itself succeeded; ret_status carries the outcome */
 }
+
+#ifdef MADEIRA_NO_AGS
+/* wine-lab port: madeira_ags.cpp (AMD AGS intrinsic rewriting) needs LLVM 15;
+ * without it, DXIL goes to the converter unmodified. */
+extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
+                                   char *note, size_t note_cap)
+{
+    (void)bc; (void)len; (void)out; (void)out_len; (void)note; (void)note_cap;
+    return 0;
+}
+#endif
