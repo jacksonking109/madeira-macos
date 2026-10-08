@@ -815,6 +815,9 @@ int main(void) {
             svd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             svd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
             svd.Texture2D.MipLevels = 1;
+            /* wine-lab port: a zero mapping reads component 0 into all four
+             * channels (RRRR), which the runtime now honours as a swizzle. */
+            svd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             ID3D12Device_CreateShaderResourceView(dev, srctex, &svd, sh);
 
             D3D12_SAMPLER_DESC smd; ZeroMemory(&smd, sizeof smd);

@@ -189,6 +189,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     svd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     svd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     svd.Texture2D.MipLevels = 1;
+    svd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;   /* wine-lab port: zero is RRRR */
     ID3D12Device_CreateShaderResourceView(dev, tex, &svd, srv_cpu);
 
     /* Point sampling, so a stretched or misaligned checker reads as hard edges
