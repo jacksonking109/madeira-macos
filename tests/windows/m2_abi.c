@@ -381,6 +381,7 @@ int main(void) {
         pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         pd.SampleDesc.Count = 1;
         pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        test_pso_defaults(&pd, FALSE);   /* wine-lab port: a zeroed desc has write mask 0 */
 
         ID3D12PipelineState *pso = NULL;
         hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
@@ -534,6 +535,7 @@ int main(void) {
         cpd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
         cpd.SampleDesc.Count = 1;
         cpd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        test_pso_defaults(&cpd, TRUE);   /* wine-lab port: "depth state" must be asked for; zero is DepthEnable FALSE */
         ID3D12PipelineState *cpso = NULL;
         hr = ID3D12Device_CreateGraphicsPipelineState(dev, &cpd, &IID_ID3D12PipelineState, (void **)&cpso);
         CHECK(SUCCEEDED(hr) && cpso, "cube pipeline created with a depth format (%#lx)", hr);
@@ -725,6 +727,7 @@ int main(void) {
         tpd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         tpd.SampleDesc.Count = 1;
         tpd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        test_pso_defaults(&tpd, FALSE);
         ID3D12PipelineState *tpso = NULL;
         hr = ID3D12Device_CreateGraphicsPipelineState(dev, &tpd, &IID_ID3D12PipelineState, (void **)&tpso);
         CHECK(SUCCEEDED(hr) && tpso, "textured pipeline created from converted DXIL (%#lx)", hr);

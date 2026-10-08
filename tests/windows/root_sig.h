@@ -82,4 +82,33 @@ static ID3D12RootSignature *make_textured_root_sig(ID3D12Device *dev, pfn_serial
     return rs;
 }
 
+/* wine-lab port: the D3D12 pipeline defaults (CD3DX12_DEFAULT) that a zeroed
+ * D3D12_GRAPHICS_PIPELINE_STATE_DESC does NOT give. Zero means something in
+ * D3D12: RenderTargetWriteMask 0 writes no colour channel, DepthEnable 0 turns
+ * the depth test off. The runtime used to ignore the blend and depth state (a
+ * fixed device-wide depth state), so zeroed descs happened to draw; it now
+ * honours them as D3D12 does, and the zeroed test pipelines drew nothing. Cull
+ * is NONE rather than CD3DX12's BACK so the cube's depth check stays a depth
+ * check (both faces reach the depth test). */
+static void test_pso_defaults(D3D12_GRAPHICS_PIPELINE_STATE_DESC *pd, BOOL depth) {
+    UINT i;
+    pd->SampleMask = 0xffffffffu;
+    pd->RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd->RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd->RasterizerState.DepthClipEnable = TRUE;
+    for (i = 0; i < 8; i++) {
+        D3D12_RENDER_TARGET_BLEND_DESC *b = &pd->BlendState.RenderTarget[i];
+        b->SrcBlend = b->SrcBlendAlpha = D3D12_BLEND_ONE;
+        b->DestBlend = b->DestBlendAlpha = D3D12_BLEND_ZERO;
+        b->BlendOp = b->BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        b->LogicOp = D3D12_LOGIC_OP_NOOP;
+        b->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    if (depth) {
+        pd->DepthStencilState.DepthEnable = TRUE;
+        pd->DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pd->DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    }
+}
+
 #endif

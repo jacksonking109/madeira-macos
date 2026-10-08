@@ -101,6 +101,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show) {
     pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
     pd.SampleDesc.Count = 1;
     pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    test_pso_defaults(&pd, TRUE);   /* wine-lab port: zeroed blend/depth state draws nothing / no depth test */
     ID3D12PipelineState *pso = NULL;
     hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
     if (FAILED(hr) || !pso) { printf("cube: no pipeline %#lx\n", hr); return 1; }
