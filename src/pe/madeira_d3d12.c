@@ -5610,7 +5610,7 @@ static BOOL mad_tile_based_answer(void) {
     return v ? TRUE : FALSE;
 }
 
-static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
+static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport_impl(ID3D12Device *This,
         D3D12_FEATURE feature, void *data, UINT size) {
     (void)This;
     if (!data) return E_INVALIDARG;
@@ -5868,6 +5868,23 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
         return E_INVALIDARG;
     }
     }
+}
+
+/* wine-lab port: madeira.cfg trace-features = 1 logs every CheckFeatureSupport query and the
+ * first bytes of the answer (engines decide whether to keep a D3D12 device from these). */
+static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
+        D3D12_FEATURE feature, void *data, UINT size) {
+    static int trace = -1;
+    HRESULT hr = device_CheckFeatureSupport_impl(This, feature, data, size);
+    if (trace < 0) trace = mad_cfg_int_pe("trace-features", 0) ? 1 : 0;
+    if (trace) {
+        char hex[3 * 48 + 1]; UINT i, n = size < 48 ? size : 48;
+        for (i = 0; i < n && data; i++) snprintf(hex + 3 * i, 4, "%02x ", ((const unsigned char *)data)[i]);
+        hex[3 * n] = 0;
+        d3d12_log("[madeira-d3d12] trace CheckFeatureSupport(feature %u, %u bytes) -> %#lx: %s\n",
+                  (unsigned)feature, size, (unsigned long)hr, hex);
+    }
+    return hr;
 }
 static ULONG STDMETHODCALLTYPE device_AddRef(ID3D12Device *This) { return mad_addref((struct mad_obj *)This); }
 static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
