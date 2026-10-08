@@ -1465,6 +1465,7 @@ static void exec_query_resolve(struct mad_exec *e, const struct mad_cmd *c);
 static void mad_vis_flush(struct mad_queue *q, obj_handle_t cb);
 
 static long long mad_cfg_int_pe(const char *key, long long dflt);
+static D3D_FEATURE_LEVEL mad_max_feature_level(void);   /* wine-lab port */
 /* ml1091 */
 static int g_fence_chain = -1;   /* ml1110: madeira.cfg fence-chain = 0 disables the per-encoder fence (perf experiment; expect flicker) */
 static obj_handle_t mad_enc_fence(struct mad_device *d) {
@@ -5692,9 +5693,9 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport(ID3D12Device *This,
             f->MaxSupportedFeatureLevel = (D3D_FEATURE_LEVEL)0;
             for (i = 0; f->pFeatureLevelsRequested && i < f->NumFeatureLevels; i++) {
                 D3D_FEATURE_LEVEL lv = f->pFeatureLevelsRequested[i];
-                if (lv <= D3D_FEATURE_LEVEL_12_0 && lv > f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = lv;
+                if (lv <= mad_max_feature_level() && lv > f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = lv;
             }
-            if (!f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = D3D_FEATURE_LEVEL_12_0;
+            if (!f->MaxSupportedFeatureLevel) f->MaxSupportedFeatureLevel = mad_max_feature_level();
         }
         return S_OK;
     }
@@ -12024,6 +12025,20 @@ __declspec(dllexport) void MadeiraD3D12GetQueueStats(ID3D12CommandQueue *queue,
     if (rejected) *rejected = q->rejected;
 }
 
+/* wine-lab port: madeira.cfg d3d12-max-feature-level (MADEIRA_D3D12_MAX_FEATURE_LEVEL), default
+ * 0xc000 (12_0). Some engines (Unity 6's D3D12 device filter) insist on 12_1; 0xc100 claims it
+ * without the conservative rasterization / ROV support 12_1 formally implies -- opt-in only. */
+static D3D_FEATURE_LEVEL mad_max_feature_level(void) {
+    static LONG cached;
+    if (!cached) {
+        LONG v = (LONG)mad_cfg_int_pe("d3d12-max-feature-level", D3D_FEATURE_LEVEL_12_0);
+        if (v != D3D_FEATURE_LEVEL_12_1) v = D3D_FEATURE_LEVEL_12_0;
+        InterlockedExchange(&cached, v);
+    }
+    return (D3D_FEATURE_LEVEL)cached;
+}
+
+
 __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
         D3D_FEATURE_LEVEL min_feature_level, REFIID riid, void **device) {
     build_vtables();
@@ -12031,8 +12046,8 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12CreateDevice(IUnknown *adapter,
     /* The design is explicit that accepting the controlled sample's requested
      * baseline is a documented limitation, not a conformance claim. Anything
      * above 11_0 is refused rather than quietly accepted. */
-    if (min_feature_level > D3D_FEATURE_LEVEL_12_0) {
-        d3d12_log("[madeira-d3d12] feature level %#x refused; 12_0 is the ceiling claimed\n", min_feature_level);
+    if (min_feature_level > mad_max_feature_level()) {   /* wine-lab port: configurable ceiling */
+        d3d12_log("[madeira-d3d12] feature level %#x refused; %#x is the ceiling claimed\n", min_feature_level, mad_max_feature_level());
         return E_NOTIMPL;
     }
     if (!device) return S_FALSE;   /* the documented "is it supported" probe */
