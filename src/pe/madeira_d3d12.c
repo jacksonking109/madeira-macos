@@ -101,6 +101,16 @@ static void d3d12_log(const char *fmt, ...) {
     fputs(buf, stderr);
     fflush(stderr);
 }
+/* wine-lab port: the refusals that returned E_NOTIMPL with no log line now name their source
+ * line once each, so an engine's "device failed (80004001)" can be traced. */
+static HRESULT mad_silent_notimpl(int line) {
+    static int seen[64]; static LONG n;
+    LONG i;
+    for (i = 0; i < n; i++) if (seen[i] == line) return E_NOTIMPL;
+    if (n < 64) seen[InterlockedIncrement(&n) - 1] = line;
+    d3d12_log("[madeira-d3d12] E_NOTIMPL from madeira_d3d12.c:%d\n", line);
+    return E_NOTIMPL;
+}
 
 void madeira_d3d12_note_unimplemented(const char *iface, const char *method) {
     /* Rate limiting is per call site rather than global: one chatty method must
@@ -5976,7 +5986,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(ID3D12Device *Thi
         D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **out) {
     (void)This;
     if (!out) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (!mad_list_type_ok(type)) return mad_silent_notimpl(__LINE__);
     struct mad_alloc *a = calloc(1, sizeof *a);
     if (!a) return E_OUTOFMEMORY;
     a->type = type;
@@ -5991,7 +6001,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
         ID3D12PipelineState *pso, REFIID riid, void **out) {
     (void)This; (void)node; (void)pso;
     if (!out || !allocator) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (!mad_list_type_ok(type)) return mad_silent_notimpl(__LINE__);
     if (((struct mad_alloc *)allocator)->type != type) return E_INVALIDARG;
     struct mad_list *l = calloc(1, sizeof *l);
     if (!l) return E_OUTOFMEMORY;
@@ -6011,7 +6021,13 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
         D3D12_FENCE_FLAGS flags, REFIID riid, void **out) {
     (void)This;
     if (!out) return E_INVALIDARG;
-    if (flags != D3D12_FENCE_FLAG_NONE) return E_NOTIMPL;
+    if (flags != D3D12_FENCE_FLAG_NONE) {
+        /* wine-lab port: Unity 6 asks for a SHARED fence and treats a refusal as a lost device.
+         * Create an ordinary one; actually sharing it (CreateSharedHandle) still fails, loudly. */
+        static LONG said;
+        if (!InterlockedExchange(&said, 1))
+            d3d12_log("[madeira-d3d12] CreateFence flags %#x: created as an unshared fence\n", (unsigned)flags);
+    }
     struct mad_fence *f = calloc(1, sizeof *f);
     if (!f) return E_OUTOFMEMORY;
     f->vtbl = &g_fence_vtbl; f->refs = 1; f->iid = &IID_ID3D12Fence; f->name = "Fence";
@@ -7972,7 +7988,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
                 d3d12_log("[madeira-d3d12] CreateRootSignature: implausible descriptor range count "
                           "(parameter %u asks for %u, running total %u, sane bound %u)\n",
                           i, nr, total_ranges, (unsigned)MAD_ROOT_RANGE_SANE);
-                return E_NOTIMPL;
+                return mad_silent_notimpl(__LINE__);
             }
             total_ranges += nr;
         }
@@ -8068,7 +8084,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
                 d3d12_log("[madeira-d3d12] CreateRootSignature: range count disagrees with the pre-pass "
                           "(%u + %u > %u) -- refusing\n", r->nranges, nr, total_ranges);
                 rootsig_Release((ID3D12RootSignature *)r);
-                return E_NOTIMPL;
+                return mad_silent_notimpl(__LINE__);
             }
             r->params[i].type = MADEIRA_IR_PARAM_TABLE;
             r->params[i].first_range = r->nranges;
@@ -8294,7 +8310,7 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
     if (bad) { RSD_REFUSE("[d3d12-rsdeser] truncated RTS0 header\n"); return E_INVALIDARG; }
     if (version == 3) {   /* 1.2 adds a flags word per static sampler; not read here */
         RSD_REFUSE("[d3d12-rsdeser] root signature version 1.2 is not supported\n");
-        return E_NOTIMPL;
+        return mad_silent_notimpl(__LINE__);
     }
     if (version != 1 && version != 2) {
         RSD_REFUSE("[d3d12-rsdeser] unknown root signature version %u\n", version);
@@ -8302,12 +8318,12 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
     }
     if (nsampler > 32) {
         RSD_REFUSE("[d3d12-rsdeser] %u static samplers exceeds the 32 this build handles\n", nsampler);
-        return E_NOTIMPL;
+        return mad_silent_notimpl(__LINE__);
     }
     if (nparam > MAD_ROOT_PARAM_MAX) {
         RSD_REFUSE("[d3d12-rsdeser] %u parameters exceeds the %u this build handles\n",
                    nparam, (unsigned)MAD_ROOT_PARAM_MAX);
-        return E_NOTIMPL;
+        return mad_silent_notimpl(__LINE__);
     }
     /* Pre-pass: validate the parameter headers and count the ranges, so the
      * blocks are sized to this blob and a corrupt count cannot become a huge
@@ -8328,7 +8344,7 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
             RSD_REFUSE("[d3d12-rsdeser] implausible descriptor range count "
                        "(parameter %u asks for %u, running total %u, sane bound %u)\n",
                        i, nr, total_ranges, (unsigned)MAD_ROOT_RANGE_SANE);
-            return E_NOTIMPL;
+            return mad_silent_notimpl(__LINE__);
         }
         total_ranges += nr;
     }
@@ -11233,7 +11249,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource1(ID3D12Device10 
         const D3D12_HEAP_PROPERTIES *hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC *desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear,
         ID3D12ProtectedResourceSession *session, REFIID riid, void **out) {
-    if (session) return E_NOTIMPL;
+    if (session) return mad_silent_notimpl(__LINE__);
     return device_CreateCommittedResource((ID3D12Device *)This, hp, hf, desc, state, clear, riid, out);
 }
 static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource2(ID3D12Device10 *This,
@@ -11241,7 +11257,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource2(ID3D12Device10 
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear,
         ID3D12ProtectedResourceSession *session, REFIID riid, void **out) {
     D3D12_RESOURCE_DESC d;
-    if (session || !desc1) return E_NOTIMPL;
+    if (session || !desc1) return mad_silent_notimpl(__LINE__);
     mad_desc1_to_desc(desc1, &d);
     return device_CreateCommittedResource((ID3D12Device *)This, hp, hf, &d, state, clear, riid, out);
 }
@@ -11251,7 +11267,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource3(ID3D12Device10 
         ID3D12ProtectedResourceSession *session, UINT32 ncast, DXGI_FORMAT *cast, REFIID riid, void **out) {
     D3D12_RESOURCE_DESC d;
     (void)layout; (void)cast;
-    if (session || ncast || !desc1) return E_NOTIMPL;
+    if (session || ncast || !desc1) return mad_silent_notimpl(__LINE__);
     mad_desc1_to_desc(desc1, &d);
     return device_CreateCommittedResource((ID3D12Device *)This, hp, hf, &d, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
 }
@@ -11420,14 +11436,14 @@ static HRESULT STDMETHODCALLTYPE device_CreateReservedResource(ID3D12Device10 *T
 static HRESULT STDMETHODCALLTYPE device_CreateReservedResource1(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc,
         D3D12_RESOURCE_STATES state, const D3D12_CLEAR_VALUE *clear, ID3D12ProtectedResourceSession *session, REFIID riid, void **out) {
     if (!mad_tiled_on()) return stub_ID3D12Device10_CreateReservedResource1(This, desc, state, clear, session, riid, out);
-    if (session) return E_NOTIMPL;   /* as CreateCommittedResource1 */
+    if (session) return mad_silent_notimpl(__LINE__);   /* as CreateCommittedResource1 */
     return mad_create_reserved((struct mad_device *)This, desc, riid, out, "CreateReservedResource1");
 }
 static HRESULT STDMETHODCALLTYPE device_CreateReservedResource2(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc,
         D3D12_BARRIER_LAYOUT layout, const D3D12_CLEAR_VALUE *clear, ID3D12ProtectedResourceSession *session,
         UINT32 ncast, DXGI_FORMAT *cast, REFIID riid, void **out) {
     if (!mad_tiled_on()) return stub_ID3D12Device10_CreateReservedResource2(This, desc, layout, clear, session, ncast, cast, riid, out);
-    if (session || ncast) return E_NOTIMPL;   /* as CreateCommittedResource3 */
+    if (session || ncast) return mad_silent_notimpl(__LINE__);   /* as CreateCommittedResource3 */
     return mad_create_reserved((struct mad_device *)This, desc, riid, out, "CreateReservedResource2");
 }
 /* A resource that was not created reserved has no tiling: zeros, as nothing
@@ -11481,7 +11497,7 @@ static void STDMETHODCALLTYPE queue_CopyTileMappings(ID3D12CommandQueue *This, I
 
 static HRESULT STDMETHODCALLTYPE device_CreateHeap1(ID3D12Device10 *This, const D3D12_HEAP_DESC *desc,
         ID3D12ProtectedResourceSession *session, REFIID riid, void **out) {
-    if (session) return E_NOTIMPL;
+    if (session) return mad_silent_notimpl(__LINE__);
     return device_CreateHeap((ID3D12Device *)This, desc, riid, out);
 }
 static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource1(ID3D12Device10 *This, ID3D12Heap *heap,
@@ -11497,7 +11513,7 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource2(ID3D12Device10 *Th
         const D3D12_CLEAR_VALUE *clear, UINT32 ncast, DXGI_FORMAT *cast, REFIID riid, void **out) {
     D3D12_RESOURCE_DESC d;
     (void)layout; (void)cast;
-    if (!desc1 || ncast) return E_NOTIMPL;
+    if (!desc1 || ncast) return mad_silent_notimpl(__LINE__);
     mad_desc1_to_desc(desc1, &d);
     return device_CreatePlacedResource((ID3D12Device *)This, heap, offset, &d, D3D12_RESOURCE_STATE_COMMON, clear, riid, out);
 }
@@ -11552,7 +11568,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList1(ID3D12Device10 *This,
     (void)node;
     if (!out) return E_INVALIDARG;
     if (flags != D3D12_COMMAND_LIST_FLAG_NONE) return E_INVALIDARG;
-    if (!mad_list_type_ok(type)) return E_NOTIMPL;
+    if (!mad_list_type_ok(type)) return mad_silent_notimpl(__LINE__);
     struct mad_list *l = calloc(1, sizeof *l);
     if (!l) return E_OUTOFMEMORY;
     l->type = type;
@@ -13068,7 +13084,7 @@ static HRESULT mad_serialize_any(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v,
                     d3d12_log("[madeira-d3d12] D3D12SerializeRootSignature: range count disagrees with the pre-count "
                               "(%u + %u > %u)\n", nr, p0->DescriptorTable.NumDescriptorRanges, want);
                     free(ranges);
-                    return E_NOTIMPL;
+                    return mad_silent_notimpl(__LINE__);
                 }
                 params[i].DescriptorTable.NumDescriptorRanges = p0->DescriptorTable.NumDescriptorRanges;
                 params[i].DescriptorTable.pDescriptorRanges = ranges + nr;
