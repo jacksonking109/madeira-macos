@@ -51,7 +51,7 @@ struct WMTGeometryEmulationInfo {
     char fragment_function[MADEIRA_FN_LEN];
     uint32_t gs_vertex_size_bytes;
     uint32_t gs_max_input_primitives;
-    uint32_t max_tessellation_factor;
+    float max_tessellation_factor;  /* wine-lab port: float, as max_tessellation_factor_fc is */
     uint32_t tessellation;
 };
 

@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 /* What Wine's unixlib.h provides; DXMT's unix side defines these itself too. */
@@ -218,13 +219,213 @@ static NTSTATUS new_render_pipeline_state_vd(void *args)
     return STATUS_SUCCESS;
 }
 
+/* wine-lab port: Metal Shader Converter geometry/tessellation emulation.
+ *
+ * Builds the object/mesh pipeline IRRuntimeNewGeometryEmulationPipeline and
+ * IRRuntimeNewGeometryTessellationEmulationPipeline build (Apple's
+ * metal_irconverter_runtime.h, Apache-2.0; followed, not included, since its
+ * Objective-C path assumes ARC and this file is MRC), as Madeira's rmetald does
+ * for RM_OP_NEW_GEOM_PSO_INFO:
+ *
+ *   geometry (ge->tessellation == 0): object = "<vs>.dxil_irconverter_object_shader"
+ *     specialised with tessellationEnabled = NO; mesh = the geometry function with
+ *     vertex_shader_output_size_fc; the stage-in function linked to the object stage.
+ *   tessellation (ge->tessellation != 0): object = the same with tessellationEnabled
+ *     = YES, linking irconverter_stage_in_shader and the hull library's
+ *     irconverter_hull_shader; mesh = the geometry function, or with no geometry
+ *     library of its own (madeira_d3d12.c passes the domain library for both) the
+ *     domain library's passthrough named by geometry_function, linking the hull
+ *     library's irconverter_tessellator and the domain library's
+ *     irconverter_dxil_domain_shader.
+ *
+ * madeira_d3d12.c then encodes DrawMeshThreadgroups with the converter's draw
+ * contract (mad_gs_draw / mad_ts_draw). Returns the PSO (+1) and any NSError
+ * retained, like new_render_pipeline_state_vd. */
+static NSError *geom_error(NSString *fmt, ...)
+{
+    NSString *msg;
+    va_list ap;
+    va_start(ap, fmt);
+    msg = [[[NSString alloc] initWithFormat:fmt arguments:ap] autorelease];
+    va_end(ap);
+    return [NSError errorWithDomain:@"madeira.d3d12.geometry-emulation" code:1
+                           userInfo:@{ NSLocalizedDescriptionKey : msg }];
+}
+
+/* A mesh pipeline must have a fragment function (Metal asserts on a nil one,
+ * where a vertex pipeline accepts it), so a pipeline without a pixel shader
+ * (depth-only passes) gets an empty one. One per device, kept for the process. */
+static id<MTLFunction> empty_fragment_function(id<MTLDevice> dev)
+{
+    static id<MTLDevice> cached_dev;
+    static id<MTLFunction> cached_fn;
+    id<MTLFunction> fn = nil;
+    @synchronized ([MTLMeshRenderPipelineDescriptor class]) {
+        if (cached_dev == dev && cached_fn) {
+            fn = cached_fn;
+        } else {
+            NSError *e = nil;
+            id<MTLLibrary> l = [dev newLibraryWithSource:@"fragment void madeira_empty_fragment() {}" options:nil error:&e];
+            fn = [l newFunctionWithName:@"madeira_empty_fragment"];
+            [l release];
+            if (fn) {
+                [cached_fn release];
+                [cached_dev release];
+                cached_fn = fn;
+                cached_dev = [dev retain];
+            }
+        }
+    }
+    return fn;
+}
+
 static NTSTATUS new_geometry_emulation_pipeline_state(void *args)
 {
     struct madeira_unix_pso_params *p = args;
-    static int said;
-    if (!said++) fprintf(stderr, "[d3d12.so] geometry/tessellation emulation pipelines are not ported yet\n");
+    const struct WMTMeshRenderPipelineInfo *info = (const void *)(uintptr_t)p->info;
+    const struct WMTGeometryEmulationInfo *ge = (const void *)(uintptr_t)p->extra;
+    id<MTLRenderPipelineState> pso = nil;
+    NSError *err = nil;
+
     p->ret_pso = 0;
     p->ret_error = 0;
+    if (!info || !ge) return STATUS_SUCCESS;
+
+    @autoreleasepool {
+        id<MTLDevice> dev = (id<MTLDevice>)p->device;
+        id<MTLLibrary> Ls = (id<MTLLibrary>)ge->stagein_library, Lv = (id<MTLLibrary>)ge->vertex_library;
+        id<MTLLibrary> Lg = (id<MTLLibrary>)ge->geometry_library, Lf = (id<MTLLibrary>)ge->fragment_library;
+        id<MTLLibrary> Lh = (id<MTLLibrary>)ge->hull_library, Ld = (id<MTLLibrary>)ge->domain_library;
+        NSString *vsname = [NSString stringWithFormat:@"%.*s.dxil_irconverter_object_shader", MADEIRA_FN_LEN, ge->vertex_function];
+        NSString *gsname = [[[NSString alloc] initWithBytes:ge->geometry_function
+                                                     length:strnlen(ge->geometry_function, MADEIRA_FN_LEN)
+                                                   encoding:NSUTF8StringEncoding] autorelease];
+        NSString *psname = [[[NSString alloc] initWithBytes:ge->fragment_function
+                                                     length:strnlen(ge->fragment_function, MADEIRA_FN_LEN)
+                                                   encoding:NSUTF8StringEncoding] autorelease];
+        MTLMeshRenderPipelineDescriptor *d = [[[MTLMeshRenderPipelineDescriptor alloc] init] autorelease];
+        MTLFunctionConstantValues *cv = [[[MTLFunctionConstantValues alloc] init] autorelease];
+        id<MTLFunction> fsi = nil, fo = nil, fm = nil, ff = nil, fh = nil, ft = nil, fd = nil;
+        int vsz = (int)ge->gs_vertex_size_bytes;
+        BOOL tess = ge->tessellation != 0;
+        unsigned i;
+
+        for (i = 0; i < 8; i++) {
+            d.colorAttachments[i].pixelFormat = to_metal_pixel_format(info->colors[i].pixel_format);
+            d.colorAttachments[i].blendingEnabled = info->colors[i].blending_enabled;
+            d.colorAttachments[i].writeMask = (MTLColorWriteMask)info->colors[i].write_mask;
+            d.colorAttachments[i].alphaBlendOperation = (MTLBlendOperation)info->colors[i].alpha_blend_operation;
+            d.colorAttachments[i].rgbBlendOperation = (MTLBlendOperation)info->colors[i].rgb_blend_operation;
+            d.colorAttachments[i].sourceRGBBlendFactor = (MTLBlendFactor)info->colors[i].src_rgb_blend_factor;
+            d.colorAttachments[i].sourceAlphaBlendFactor = (MTLBlendFactor)info->colors[i].src_alpha_blend_factor;
+            d.colorAttachments[i].destinationRGBBlendFactor = (MTLBlendFactor)info->colors[i].dst_rgb_blend_factor;
+            d.colorAttachments[i].destinationAlphaBlendFactor = (MTLBlendFactor)info->colors[i].dst_alpha_blend_factor;
+        }
+        for (i = 0; i < 31; i++) {
+            if (info->immutable_object_buffers & (1u << i)) d.objectBuffers[i].mutability = MTLMutabilityImmutable;
+            if (info->immutable_mesh_buffers & (1u << i)) d.meshBuffers[i].mutability = MTLMutabilityImmutable;
+            if (info->immutable_fragment_buffers & (1u << i)) d.fragmentBuffers[i].mutability = MTLMutabilityImmutable;
+        }
+        d.depthAttachmentPixelFormat = to_metal_pixel_format(info->depth_pixel_format);
+        d.stencilAttachmentPixelFormat = to_metal_pixel_format(info->stencil_pixel_format);
+        d.alphaToCoverageEnabled = info->alpha_to_coverage_enabled;
+        d.rasterizationEnabled = info->rasterization_enabled;
+        d.rasterSampleCount = info->raster_sample_count ? info->raster_sample_count : 1;
+        if (info->payload_memory_length) d.payloadMemoryLength = info->payload_memory_length;
+        d.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->mesh_tgsize_is_multiple_of_sgwidth;
+        d.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->object_tgsize_is_multiple_of_sgwidth;
+
+        /* Metal aborts the process (not an exception) on a mesh descriptor without
+         * a mesh function, so every lookup is checked before the pipeline call. */
+        if (!dev || !Lv || !gsname.length || (!Lg && !tess) || (tess && (!Ls || !Lh || !Ld))) {
+            err = geom_error(@"%s pipeline is missing a library or name (stage-in %d vertex %d geometry %d fragment %d hull %d domain %d, gs '%@')",
+                             tess ? "tessellation" : "geometry", !!Ls, !!Lv, !!Lg, !!Lf, !!Lh, !!Ld, gsname);
+            goto done;
+        }
+
+        if (!tess) {
+            BOOL off = NO;
+            /* The stage-in library holds one function; a vertex stage without an
+             * input layout may come without one, and then nothing is linked. */
+            if (Ls && Ls.functionNames.count) fsi = [[Ls newFunctionWithName:Ls.functionNames.firstObject] autorelease];
+            if (Ls && !fsi) { err = geom_error(@"stage-in library has no function"); goto done; }
+            [cv setConstantValue:&off type:MTLDataTypeBool withName:@"tessellationEnabled"];
+            fo = [[Lv newFunctionWithName:vsname constantValues:cv error:&err] autorelease];
+            if (!fo) { if (!err) err = geom_error(@"object function '%@' not found", vsname); goto done; }
+            [cv setConstantValue:&vsz type:MTLDataTypeInt withName:@"vertex_shader_output_size_fc"];
+            fm = [[Lg newFunctionWithName:gsname constantValues:cv error:&err] autorelease];
+            if (!fm) { if (!err) err = geom_error(@"mesh (geometry) function '%@' not found", gsname); goto done; }
+            if (fsi) {
+                MTLLinkedFunctions *lf = [MTLLinkedFunctions linkedFunctions];
+                lf.functions = @[ fsi ];
+                d.objectLinkedFunctions = lf;
+            }
+        } else {
+            BOOL on = YES, so = NO;
+            float maxf = ge->max_tessellation_factor;
+            MTLFunctionConstantValues *hc = [[[MTLFunctionConstantValues alloc] init] autorelease];
+            MTLLinkedFunctions *olf = [MTLLinkedFunctions linkedFunctions], *mlf = [MTLLinkedFunctions linkedFunctions];
+
+            fsi = [[Ls newFunctionWithName:@"irconverter_stage_in_shader"] autorelease];
+            if (!fsi) { err = geom_error(@"stage-in library has no irconverter_stage_in_shader"); goto done; }
+            fd = [[Ld newFunctionWithName:@"irconverter_dxil_domain_shader"] autorelease];
+            if (!fd) { err = geom_error(@"domain library has no irconverter_dxil_domain_shader"); goto done; }
+            [cv setConstantValue:&on type:MTLDataTypeBool withName:@"tessellationEnabled"];
+            fo = [[Lv newFunctionWithName:vsname constantValues:cv error:&err] autorelease];
+            if (!fo) { if (!err) err = geom_error(@"object function '%@' not found", vsname); goto done; }
+            /* The hull library holds the hull function (control point and patch
+             * constant phases) and the tessellator. */
+            if (!(maxf >= 1.0f && maxf <= 64.0f)) maxf = 64.0f;
+            [hc setConstantValue:&vsz type:MTLDataTypeInt withName:@"vertex_shader_output_size_fc"];
+            [hc setConstantValue:&maxf type:MTLDataTypeFloat withName:@"max_tessellation_factor_fc"];
+            fh = [[Lh newFunctionWithName:@"irconverter_hull_shader" constantValues:hc error:&err] autorelease];
+            if (!fh) { if (!err) err = geom_error(@"hull library has no irconverter_hull_shader"); goto done; }
+            ft = [[Lh newFunctionWithName:@"irconverter_tessellator" constantValues:hc error:&err] autorelease];
+            if (!ft) { if (!err) err = geom_error(@"hull library has no irconverter_tessellator"); goto done; }
+            if (Lg && Lg != Ld) {   /* a real geometry stage after the domain stage */
+                MTLFunctionConstantValues *gc = [[[MTLFunctionConstantValues alloc] init] autorelease];
+                [gc setConstantValue:&on type:MTLDataTypeBool withName:@"tessellationEnabled"];
+                [gc setConstantValue:&so type:MTLDataTypeBool withName:@"streamOutEnabled"];
+                [gc setConstantValue:&vsz type:MTLDataTypeInt withName:@"vertex_shader_output_size_fc"];
+                fm = [[Lg newFunctionWithName:gsname constantValues:gc error:&err] autorelease];
+            } else {                /* kIR{Triangle,Line,Point}PassthroughGeometryShader */
+                fm = [[Ld newFunctionWithName:gsname] autorelease];
+            }
+            if (!fm) { if (!err) err = geom_error(@"mesh (geometry) function '%@' not found", gsname); goto done; }
+            olf.functions = @[ fsi, fh ];
+            d.objectLinkedFunctions = olf;
+            mlf.functions = @[ ft, fd ];
+            d.meshLinkedFunctions = mlf;
+        }
+
+        if (psname.length) {
+            ff = Lf ? [[Lf newFunctionWithName:psname] autorelease] : nil;
+            if (!ff) { err = geom_error(@"fragment function '%@' not found", psname); goto done; }
+        } else if (info->fragment_function) {
+            ff = (id<MTLFunction>)info->fragment_function;
+        } else if (!(ff = empty_fragment_function(dev))) {
+            err = geom_error(@"no pixel shader, and the empty fragment function did not compile");
+            goto done;
+        }
+
+        d.objectFunction = fo;
+        d.meshFunction = fm;
+        d.fragmentFunction = ff;
+        err = nil;
+        pso = [dev newRenderPipelineStateWithMeshDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&err];
+        if (pso) err = nil;
+    done:
+        [err retain];   /* outlives the pool; the caller owns it, as with new_render_pipeline_state_vd */
+    }
+    if (!pso) {
+        static unsigned said;
+        if (said++ < 8) @autoreleasepool {
+            fprintf(stderr, "[d3d12.so] %s emulation pipeline failed: %s\n", ge->tessellation ? "tessellation" : "geometry",
+                    err ? [[err localizedDescription] UTF8String] : "(no error)");
+        }
+    }
+    p->ret_pso = (obj_handle_t)pso;
+    p->ret_error = (obj_handle_t)err;
     return STATUS_SUCCESS;
 }
 
