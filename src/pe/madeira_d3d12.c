@@ -32,6 +32,7 @@
  * the D3D12 path inherits the working local/remote split rather than growing a
  * second transport, which the design asks for explicitly. */
 #include "winemetal.h"
+#include "madeira_ext.h"   /* wine-lab port: Metal calls beyond DXMT v0.80, served by d3d12.so */
 
 #include "madeira_d3d12_stubs.h"
 #include "madeira_ir_abi.h"
@@ -1842,7 +1843,7 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     k.type = WMTBlitCommandCopyFromTextureToBuffer;
     k.src = r->texture; k.slice = v->slice; k.level = v->level;
     k.size.width = w; k.size.height = h; k.size.depth = 1;
-    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)total; k.options = options;
+    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)total; (void)options;   /* wine-lab port: DXMT v0.80 has no blit options; capture-only path */
     MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
     if (!mad_grow((void **)&g_capbufs, &g_capbufs_cap, g_ncapbufs + 1, sizeof *g_capbufs)) { NSObject_release(buf); return; }
     cb = &g_capbufs[g_ncapbufs++];
@@ -4328,8 +4329,7 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     k1.origin.x = c->u.tt.sx; k1.origin.y = c->u.tt.sy; k1.origin.z = c->u.tt.sz;
     k1.size.width = c->u.tt.w; k1.size.height = c->u.tt.h; k1.size.depth = c->u.tt.d ? c->u.tt.d : 1;
     k1.dst = dev->ds_scratch; k1.offset = 0; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
-    k1.options = mad_aspect_opt(s, c->u.tt.splane);
-    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k1);
+    madeira_blit_t2b(e->benc, &k1, mad_aspect_opt(s, c->u.tt.splane));   /* wine-lab port: options via d3d12.so */
     exec_end(e);   /* the staging buffer is written, then read: two encoders */
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     memset(&k2, 0, sizeof k2);
@@ -4434,8 +4434,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = c->u.bt.d;
         k.dst = c->u.bt.buf->buffer; k.offset = c->u.bt.off;
         k.bytes_per_row = c->u.bt.row; k.bytes_per_image = c->u.bt.row * c->u.bt.rows;
-        k.options = mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);
-        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        madeira_blit_t2b(e->benc, &k, mad_aspect_opt(c->u.bt.tex, c->u.bt.plane));   /* wine-lab port: options via d3d12.so */
         return;
     }
     case MC_COPY_T2T: {
@@ -12921,7 +12920,10 @@ static void mad_load_d3d12core(void) {
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     (void)inst; (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) { build_vtables(); mad_swap_fill_vtbl(); mad_load_d3d12core(); }
+    if (reason == DLL_PROCESS_ATTACH) {
+        if (!madeira_ext_init()) return FALSE;   /* wine-lab port: connect d3d12.so */
+        build_vtables(); mad_swap_fill_vtbl(); mad_load_d3d12core();
+    }
     return TRUE;
 }
 
