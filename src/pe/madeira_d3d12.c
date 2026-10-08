@@ -5614,6 +5614,9 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport_impl(ID3D12Device *T
         D3D12_FEATURE feature, void *data, UINT size) {
     (void)This;
     if (!data) return E_INVALIDARG;
+    /* wine-lab port: feature 54 (Agility SDK D3D12_FEATURE_D3D12_TIGHT_ALIGNMENT, newer than these
+     * headers) is a single support tier; answer "tier 0, not supported" instead of failing the query. */
+    if ((UINT)feature == 54 && size == 4) { memset(data, 0, 4); return S_OK; }
     switch (feature) {
     case D3D12_FEATURE_D3D12_OPTIONS: {
         D3D12_FEATURE_DATA_D3D12_OPTIONS *o = data;
