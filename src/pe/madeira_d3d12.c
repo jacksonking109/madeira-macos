@@ -1827,7 +1827,11 @@ static void exec_end(struct mad_exec *e) {
     }
     if (e->benc) { MTLCommandEncoder_endEncoding(e->benc); e->benc = 0; }
     if (e->cenc) { MTLCommandEncoder_endEncoding(e->cenc); e->cenc = 0; }
-    if (cdraws && g_capture_on) mad_capture_pass(e, crt, cn, crtp, cdepth, &cdp, cseq);   /* ml1098: after the pass, before anything else */
+    if (cdraws && g_capture_on) {   /* ml1098: after the pass, before anything else */
+        static int passes = -1;     /* wine-lab port: madeira.cfg capture-passes = 0 keeps only targeted (capture-ps/-cs) captures */
+        if (passes < 0) passes = mad_cfg_int_pe("capture-passes", 1) ? 1 : 0;
+        if (passes) mad_capture_pass(e, crt, cn, crtp, cdepth, &cdp, cseq);
+    }
 }
 
 /* ml1098: one attachment -> one shared buffer, one file later. */
@@ -1857,11 +1861,12 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
             return;
         }
     }
-    if (g_cap_bytes + total > MAD_CAPTURE_BUDGET) {
+    {   static UINT64 budget; if (!budget) budget = (UINT64)mad_cfg_int_pe("capture-budget-mb", 384) << 20;   /* wine-lab port */
+    if (g_cap_bytes + total > budget) {
         if (!said_budget++) d3d12_log("[capture] budget of %llu MB reached at enc#%u; later targets of this frame are not captured\n",
-                                      (unsigned long long)(MAD_CAPTURE_BUDGET >> 20), seq);
+                                      (unsigned long long)(budget >> 20), seq);
         return;
-    }
+    } }
     memset(&bi, 0, sizeof bi); bi.length = total; bi.options = WMTResourceStorageModeShared;
     buf = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
     if (!buf || !bi.memory.ptr) { if (buf) NSObject_release(buf); return; }
@@ -12789,6 +12794,11 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
         if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
         memset(&a, 0, sizeof a); a.op = 0; MadeiraCtl(&a);
         if (a.ret) { g_capture_left += a.ret; d3d12_log("[capture] %u frame(s) requested at present #%llu\n", a.ret, (unsigned long long)s->presents); }
+        {   /* wine-lab port: madeira.cfg capture-at = <present number> captures the frame after it (no overlay here) */
+            static LONG64 at = -2;
+            if (at == -2) at = mad_cfg_int_pe("capture-at", -1);
+            if (at >= 0 && (LONG64)s->presents == at) { g_capture_left++; d3d12_log("[capture] capture-at: frame requested at present #%llu\n", (unsigned long long)s->presents); }
+        }
         {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
             int want;
             memset(&a, 0, sizeof a); a.op = 6; MadeiraCtl(&a);

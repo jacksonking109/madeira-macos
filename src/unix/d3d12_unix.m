@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* What Wine's unixlib.h provides; DXMT's unix side defines these itself too. */
 typedef int32_t NTSTATUS;
@@ -452,6 +453,20 @@ static NTSTATUS ctl(void *args)
             a->ret = 1;
         } else if (madeira_cfg_get(a->name, (char *)(uintptr_t)a->ptr, a->len)) {
             a->ret = 1;
+        }
+        break;
+    }
+    case 1: {   /* wine-lab port: frame capture file -> $MADEIRA_DOCS_DIR/capture/<name> */
+        const char *docs = getenv("MADEIRA_DOCS_DIR");
+        char path[1200];
+        FILE *f;
+        if (!docs || !*docs || !a->ptr || !a->len || strchr(a->name, '/')) break;
+        snprintf(path, sizeof path, "%s/capture", docs);
+        mkdir(path, 0755);
+        snprintf(path, sizeof path, "%s/capture/%s", docs, a->name);
+        if ((f = fopen(path, "wb"))) {
+            a->ret = fwrite((const void *)(uintptr_t)a->ptr, 1, a->len, f) == a->len;
+            fclose(f);
         }
         break;
     }
