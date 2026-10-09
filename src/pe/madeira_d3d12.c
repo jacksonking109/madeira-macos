@@ -1171,6 +1171,7 @@ struct mad_cmd {
 };
 
 #define MAD_ARG_RING_BYTES  (64u * 1024u)
+#define MAD_ARG_GRAN        64u    /* wine-lab port: ring allocation granule; a table takes the granules it needs, not a whole slot */
 #define MAD_ARG_SLOT_BYTES  1088u  /* up to 64 dwords of root constants plus 32 root arguments, then ml912 draw params, then the ml927 vertex-buffer table */
 #define MAD_ARG_DRAWPARAMS_OFF 512u /* IRRuntimeDrawParams (20 bytes) at kIRArgumentBufferDrawArgumentsBindPoint */
 #define MAD_ARG_DRAWINFO_OFF   544u /* IRRuntimeDrawInfo (24 bytes; first uint16 = index type) at kIRArgumentBufferUniformsBindPoint */
@@ -1426,6 +1427,7 @@ struct mad_exec {
     struct mad_pso *pso;
     struct mad_rootsig *rs;
     unsigned cap_after;   /* ml918: capture rt[0] texels after the current draw */
+    unsigned char *arg_cpu;   /* wine-lab port: the CPU view of the slot exec_arg_slot_for just filled */
     struct mad_resource *cap_after_cs;   /* ml920: texture to capture after the current dispatch */
     struct { struct mad_resource *r; UINT64 off; char label[96]; } cap_after_buf[6]; unsigned ncap_after_buf;   /* ml922 */
     struct { struct mad_resource *r; UINT slice; char label[96]; } cap_after_tex[6]; unsigned ncap_after_tex;   /* ml924 */
@@ -2482,40 +2484,40 @@ static int mad_list_ring_grow(struct mad_exec *e) {
  * slots were cleared for every table (~6.5 KB per draw, plus an 8 KB useResource
  * array): memset was ~12 % of the submission worker's running samples in the
  * ph-rdr83 profile, and on a power-capped phone the memory traffic costs frames. */
-static int exec_ring_take_z(struct mad_exec *e, unsigned n, size_t zero_bytes, obj_handle_t *buf, UINT64 *off, void **cpu, UINT64 *gpu);
-static int exec_ring_take_n(struct mad_exec *e, unsigned n, obj_handle_t *buf, UINT64 *off, void **cpu, UINT64 *gpu) {
-    return exec_ring_take_z(e, n, (size_t)n * MAD_ARG_SLOT_BYTES, buf, off, cpu, gpu);
-}
-static int exec_ring_take_z(struct mad_exec *e, unsigned n, size_t zero_bytes, obj_handle_t *buf, UINT64 *off, void **cpu, UINT64 *gpu) {
+static int exec_ring_take_z(struct mad_exec *e, size_t bytes, size_t zero_bytes, obj_handle_t *buf, UINT64 *off, void **cpu, UINT64 *gpu);
+/* wine-lab port: RING TABLES BY THE GRANULE. Every table used to take a whole
+ * 1088-byte slot; a DXBC draw takes five or six (draw params, two constant-buffer
+ * tables, two argument tables, a vertex table) and writes a few dozen bytes of
+ * each: 6.5 KB of fresh, cache-cold ring per draw, a new 64 KB chunk (a lock, three
+ * reallocs, a Metal buffer when the pool is dry) every ten draws, and a TLB miss
+ * per table. A table now takes ceil(bytes / 64) granules; 64 divides the old slot
+ * size, so every offset keeps the alignment it had. */
+static int exec_ring_take_z(struct mad_exec *e, size_t bytes, size_t zero_bytes, obj_handle_t *buf, UINT64 *off, void **cpu, UINT64 *gpu) {
     struct mad_list *l = e->l;
-    const unsigned per = MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES;
-    unsigned chunk, slot;
+    const unsigned per = MAD_ARG_RING_BYTES / MAD_ARG_GRAN;
+    unsigned n = (unsigned)((bytes + MAD_ARG_GRAN - 1) / MAD_ARG_GRAN), chunk, gr;
     if (!n || n > per) return 0;
     if ((l->ring_used % per) + n > per) l->ring_used += per - (l->ring_used % per);
     chunk = l->ring_used / per;
-    slot = l->ring_used % per;
+    gr = l->ring_used % per;
     if (chunk >= l->nrings && !mad_list_ring_grow(e)) return 0;   /* ml1061: pooled, GPU-lifetime aware */
-    *cpu = (unsigned char *)l->ring_cpu[chunk] + (size_t)slot * MAD_ARG_SLOT_BYTES;
-    if (zero_bytes > (size_t)n * MAD_ARG_SLOT_BYTES) zero_bytes = (size_t)n * MAD_ARG_SLOT_BYTES;
+    *cpu = (unsigned char *)l->ring_cpu[chunk] + (size_t)gr * MAD_ARG_GRAN;
+    if (zero_bytes > (size_t)n * MAD_ARG_GRAN) zero_bytes = (size_t)n * MAD_ARG_GRAN;
     if (zero_bytes) memset(*cpu, 0, zero_bytes);
     *buf = l->rings[chunk];
-    *off = (UINT64)slot * MAD_ARG_SLOT_BYTES;
+    *off = (UINT64)gr * MAD_ARG_GRAN;
     *gpu = l->ring_gpu[chunk];
     l->ring_used += n;
     return 1;
 }
-static int exec_ring_take(struct mad_exec *e, obj_handle_t *buf, UINT64 *off, void **cpu, UINT64 *gpu) {
-    return exec_ring_take_n(e, 1, buf, off, cpu, gpu);
-}
 
 static int exec_arg_slot_for(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                              const UINT32 (*consts)[64], obj_handle_t *buf, UINT64 *off, const UINT *ovr, const struct mad_pso *pso) {
-    struct mad_list *l = e->l;
-    unsigned chunk = l->ring_used / (MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES);
-    unsigned slot = l->ring_used % (MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES);
-    if (chunk >= l->nrings && !mad_list_ring_grow(e)) return 0;   /* ml1061: pooled, GPU-lifetime aware */
+    void *slot_cpu; UINT64 slot_gpu;
+    if (!exec_ring_take_z(e, MAD_ARG_SLOT_BYTES, 0, buf, off, &slot_cpu, &slot_gpu)) return 0;   /* ml1061: pooled, GPU-lifetime aware */
     {
-        unsigned char *dst = (unsigned char *)l->ring_cpu[chunk] + slot * MAD_ARG_SLOT_BYTES;
+        unsigned char *dst = (unsigned char *)slot_cpu;
+        e->arg_cpu = dst;
         if (rs) {
             UINT offsets[MAD_ROOT_PARAM_MAX], i, end = 0;
             if (ovr) memcpy(offsets, ovr, sizeof offsets); else mad_root_layout(rs, offsets);
@@ -2556,8 +2558,6 @@ static int exec_arg_slot_for(struct mad_exec *e, const struct mad_rootsig *rs, c
             memcpy(dst, root, MAD_ROOT_PARAM_MAX * 8);   /* no signature bound: flat addresses */
         }
     }
-    *buf = l->rings[chunk]; *off = (UINT64)slot * MAD_ARG_SLOT_BYTES;
-    l->ring_used++;
     return 1;
 }
 
@@ -3139,7 +3139,7 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
             if (rg->type != MADEIRA_IR_AIR_CBV) continue;
             if (pp->shader_register != rg->lower_bound || pp->register_space != rg->space) continue;
             n = pp->num_constants > 64 ? 64 : pp->num_constants;
-            if (!exec_ring_take_z(e, 1, 256, &cb, &coff, &ccpu, &cgpu)) { *why = "no ring slot for root constants"; return 0; }   /* ml1130 */
+            if (!exec_ring_take_z(e, 256, 256, &cb, &coff, &ccpu, &cgpu)) { *why = "no ring slot for root constants"; return 0; }   /* ml1130 */
             memcpy(ccpu, consts[i], (size_t)n * 4);
             *direct_va = cgpu + coff;
             return 1;
@@ -3201,7 +3201,7 @@ static int mad_air_build_vb_table_mask(struct mad_exec *e, const struct mad_pso 
     *buf = 0; *off = 0;
     if (!slot_mask) return 1;   /* the shader fetches nothing */
     if (__builtin_popcount(slot_mask) * sizeof *tab > MAD_ARG_SLOT_BYTES) return 0;
-    if (!exec_ring_take_z(e, 1, (size_t)__builtin_popcount(slot_mask) * sizeof *tab, buf, off, &cpu, &gpu)) return 0;   /* ml1130 */
+    if (!exec_ring_take_z(e, (size_t)__builtin_popcount(slot_mask) * sizeof *tab, (size_t)__builtin_popcount(slot_mask) * sizeof *tab, buf, off, &cpu, &gpu)) return 0;   /* ml1130 */
     tab = (struct mad_air_vb_entry *)cpu;
 
     for (slot = 0; slot < 16; slot++) {
@@ -3257,18 +3257,17 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
     if (cb_bind != ~0u) {
         size_t cbz = 8;   /* ml1130: up to the highest constant-buffer entry this stage has */
         for (k = 0; k < nair; k++) if (airv[k].cb_table && ((size_t)airv[k].ptr_offset + 3) * 8 > cbz) cbz = ((size_t)airv[k].ptr_offset + 3) * 8;
-        if (!exec_ring_take_z(e, 1, cbz, cb_buf, cb_off, &cpu, &gpu)) return 0;
+        if (!exec_ring_take_z(e, cbz, cbz, cb_buf, cb_off, &cpu, &gpu)) return 0;
         cb_words = (UINT64 *)cpu;
     }
     if (arg_bind != ~0u) {
-        unsigned nslots = (unsigned)(((UINT64)arg_qwords * 8 + MAD_ARG_SLOT_BYTES - 1) / MAD_ARG_SLOT_BYTES);   /* ml1087 */
-        if (nslots > MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES) {
+        if ((UINT64)arg_qwords * 8 > MAD_ARG_RING_BYTES) {   /* ml1087; wine-lab port: the table is taken by the granule now */
             if (said_fail++ < 8)
                 d3d12_log("[madeira-d3d12] ml1008 '%s' wants a %u-qword argument table; a whole ring chunk holds %u\n",
                           pso->vs_name, arg_qwords, (unsigned)(MAD_ARG_RING_BYTES / 8));
             return 0;
         }
-        if (!exec_ring_take_z(e, nslots ? nslots : 1, (size_t)arg_qwords * 8, arg_buf, arg_off, &cpu, &gpu)) return 0;   /* ml1130 */
+        if (!exec_ring_take_z(e, arg_qwords ? (size_t)arg_qwords * 8 : 8, (size_t)arg_qwords * 8, arg_buf, arg_off, &cpu, &gpu)) return 0;   /* ml1130 */
         arg_words = (UINT64 *)cpu;
     }
 
@@ -3971,7 +3970,7 @@ static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_tess *tv = NULL; unsigned tfmt = 0;   /* ml1083: the tessellation pipeline and index-format variant in use */
     struct wmtcmd_base *tail;
     obj_handle_t argbuf = 0; UINT64 argoff = 0;
-    unsigned nsb = 0, nur = 0, i, arg_slot_used = 0;
+    unsigned nsb = 0, nur = 0, i, dp_off = 0, di_off = 0; unsigned char *arg_cpu = NULL;
     static unsigned said_nopso, said_trunc;
     struct mad_device *dev = e->q->device;
 
@@ -4055,8 +4054,17 @@ static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
         }
     }
 tess_go:
-    if (!exec_arg_slot(e, &argbuf, &argoff)) { MAD_SKIP(e); return; }
-    arg_slot_used = e->l->ring_used - 1;   /* ml1084: the slot exec_arg_slot took, see the draw-params block */
+    /* wine-lab port: a DXBC (airconv) draw reads none of the root-layout slot: its
+     * tables are built below and only the draw parameters (index 4) and draw info
+     * (index 5) come from here, so they get one granule instead of a 1088-byte slot. */
+    if (e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV && !gsemu && !tv) {
+        UINT64 g_unused; void *c_unused;
+        if (!exec_ring_take_z(e, MAD_ARG_GRAN, MAD_ARG_GRAN, &argbuf, &argoff, &c_unused, &g_unused)) { MAD_SKIP(e); return; }
+        arg_cpu = (unsigned char *)c_unused; dp_off = 0; di_off = 32;
+    } else {
+        if (!exec_arg_slot(e, &argbuf, &argoff)) { MAD_SKIP(e); return; }
+        arg_cpu = e->arg_cpu; dp_off = MAD_ARG_DRAWPARAMS_OFF; di_off = MAD_ARG_DRAWINFO_OFF;   /* ml1084: the slot exec_arg_slot took, see the draw-params block */
+    }
     PR_LAP(pr_t, PR_ARGSLOT);
 
     memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = tv ? tv->obj[tfmt].rps : e->pso->rps;
@@ -4118,7 +4126,7 @@ tess_go:
         /* The draw arguments, D3D's own layout (DXMT_DRAW_[INDEXED_]ARGUMENTS):
          * the start index is in ELEMENTS and the index buffer is bound at its
          * view's base, the object function adds the two. */
-        if (!exec_ring_take_z(e, 1, 64, &dab, &daboff, &dcpu, &dgpu)) { MAD_SKIP(e); return; }   /* ml1130 */
+        if (!exec_ring_take_z(e, 64, 64, &dab, &daboff, &dcpu, &dgpu)) { MAD_SKIP(e); return; }   /* ml1130 */
         gs_daboff = daboff;   /* ml1147: the geometry draw re-points object buffer 21 at this offset */
         if (c->kind == MC_DRAW_INDEXED) {
             dp[0] = c->u.drawi.icount; dp[1] = c->u.drawi.inst ? c->u.drawi.inst : 1; dp[2] = c->u.drawi.start;
@@ -4190,7 +4198,6 @@ tess_go:
      * indirect draws the argument buffer itself is bound, as Apple's helper
      * does, so the GPU reads the culling output the draw consumes. */
     if (!tv) {   /* ml1083: a tessellation draw bound its arguments above */
-        struct mad_list *l = e->l;
         /* ml1084: this used to take "the last slot taken" (ring_used - 1), which
          * is the argument slot only on the DXIL path. On the DXBC path the table
          * builders above take up to five more slots after it, so the 20-byte
@@ -4199,8 +4206,7 @@ tess_go:
          * 256 bytes), otherwise the PIXEL argument table, whose 64th qword
          * onwards then read {count, instances, start, ...} instead of texture
          * handles. Write into the slot actually bound at index 4. */
-        unsigned per = MAD_ARG_RING_BYTES / MAD_ARG_SLOT_BYTES, used = arg_slot_used;
-        unsigned char *cpu = (unsigned char *)l->ring_cpu[used / per] + (used % per) * MAD_ARG_SLOT_BYTES;
+        unsigned char *cpu = arg_cpu;
         UINT32 dp[5] = { 0, 0, 0, 0, 0 };
         UINT16 kind = 0;
         if (c->kind == MC_DRAW_INDEXED) {
@@ -4243,13 +4249,13 @@ tess_go:
             memcpy(cpu + MAD_ARG_VBTABLE_OFF, vbt, sizeof vbt);
             MAD_SETBUF(WMTRenderCommandSetObjectBuffer, argbuf, argoff + MAD_ARG_VBTABLE_OFF, 6);
         } else gdi.index_type = kind;
-        memcpy(cpu + MAD_ARG_DRAWPARAMS_OFF, dp, sizeof dp);
-        memcpy(cpu + MAD_ARG_DRAWINFO_OFF, &gdi, sizeof gdi);
+        memcpy(cpu + dp_off, dp, sizeof dp);
+        memcpy(cpu + di_off, &gdi, sizeof gdi);
         if ((c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT) && c->u.ind.args && c->u.ind.args->buffer)
             MAD_SETBUF(WMTRenderCommandSetVertexBuffer, c->u.ind.args->buffer, c->u.ind.off, 4);
         else
-            MAD_SETBUF_VS(argbuf, argoff + MAD_ARG_DRAWPARAMS_OFF, 4);
-        MAD_SETBUF_VS(argbuf, argoff + MAD_ARG_DRAWINFO_OFF, 5);
+            MAD_SETBUF_VS(argbuf, argoff + dp_off, 4);
+        MAD_SETBUF_VS(argbuf, argoff + di_off, 5);
     }
 #undef MAD_SETBUF_VS
 #undef MAD_SETBUF
