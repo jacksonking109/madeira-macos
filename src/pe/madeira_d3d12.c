@@ -1412,6 +1412,21 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
     return (ULONG)r;
 }
 /* ---- execution: replaying a list into Metal encoders -------------------- */
+/* wine-lab port: REDUNDANT-STATE ELISION. What the open render encoder was last told, so a draw
+ * only sends the state that differs: pipeline, viewport, scissor, depth-stencil, blend colour,
+ * rasteriser, and every buffer binding (a binding that keeps its buffer and moves its offset
+ * becomes a setBufferOffset). Each Metal call costs more than building the command. The shadow is
+ * cleared whenever a new encoder begins and whenever a draw built commands it did not encode. */
+struct mad_encsh {
+    obj_handle_t pso; int has_pso;
+    struct WMTViewport vp; int has_vp;
+    struct WMTScissorRect sc; int has_sc;
+    obj_handle_t dsso; int has_dsso;
+    float blend[4]; int has_blend;
+    UINT8 sref; int has_sref;                 /* the stencil reference, set by the depth-stencil and blend commands alike */
+    struct wmtcmd_render_setrasterizerstate ras; int has_ras;
+    struct { obj_handle_t buf; UINT64 off; } buf[4][32];   /* vertex, fragment, object, mesh stage x index */
+};
 struct mad_exec {
     int fence_needed;
     struct mad_resource *wr[64]; unsigned nwr; int wr_all;   /* ml1116: written since the last fence wait (mode 3) */   /* ml1111: fence-chain = 2: a barrier (or list start) was seen since the last wait */
@@ -1427,6 +1442,7 @@ struct mad_exec {
     struct mad_pso *pso;
     struct mad_rootsig *rs;
     unsigned cap_after;   /* ml918: capture rt[0] texels after the current draw */
+    struct mad_encsh sh; int enc_dirty;   /* wine-lab port: redundant-state elision */
     unsigned char *arg_cpu;   /* wine-lab port: the CPU view of the slot exec_arg_slot_for just filled */
     struct mad_resource *cap_after_cs;   /* ml920: texture to capture after the current dispatch */
     struct { struct mad_resource *r; UINT64 off; char label[96]; } cap_after_buf[6]; unsigned ncap_after_buf;   /* ml922 */
@@ -2119,6 +2135,7 @@ static LONG64 g_pr_t[PR_N]; static LONG64 g_pr_draws, g_pr_lists, g_pr_cmds;
 /* QueryPerformanceCounter costs ~0.4 us here (Rosetta), more than most phases; the phase timers read the
  * time stamp counter (a few ns) and the report converts ticks to seconds against QPC over the same interval. */
 static LONG64 g_pr_tsc0, g_pr_qpc0;
+#include <stddef.h>
 #define PR_NOW() ((LONG64)__builtin_ia32_rdtsc())
 static int mad_perf_replay_on(void) {
     if (g_perf_replay < 0) { g_perf_replay = mad_cfg_int_pe("perf-replay", 0) ? 1 : 0;
@@ -2372,6 +2389,7 @@ static int exec_begin_render(struct mad_exec *e) {
             InterlockedExchangeAdd64(rpi.depth.load_action == WMTLoadActionClear ? &g_ac_clear : &g_ac_load, f7_att_bytes(e->depth, e->dp.level));
     }
     e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
+    memset(&e->sh, 0, sizeof e->sh);   /* wine-lab port: a new encoder knows nothing */
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
     for (i = 0; i < e->nrt && e->f6_natt < 8; i++) if (e->rt[i]) e->f6_att[e->f6_natt++] = e->rt[i];
@@ -3957,13 +3975,14 @@ static int mad_use_seen(struct mad_exec *e, obj_handle_t enc, obj_handle_t h, UI
 
 static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
     LONG64 pr_t = g_perf_replay > 0 ? PR_NOW() : 0;   /* perf-replay */
-    struct wmtcmd_render_setpso c_pso;
+    struct wmtcmd_render_setpso c_pso; struct wmtcmd_base c_head; obj_handle_t pso_h;
+    int light_args = 0;
     struct wmtcmd_render_draw_indirect c_di;
     struct wmtcmd_render_setblendcolor c_bl;
     struct wmtcmd_render_draw_indexed_indirect c_dii;
     struct wmtcmd_render_setviewport c_vp;
     struct wmtcmd_render_setscissorrect c_sc;
-    struct wmtcmd_render_setbuffer sb[6 + 16 + 2];
+    union { struct wmtcmd_render_setbuffer b; struct wmtcmd_render_setbufferoffset o; } sb[6 + 16 + 2];
     struct wmtcmd_render_useresource ur[256];
     struct wmtcmd_render_setdsso c_dss;
     struct wmtcmd_render_setrasterizerstate c_ras;
@@ -4060,20 +4079,22 @@ static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
         }
     }
 tess_go:
-    /* wine-lab port: a DXBC (airconv) draw reads none of the root-layout slot: its
-     * tables are built below and only the draw parameters (index 4) and draw info
-     * (index 5) come from here, so they get one granule instead of a 1088-byte slot. */
-    if (e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV && !gsemu && !tv) {
-        UINT64 g_unused; void *c_unused;
-        if (!exec_ring_take_z(e, MAD_ARG_GRAN, MAD_ARG_GRAN, &argbuf, &argoff, &c_unused, &g_unused)) { MAD_SKIP(e); return; }
-        arg_cpu = (unsigned char *)c_unused; dp_off = 0; di_off = 32;
+    e->enc_dirty = 1;   /* wine-lab port: from here the draw may change the shadow of the encoder's state */
+    /* wine-lab port: a plain DXBC (airconv) draw reads none of the root-layout slot, and
+     * neither of the draw parameters (index 4) nor the draw info (index 5) the converter's
+     * runtime contract puts there: DXMT's converted vertex stages take [[base_vertex]] and
+     * [[base_instance]] as attributes, and only its geometry/tessellation stages read draw
+     * arguments (buffer 21, the `tv` path). Its tables are built below. */
+    light_args = e->pso->backend == MADEIRA_IR_BACKEND_AIRCONV && !gsemu && !tv;
+    if (light_args) {
+        /* nothing */
     } else {
         if (!exec_arg_slot(e, &argbuf, &argoff)) { MAD_SKIP(e); return; }
         arg_cpu = e->arg_cpu; dp_off = MAD_ARG_DRAWPARAMS_OFF; di_off = MAD_ARG_DRAWINFO_OFF;   /* ml1084: the slot exec_arg_slot took, see the draw-params block */
     }
     PR_LAP(pr_t, PR_ARGSLOT);
 
-    memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = tv ? tv->obj[tfmt].rps : e->pso->rps;
+    pso_h = tv ? tv->obj[tfmt].rps : e->pso->rps;
     if (e->pso->has_vd && !gsemu && !tv) {
         UINT strides[16];
         /* ml904: a BOUND stream with StrideInBytes 0 means "every vertex reads
@@ -4081,18 +4102,26 @@ tess_go:
          * packed stride, which made the base pass read successive elements of
          * a per-draw constant stream. Unbound slots keep the assumed stride. */
         for (i = 0; i < 16; i++) strides[i] = e->vb[i].res ? e->vb[i].stride : e->pso->vb_stride[i];
-        c_pso.pso = mad_pso_for_strides(e->pso, strides);
-        c_pso.pso = mad_pso_for_targets(e->pso, c_pso.pso, e->enc_rt, e->enc_rtp, e->enc_nrt, strides);   /* wine-lab port */
-    } else if (!gsemu && !tv) c_pso.pso = mad_pso_for_targets(e->pso, c_pso.pso, e->enc_rt, e->enc_rtp, e->enc_nrt, NULL);   /* wine-lab port */
+        pso_h = mad_pso_for_strides(e->pso, strides);
+        pso_h = mad_pso_for_targets(e->pso, pso_h, e->enc_rt, e->enc_rtp, e->enc_nrt, strides);   /* wine-lab port */
+    } else if (!gsemu && !tv) pso_h = mad_pso_for_targets(e->pso, pso_h, e->enc_rt, e->enc_rtp, e->enc_nrt, NULL);   /* wine-lab port */
     PR_LAP(pr_t, PR_PSO);
-    tail = (struct wmtcmd_base *)&c_pso;
+    memset(&c_head, 0, sizeof c_head);   /* a Nop heads the chain: the first real command may be elided */
+    tail = &c_head;
 #define MAD_APPEND(node) do { tail->next.ptr = (node); tail = (struct wmtcmd_base *)(node); } while (0)
+    if (!e->sh.has_pso || e->sh.pso != pso_h) {
+        memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = pso_h;
+        MAD_APPEND(&c_pso);
+        e->sh.pso = pso_h; e->sh.has_pso = 1;
+    }
     if (e->has_vp) {
         memset(&c_vp, 0, sizeof c_vp); c_vp.type = WMTRenderCommandSetViewport;
         c_vp.viewport.originX = e->vp.TopLeftX; c_vp.viewport.originY = e->vp.TopLeftY;
         c_vp.viewport.width = e->vp.Width; c_vp.viewport.height = e->vp.Height;
         c_vp.viewport.znear = e->vp.MinDepth; c_vp.viewport.zfar = e->vp.MaxDepth;
-        MAD_APPEND(&c_vp);
+        if (!e->sh.has_vp || memcmp(&e->sh.vp, &c_vp.viewport, sizeof c_vp.viewport)) {
+            MAD_APPEND(&c_vp); e->sh.vp = c_vp.viewport; e->sh.has_vp = 1;
+        }
     }
     if (e->has_sc) {
         /* Metal refuses a scissor outside the attachment; clamp to it. */
@@ -4106,12 +4135,26 @@ tess_go:
             memset(&c_sc, 0, sizeof c_sc); c_sc.type = WMTRenderCommandSetScissorRect;
             c_sc.scissor_rect.x = (UINT64)x0; c_sc.scissor_rect.y = (UINT64)y0;
             c_sc.scissor_rect.width = (UINT64)(x1 - x0); c_sc.scissor_rect.height = (UINT64)(y1 - y0);
-            MAD_APPEND(&c_sc);
+            if (!e->sh.has_sc || memcmp(&e->sh.sc, &c_sc.scissor_rect, sizeof c_sc.scissor_rect)) {
+                MAD_APPEND(&c_sc); e->sh.sc = c_sc.scissor_rect; e->sh.has_sc = 1;
+            }
         }
     }
-    memset(sb, 0, sizeof sb);
-#define MAD_SETBUF(stage, buf_, off_, idx_) do { sb[nsb].type = (stage); sb[nsb].buffer = (buf_); \
-        sb[nsb].offset = (off_); sb[nsb].index = (idx_); MAD_APPEND(&sb[nsb]); nsb++; } while (0)
+    /* wine-lab port: a binding is sent only when it differs from what the encoder holds; the same
+     * buffer at another offset becomes setBufferOffset. The stage's command type picks the shadow row. */
+#define MAD_SETBUF(stage, buf_, off_, idx_) do { \
+        const int st_ = (stage) == WMTRenderCommandSetVertexBuffer ? 0 : (stage) == WMTRenderCommandSetFragmentBuffer ? 1 : \
+                        (stage) == WMTRenderCommandSetObjectBuffer ? 2 : 3; \
+        const obj_handle_t b_ = (buf_); const UINT64 o_ = (off_); const unsigned i_ = (idx_); \
+        if (i_ >= 32) { memset(&sb[nsb], 0, sizeof sb[nsb]); sb[nsb].b.type = (stage); sb[nsb].b.buffer = b_; sb[nsb].b.offset = o_; sb[nsb].b.index = (uint8_t)i_; MAD_APPEND(&sb[nsb].b); nsb++; } \
+        else if (e->sh.buf[st_][i_].buf == b_ && e->sh.buf[st_][i_].off == o_ && b_) { } \
+        else if (e->sh.buf[st_][i_].buf == b_ && b_) { \
+            memset(&sb[nsb], 0, sizeof sb[nsb]); sb[nsb].o.type = (enum WMTRenderCommandType)((stage) + 1); sb[nsb].o.offset = o_; sb[nsb].o.index = (uint8_t)i_; \
+            MAD_APPEND(&sb[nsb].o); nsb++; e->sh.buf[st_][i_].off = o_; \
+        } else { \
+            memset(&sb[nsb], 0, sizeof sb[nsb]); sb[nsb].b.type = (stage); sb[nsb].b.buffer = b_; sb[nsb].b.offset = o_; sb[nsb].b.index = (uint8_t)i_; \
+            MAD_APPEND(&sb[nsb].b); nsb++; e->sh.buf[st_][i_].buf = b_; e->sh.buf[st_][i_].off = o_; \
+        } } while (0)
     /* kIRArgumentBufferBindPoint 2, descriptor heap 0, sampler heap 1. */
     /* ml927: on a geometry-emulation pipeline the vertex stage is the OBJECT
      * stage and the geometry shader the MESH stage; both take the same
@@ -4203,7 +4246,7 @@ tess_go:
      * shaders were computing their instance ids from an unbound buffer. For
      * indirect draws the argument buffer itself is bound, as Apple's helper
      * does, so the GPU reads the culling output the draw consumes. */
-    if (!tv) {   /* ml1083: a tessellation draw bound its arguments above */
+    if (!tv && !light_args) {   /* ml1083: a tessellation draw bound its arguments above */
         /* ml1084: this used to take "the last slot taken" (ring_used - 1), which
          * is the argument slot only on the DXIL path. On the DXBC path the table
          * builders above take up to five more slots after it, so the 20-byte
@@ -4313,17 +4356,25 @@ tess_go:
         memset(&c_dss, 0, sizeof c_dss); c_dss.type = WMTRenderCommandSetDSSO;
         c_dss.dsso = e->pso->dsso ? e->pso->dsso : dev->dsso;
         c_dss.stencil_ref = (uint8_t)e->stencil_ref;
-        MAD_APPEND(&c_dss);
+        if (!e->sh.has_dsso || e->sh.dsso != c_dss.dsso || !e->sh.has_sref || e->sh.sref != c_dss.stencil_ref) {
+            MAD_APPEND(&c_dss); e->sh.dsso = c_dss.dsso; e->sh.has_dsso = 1; e->sh.sref = c_dss.stencil_ref; e->sh.has_sref = 1;
+        }
     }
     if (e->has_blend) {
         memset(&c_bl, 0, sizeof c_bl); c_bl.type = WMTRenderCommandSetBlendFactorAndStencilRef;
         c_bl.red = e->blend[0]; c_bl.green = e->blend[1]; c_bl.blue = e->blend[2]; c_bl.alpha = e->blend[3];
         c_bl.stencil_ref = (uint8_t)e->stencil_ref;
-        MAD_APPEND(&c_bl);
+        if (!e->sh.has_blend || memcmp(e->sh.blend, e->blend, sizeof e->sh.blend) || !e->sh.has_sref || e->sh.sref != c_bl.stencil_ref) {
+            MAD_APPEND(&c_bl); memcpy(e->sh.blend, e->blend, sizeof e->sh.blend); e->sh.has_blend = 1; e->sh.sref = c_bl.stencil_ref; e->sh.has_sref = 1;
+        }
     }
     c_ras = e->pso->raster;
     c_ras.next.ptr = NULL;
-    MAD_APPEND(&c_ras);
+    if (!e->sh.has_ras || memcmp((const char *)&c_ras + offsetof(struct wmtcmd_render_setrasterizerstate, fill_mode),
+                                 (const char *)&e->sh.ras + offsetof(struct wmtcmd_render_setrasterizerstate, fill_mode),
+                                 sizeof c_ras - offsetof(struct wmtcmd_render_setrasterizerstate, fill_mode))) {
+        MAD_APPEND(&c_ras); e->sh.ras = c_ras; e->sh.has_ras = 1;
+    }
     for (i = 0; i < 16; i++) {
         if (!(e->pso->vb_mask & (1u << i)) || !e->vb[i].res) continue;
         /* ml878: stride differences are handled by mad_pso_for_strides above */
@@ -4481,14 +4532,15 @@ tess_go:
             memset(&c_vis, 0, sizeof c_vis); c_vis.type = WMTRenderCommandSetVisibilityMode;
             if (want == ~(UINT64)0) { c_vis.mode = WMTVisibilityResultModeDisabled; c_vis.offset = 0; }
             else { c_vis.mode = WMTVisibilityResultModeCounting; c_vis.offset = (want % MAD_VIS_SLOTS) * 8; }
-            c_vis.next.ptr = &c_pso;
+            c_vis.next.ptr = &c_head;
             e->vis_prev = want;
             tail->next.ptr = NULL;
             MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_vis);
         } else {
             tail->next.ptr = NULL;
-            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_pso);
+            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_head);
         }
+        e->enc_dirty = 0;
         if (want != ~(UINT64)0) v->dirty = 1;
         PR_LAP(pr_t, PR_ENCODE);
     }
@@ -4522,10 +4574,11 @@ tess_go:
 
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     LONG64 t0;
-    if (g_perf_replay <= 0) { exec_draw_impl(e, c); return; }
+    if (g_perf_replay <= 0) { exec_draw_impl(e, c); if (e->enc_dirty) { e->enc_dirty = 0; memset(&e->sh, 0, sizeof e->sh); } return; }
     t0 = PR_NOW();
     exec_draw_impl(e, c);
     g_pr_t[PR_DRAW] += PR_NOW() - t0; g_pr_draws++;
+    if (e->enc_dirty) { e->enc_dirty = 0; memset(&e->sh, 0, sizeof e->sh); }
 }
 
 /* Depth-stencil plane copies. Metal copies one plane of a combined
@@ -4990,6 +5043,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             e.enc_nrt = c->enc_nrt; e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h;
             e.vis_prev = c->vis_prev; e.enc_vis_buf = c->enc_vis_buf; e.pass_draws = c->pass_draws;
             e.ud_enc = c->ud_enc; e.ud_n = c->ud_n; e.ud_committed = c->ud_committed; memcpy(e.ud, c->ud, sizeof e.ud);
+            memcpy(&e.sh, &c->sh, sizeof e.sh);   /* wine-lab port: and what the encoder was told */
             InterlockedIncrement(&g_pass_carried);
         }
     }
