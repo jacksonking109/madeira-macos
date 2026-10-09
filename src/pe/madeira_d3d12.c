@@ -141,7 +141,7 @@ static unsigned g_enc_seq, g_list_seq, g_dump_draws;
  * G-buffer targets plus depth). Count why encoders end, and estimate the
  * attachment traffic each pass boundary implies. */
 static volatile LONG g_pass_begun, g_pass_end_rts, g_pass_end_clear, g_pass_end_dispatch, g_pass_end_blit, g_pass_end_list,
-                     g_pass_end_attachless, g_pass_clear_only, g_pass_reused;
+                     g_pass_end_attachless, g_pass_clear_only, g_pass_reused, g_pass_carried;
 static volatile LONG64 g_pass_attach_bytes;
 static int g_census_on;   /* ml899: one frame at presents 1500,1700,...,2800 */
 /* ml1098: MANUAL FRAME CAPTURE. The UI asks (MadeiraCtl op 0); the next frame
@@ -1318,11 +1318,13 @@ struct mad_queue {
      * ExecuteCommandLists. The engine submits ~31 lists per frame; each used
      * to be its own command buffer with its own round trips and its own
      * shadow-buffer flush (measured: 6.6 ms per submission = 5 FPS). The open
-     * buffer is committed at Signal, Wait, Present or after open_cap lists. */
+     * buffer is committed at Signal, Wait, Present or after open_cap lists.
+     * wine-lab port: or earlier, see mad_batch_lists. */
     obj_handle_t open_cb;
     UINT64 last_serial;            /* ml1061: serial of the newest committed batch */
     UINT64 batch_serial[64];       /* serial of batch n at [n & 63] */
     unsigned open_lists;
+    unsigned open_draws;           /* wine-lab port: draws and dispatches encoded into open_cb (batch-draws) */
     UINT64 batches;
     /* ml1021: SUBMISSION LOCK.
      *
@@ -1363,6 +1365,9 @@ struct mad_queue {
      * submit_lock (the replay and mad_queue_flush both hold it). */
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; } f6_pend[40]; unsigned f6_npend;
+    /* wine-lab port: the render pass the previous list of this replay left open
+     * (pass-carry), see mad_exec_list. Touched only under submit_lock. */
+    struct mad_exec *carry; int carry_live;
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
@@ -1398,6 +1403,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         }
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
+        free(q->carry);   /* wine-lab port */
         free(q);
     }
     return (ULONG)r;
@@ -4881,6 +4887,33 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
 }
 
+/* wine-lab port: RENDER PASSES ACROSS COMMAND-LIST BOUNDARIES (madeira.cfg
+ * pass-carry, default 1). Unity 6's split graphics jobs record a frame as ~85
+ * small command lists, consecutive ones often drawing into the same targets,
+ * and every list end closed the Metal render pass: in PEAK's menu 70 % of all
+ * passes ended at a list boundary, each storing its attachments and the next
+ * list's pass loading them straight back (~1.2 GB of tile traffic a frame),
+ * plus a fence wait/update per pass. Lists of one ExecuteCommandLists call run
+ * back to back on one command buffer, so the next list may keep drawing into
+ * the open encoder when it binds the same targets -- exactly what happens
+ * inside one list, under the same rules (a clear, a different target set, a
+ * dispatch or a copy still end the pass; ResourceBarrier leaves it open as it
+ * always has). The carried pass is ended before the command buffer is
+ * committed and before the replay returns (its encoder lives in the replay's
+ * autorelease pool). Off in fence-chain mode 6, whose per-encoder bookkeeping
+ * assumes one list per encoder. */
+static int mad_pass_carry_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("pass-carry", 1) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] pass-carry = %d (render passes %s command-list boundaries)\n", on, on ? "continue across" : "end at"); }
+    return on;
+}
+static void mad_carry_end(struct mad_queue *q) {
+    if (!q || !q->carry_live) return;
+    q->carry_live = 0;
+    InterlockedIncrement(&g_pass_end_list);
+    exec_end(q->carry);
+}
 static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
     g_list_seq++;
     struct mad_exec e;
@@ -4892,6 +4925,19 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.l = l; e.cb = cb;
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
+    if (q->carry_live) {   /* wine-lab port: pass-carry -- adopt the encoder the previous list left open */
+        struct mad_exec *c = q->carry;
+        if (c->cb != cb || c->mode != e.mode || e.mode == 6) mad_carry_end(q);
+        else {
+            q->carry_live = 0;
+            e.renc = c->renc; e.renc_seq = c->renc_seq;
+            memcpy(e.enc_rt, c->enc_rt, sizeof e.enc_rt); memcpy(e.enc_rtp, c->enc_rtp, sizeof e.enc_rtp);
+            e.enc_nrt = c->enc_nrt; e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h;
+            e.vis_prev = c->vis_prev; e.enc_vis_buf = c->enc_vis_buf; e.pass_draws = c->pass_draws;
+            e.ud_enc = c->ud_enc; e.ud_n = c->ud_n; e.ud_committed = c->ud_committed; memcpy(e.ud, c->ud, sizeof e.ud);
+            InterlockedIncrement(&g_pass_carried);
+        }
+    }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     for (i = 0; i < l->ncmds; i++) {
@@ -4987,8 +5033,15 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
-    if (e.renc) InterlockedIncrement(&g_pass_end_list);
-    exec_end(&e);
+    q->open_draws += e.draws;   /* wine-lab port: batch-draws */
+    if (e.renc && !e.npend && e.mode != 6 && mad_pass_carry_on() &&
+        (q->carry || (q->carry = malloc(sizeof *q->carry)))) {   /* wine-lab port: pass-carry */
+        memcpy(q->carry, &e, sizeof e);
+        q->carry_live = 1;
+    } else {
+        if (e.renc) InterlockedIncrement(&g_pass_end_list);
+        exec_end(&e);
+    }
     while (e.npend) exec_flush_clear(&e, 0);
     /* ml1042: a PERIODIC summary. Every per-list line is rate-limited to the first
      * dozen, which is the menu -- so the first run to reach real 3D (black, ~2 FPS)
@@ -5006,9 +5059,9 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
                       "largest list %ld draws\n",
                       InterlockedExchange(&acc_cmds, 0), InterlockedExchange(&acc_draws, 0),
                       InterlockedExchange(&acc_skipped, 0), InterlockedExchange(&acc_max_draws, 0));
-            d3d12_log("[madeira-d3d12] ml1070 render passes in those lists: %ld begun (%ld reused), ended by: targets %ld, clear %ld, "
+            d3d12_log("[madeira-d3d12] ml1070 render passes in those lists: %ld begun (%ld reused, %ld carried into the next list), ended by: targets %ld, clear %ld, "
                       "dispatch %ld, blit %ld, list-end %ld, attachless %ld; clear-only passes %ld; attachment load+store ~%lld MB\n",
-                      InterlockedExchange(&g_pass_begun, 0), InterlockedExchange(&g_pass_reused, 0), InterlockedExchange(&g_pass_end_rts, 0),
+                      InterlockedExchange(&g_pass_begun, 0), InterlockedExchange(&g_pass_reused, 0), InterlockedExchange(&g_pass_carried, 0), InterlockedExchange(&g_pass_end_rts, 0),
                       InterlockedExchange(&g_pass_end_clear, 0), InterlockedExchange(&g_pass_end_dispatch, 0), InterlockedExchange(&g_pass_end_blit, 0),
                       InterlockedExchange(&g_pass_end_list, 0), InterlockedExchange(&g_pass_end_attachless, 0), InterlockedExchange(&g_pass_clear_only, 0),
                       (long long)(InterlockedExchange64(&g_pass_attach_bytes, 0) >> 20));
@@ -5040,6 +5093,28 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
 }
 
+/* wine-lab port: EARLIER COMMITS. ml884 batched up to 48 lists per command
+ * buffer because every submission cost ~6.6 ms on iOS. On macOS a commit costs
+ * tens of microseconds, and a 48-list buffer leaves the GPU idle while the CPU
+ * encodes all of it: PEAK's menu showed 5-7 ms GPU gaps in front of its big
+ * buffer, exactly its encode time. The open buffer is now also committed once
+ * it holds batch-lists lists (madeira.cfg, default 8) at a list boundary with
+ * no render pass carried over (pass-carry), or batch-draws draws/dispatches
+ * (default 512) even if that ends a carried pass: one more store and reload of
+ * the targets costs far less than the GPU waiting for the rest of a long pass.
+ * batch-lists = 48 with batch-draws = 0 is the old behaviour. */
+static int mad_batch_lists(void) {
+    static int n = -1;
+    if (n < 0) { n = (int)mad_cfg_int_pe("batch-lists", 8); if (n < 1) n = 1; if (n > 48) n = 48;
+                 d3d12_log("[madeira-d3d12] batch-lists = %d\n", n); }
+    return n;
+}
+static unsigned mad_batch_draws(void) {
+    static long long n = -1;
+    if (n < 0) { n = mad_cfg_int_pe("batch-draws", 512); if (n <= 0) n = 0xffffffffll;
+                 d3d12_log("[madeira-d3d12] batch-draws = %lld\n", n); }
+    return (unsigned)n;
+}
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
  * queue's submission worker. */
 static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList *const *lists) {
@@ -5084,8 +5159,11 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         if (l) mad_exec_list(q, l, q->open_cb);
         q->open_lists++;
         q->executed++;
-        if (q->open_lists >= 48) mad_queue_flush(q);   /* bound the batch */
+        if (q->open_lists >= 48 || (q->open_lists >= mad_batch_lists() && !q->carry_live) ||
+            q->open_draws >= mad_batch_draws())
+            mad_queue_flush(q);   /* bound the batch; wine-lab port: batch-lists/batch-draws */
     }
+    mad_carry_end(q);   /* wine-lab port: the open encoder is in this replay's autorelease pool */
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (ml1049_pool) NSObject_release(ml1049_pool);
 }
@@ -5332,6 +5410,7 @@ static void mad_queue_flush(struct mad_queue *q) {
     if (!q) return;
     EnterCriticalSection(&q->submit_lock);   /* ml1021 */
     if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
+    mad_carry_end(q);   /* wine-lab port: pass-carry */
     if (q->npending == 16) {
         for (unsigned k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
         q->npending = 0;
@@ -5361,7 +5440,7 @@ static void mad_queue_flush(struct mad_queue *q) {
         q->batch_serial[(q->batches + 1) & 63] = serial;
     }
     q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
-    q->open_cb = 0; q->open_lists = 0; q->batches++;
+    q->open_cb = 0; q->open_lists = 0; q->open_draws = 0; q->batches++;
     if (q->batches <= 3 || (q->batches % 500) == 0)
         d3d12_log("[madeira-d3d12] batch #%llu committed (%llu lists so far)\n",
                   (unsigned long long)q->batches, (unsigned long long)q->executed);
