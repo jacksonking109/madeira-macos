@@ -176,6 +176,7 @@ static void test_key(void)
     MUTATE("range base register", r->ranges[2].base_register = 1);
     MUTATE("range space", r->ranges[2].register_space = 2);
     MUTATE("range table offset", r->ranges[2].table_offset = 9);
+    MUTATE("root signature flags", r->a.root_flags = 0xc00);
     MUTATE("sampler count", r->a.num_samplers = 1);
     MUTATE("sampler filter", r->samplers[0].filter = 0x14);
     MUTATE("sampler address", r->samplers[1].address_w = 3);

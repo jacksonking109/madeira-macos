@@ -660,6 +660,7 @@ struct mad_rootsig {
     UINT nparams, nranges;
     struct madeira_ir_static_sampler samplers[32];
     UINT nsamplers;
+    UINT flags;   /* wine-lab port: D3D12_ROOT_SIGNATURE_FLAGS, for the converter (heap directly indexed) */
     /* ml923: the converter reserves one implicit descriptor-table slot at the
      * end of the top-level argument buffer for the static samplers; this is
      * the table it points at (nsamplers sampler descriptors, built once). */
@@ -8597,6 +8598,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
     UINT32 nparam    = rs_rd(p, n, 4,  &bad);
     UINT32 poff      = rs_rd(p, n, 8,  &bad);
     UINT32 nsampler  = rs_rd(p, n, 12, &bad);
+    UINT32 rs_flags  = rs_rd(p, n, 20, &bad);
     if (bad) { d3d12_log("[madeira-d3d12] CreateRootSignature: truncated RTS0 header\n"); return E_INVALIDARG; }
     if (version != 1 && version != 2) {
         d3d12_log("[madeira-d3d12] CreateRootSignature: root signature version %u is not supported\n", version);
@@ -8644,6 +8646,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
     r->vtbl = &g_rootsig_vtbl; r->refs = 1; r->iid = &IID_ID3D12RootSignature; r->name = "RootSignature";
     r->ranges = total_ranges ? (struct madeira_ir_root_range *)((char *)r + sizeof *r) : NULL;
     r->nparams = nparam;
+    r->flags = rs_flags;
     {   /* ml1009: how big real signatures actually are, so the bound above is
          * evidence-based rather than folklore. */
         static UINT32 seen_max;
@@ -8770,8 +8773,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
 
     { static LONG said; if (InterlockedIncrement(&said) <= 24)   /* ml1053: was 15,589 lines a run */
     d3d12_log("[madeira-d3d12] root signature parsed from the application blob: "
-              "version 1.%u, %u parameter(s), %u descriptor range(s), %u static sampler(s)\n",
-              version == 2 ? 1u : 0u, r->nparams, r->nranges, r->nsamplers); }
+              "version 1.%u, %u parameter(s), %u descriptor range(s), %u static sampler(s), flags %#x\n",
+              version == 2 ? 1u : 0u, r->nparams, r->nranges, r->nsamplers, r->flags); }
     HRESULT hr = rootsig_QI((ID3D12RootSignature *)r, riid, out);
     rootsig_Release((ID3D12RootSignature *)r);
     return hr;
@@ -9790,6 +9793,7 @@ static void mad_fill_convert_inputs(struct madeira_ir_convert_args *a, struct ma
     a->num_params = rs ? rs->nparams : 0;
     a->ranges = (uint64_t)(uintptr_t)(rs ? rs->ranges : NULL);
     a->num_ranges = rs ? rs->nranges : 0;
+    a->root_flags = rs ? rs->flags : 0;
     a->target_os = g_target.os;
     a->gpu_family = g_target.family;
     a->os_version = (uint64_t)(uintptr_t)g_target.os_version;

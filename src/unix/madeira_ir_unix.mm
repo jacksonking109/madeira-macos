@@ -1642,7 +1642,11 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     desc.desc_1_1.pParameters = irp;
     desc.desc_1_1.NumStaticSamplers = a->num_samplers;
     desc.desc_1_1.pStaticSamplers = irs;
-    desc.desc_1_1.Flags = IRRootSignatureFlagNone;
+    /* The converter's flags are D3D12's bit for bit. CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+     * and SAMPLER_HEAP_DIRECTLY_INDEXED are what let an SM 6.6 shader reach
+     * ResourceDescriptorHeap[] / SamplerDescriptorHeap[], which read the heaps
+     * the runtime binds at kIRDescriptorHeapBindPoint (0) / kIRSamplerHeapBindPoint (1). */
+    desc.desc_1_1.Flags = (IRRootSignatureFlags)a->root_flags;
 
     rsig = g_ir.IRRootSignatureCreateFromDescriptor(&desc, &err);
     if (!rsig) {

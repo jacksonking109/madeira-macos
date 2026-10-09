@@ -164,7 +164,7 @@ struct madeira_ir_convert_args {
     uint64_t num_params;        /* in */
     uint64_t ranges;            /* in: const struct madeira_ir_root_range * */
     uint64_t num_ranges;        /* in */
-    uint64_t root_flags;        /* in: reserved, must be 0 */
+    uint64_t root_flags;        /* in: D3D12_ROOT_SIGNATURE_FLAGS; IRRootSignatureFlags has the same bits */
 
     uint32_t target_os;         /* in: madeira_ir_os */
     uint32_t gpu_family;        /* in: IRGPUFamily, chosen from the real device */

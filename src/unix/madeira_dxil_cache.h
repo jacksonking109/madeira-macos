@@ -11,7 +11,7 @@
  *
  * KEY IDENTITY. The key covers exactly what madeira_ir_convert_impl's DXIL
  * branch reads: the bytecode, the D3D entry name, the root signature (params,
- * the ranges each table references, static samplers), the target OS / GPU
+ * the ranges each table references, flags, static samplers), the target OS / GPU
  * family / minimum OS version, geometry emulation and -- only when emulation is
  * on, because only then are they read -- the input topology and the input
  * layout the stage-in function is synthesised from. The caller adds the
@@ -141,6 +141,7 @@ static inline void mad_dxc_key(const struct madeira_ir_convert_args *a,
             break;
         }
     }
+    mad_dxc_hu64(&s, a->root_flags);   /* wine-lab port: e.g. heap directly indexed */
     mad_dxc_hu32(&s, ss ? a->num_samplers : 0);
     for (uint32_t i = 0; ss && i < a->num_samplers; i++) {
         const struct madeira_ir_static_sampler *m = &ss[i];
