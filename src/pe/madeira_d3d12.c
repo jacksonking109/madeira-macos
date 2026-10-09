@@ -240,7 +240,7 @@ struct mad_device {
     /* ml880: one residency set on the queue holds every buffer and texture
      * ever created; committed before the next submission whenever it grew.
      * The 256-per-draw useResource lists stay as a belt for older systems. */
-    obj_handle_t resset; LONG resset_dirty;
+    obj_handle_t resset; LONG resset_dirty; SRWLOCK resset_lock;   /* wine-lab port: add, remove and commit are one at a time */
     /* Unset root descriptors used to hand the shader address 0 (+ offset),
      * which was a GPU page fault that killed the whole queue. They now point
      * at 64 KB of zeros instead. */
@@ -342,7 +342,9 @@ static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sig
 static void mad_acct_report(void);
 static void mad_resident(struct mad_device *d, obj_handle_t h) {
     if (!d || !h || !d->resset) return;
+    AcquireSRWLockExclusive(&d->resset_lock);
     MTLResidencySet_addAllocation(d->resset, h);
+    ReleaseSRWLockExclusive(&d->resset_lock);
     InterlockedIncrement(&g_res_added);
     InterlockedExchange(&d->resset_dirty, 1);
 }
@@ -353,9 +355,16 @@ static void mad_resident(struct mad_device *d, obj_handle_t h) {
  * the next command buffer. */
 static void mad_unresident(struct mad_device *d, obj_handle_t h) {
     if (!d || !h || !d->resset) return;
+    AcquireSRWLockExclusive(&d->resset_lock);
     MTLResidencySet_removeAllocation(d->resset, h);
+    ReleaseSRWLockExclusive(&d->resset_lock);
     InterlockedIncrement(&g_res_removed);
     InterlockedExchange(&d->resset_dirty, 1);
+}
+static void mad_resident_commit(struct mad_device *d) {
+    AcquireSRWLockExclusive(&d->resset_lock);
+    MTLResidencySet_commit(d->resset);
+    ReleaseSRWLockExclusive(&d->resset_lock);
 }
 
 /* Growable arrays. The fixed tables of the cube era (16 samplers, 16 views,
@@ -1410,6 +1419,7 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
         free(q->carry);   /* wine-lab port */
         free(q);
+        free(q->bat);     /* wine-lab port: the draw-batch arena */
     }
     return (ULONG)r;
 }
@@ -5415,7 +5425,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
         }
         if (!q->open_cb) {
             if (q->device->resset && InterlockedExchange(&q->device->resset_dirty, 0))
-                MTLResidencySet_commit(q->device->resset);
+                mad_resident_commit(q->device);
             mad_queue_revive(q->device);   /* ml1067 */
             q->open_cb = MTLCommandQueue_commandBuffer(q->device->mtl_queue);
             if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
@@ -5700,7 +5710,7 @@ static void mad_queue_flush_impl(struct mad_queue *q) {
          * buffer opened -- so this batch ran with it non-resident. With the per-draw
          * useResource lists gone (ml1060) nothing else covered that window. Commit
          * whatever is staged right before the buffer that will use it. */
-        if (sd->resset && InterlockedExchange(&sd->resset_dirty, 0)) MTLResidencySet_commit(sd->resset);
+        if (sd->resset && InterlockedExchange(&sd->resset_dirty, 0)) mad_resident_commit(sd);
         EnterCriticalSection(&sd->fence_lock);
         if (sd->gpu_event) {
             serial = (UINT64)InterlockedIncrement64(&sd->gpu_serial);
