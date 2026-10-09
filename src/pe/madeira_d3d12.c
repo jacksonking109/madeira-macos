@@ -1193,6 +1193,13 @@ struct mad_list {
      * buffers are POINTERS in a table, so root constants consumed as a CBV need a
      * GPU-visible copy with a per-dispatch lifetime -- which is what this ring is. */
     UINT32 *cdata; unsigned ncdata, cdcap;   /* root constant words, referenced by MC_ROOT_CONST */
+    /* wine-lab port: BeginRenderPass (RenderPassesTier 0, emulated). The
+     * resolves its ending accesses ask for, copied at Begin because the
+     * caller's subresource arrays need not outlive the call; EndRenderPass
+     * records them. */
+    struct mad_rp_resolve { ID3D12Resource *src, *dst; UINT src_sub, dst_sub; DXGI_FORMAT format; } *rp_resolves;
+    unsigned rp_nresolves, rp_rcap;
+    int rp_open; D3D12_RENDER_PASS_FLAGS rp_flags;
 };
 
 static struct mad_cmd *mad_list_push(struct mad_list *l, enum mad_ck kind) {
@@ -1237,6 +1244,7 @@ static ULONG STDMETHODCALLTYPE list_Release(ID3D12GraphicsCommandList *This) {
         if (l->alloc) ID3D12CommandAllocator_Release((ID3D12CommandAllocator *)l->alloc);
         for (unsigned k = 0; k < l->nrings; k++) NSObject_release(l->rings[k]);
         free(l->rings); free(l->ring_cpu); free(l->ring_gpu); free(l->cmds); free(l->used); free(l->cdata);
+        free(l->rp_resolves);
         free(l);
     }
     return (ULONG)r;
@@ -1269,6 +1277,7 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
     l->ncmds = 0;
     l->nused = 0;
     l->ncdata = 0;
+    l->rp_open = 0; l->rp_nresolves = 0;   /* wine-lab port: render pass state */
     mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
     return S_OK;
 }
@@ -11211,6 +11220,98 @@ static void STDMETHODCALLTYPE list_ResolveSubresource(ID3D12GraphicsCommandList 
     c->u.tt.dst = d; c->u.tt.src = s;
 }
 
+/* ---- wine-lab port: render passes, RenderPassesTier 0 ---------------------
+ * D3D12_FEATURE_D3D12_OPTIONS5 reports tier 0, under which the API must still
+ * work: the runtime emulates a pass with the calls it is shorthand for. Begin =
+ * OMSetRenderTargets + a Clear*View per CLEAR beginning access; End = a
+ * ResolveSubresource per RESOLVE ending access. PRESERVE, DISCARD and
+ * NO_ACCESS need nothing (DiscardResource is a no-op here anyway). Everything
+ * goes through the existing recording paths, so the executor sees exactly
+ * what it would for the equivalent tier-0 call sequence.
+ * Suspend/resume: a RESUMING pass continues the suspended one, so its
+ * beginning accesses are not re-applied (no second clear), and a SUSPENDING
+ * pass defers its ending accesses (no resolve) to the pass that finally ends
+ * without the flag. ALLOW_UAV_WRITES and BIND_READ_ONLY_* need nothing. */
+static void mad_rp_add_resolve(struct mad_list *l, const D3D12_RENDER_PASS_ENDING_ACCESS *e) {
+    const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS *r = &e->Resolve;
+    static unsigned said_mode, said_rect;
+    UINT i;
+    if (e->Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE) return;
+    if (!r->pSrcResource || !r->pDstResource || !r->pSubresourceParameters) return;
+    if (r->ResolveMode != D3D12_RESOLVE_MODE_AVERAGE && said_mode++ < 4)
+        d3d12_log("[madeira-d3d12] EndRenderPass: resolve mode %u emulated as a plain (average) resolve\n", (unsigned)r->ResolveMode);
+    for (i = 0; i < r->SubresourceCount; i++) {
+        const D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS *sp = &r->pSubresourceParameters[i];
+        struct mad_rp_resolve *o;
+        if ((sp->DstX || sp->DstY) && said_rect++ < 4)
+            d3d12_log("[madeira-d3d12] EndRenderPass: resolve offset (%u,%u) / source rect ignored; whole subresource resolved\n",
+                      sp->DstX, sp->DstY);
+        if (!mad_grow((void **)&l->rp_resolves, &l->rp_rcap, l->rp_nresolves + 1, sizeof *l->rp_resolves)) return;
+        o = &l->rp_resolves[l->rp_nresolves++];
+        o->src = r->pSrcResource; o->dst = r->pDstResource;
+        o->src_sub = sp->SrcSubresource; o->dst_sub = sp->DstSubresource; o->format = r->Format;
+    }
+}
+static void STDMETHODCALLTYPE list_BeginRenderPass(ID3D12GraphicsCommandList7 *This, UINT n,
+        const D3D12_RENDER_PASS_RENDER_TARGET_DESC *rts, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC *ds,
+        D3D12_RENDER_PASS_FLAGS flags) {
+    struct mad_list *l = (struct mad_list *)This;
+    ID3D12GraphicsCommandList *gl = (ID3D12GraphicsCommandList *)This;
+    D3D12_CPU_DESCRIPTOR_HANDLE h[8], dsv;
+    const D3D12_CPU_DESCRIPTOR_HANDLE *pdsv = NULL;
+    int resuming = (flags & D3D12_RENDER_PASS_FLAG_RESUMING_PASS) != 0;
+    UINT i;
+    static unsigned said;
+    if (l->closed) return;
+    if (n > 8) n = 8;
+    if (!rts) n = 0;
+    if (said++ < 8)
+        d3d12_log("[madeira-d3d12] BeginRenderPass (tier 0, emulated): %u RTs%s, flags %#x\n",
+                  n, ds && ds->cpuDescriptor.ptr ? " + DSV" : "", (unsigned)flags);
+    l->rp_open = 1; l->rp_flags = flags;
+    l->rp_nresolves = 0;
+    for (i = 0; i < n; i++) h[i] = rts[i].cpuDescriptor;
+    /* A DSV both of whose planes are NO_ACCESS is not part of the pass. */
+    if (ds && ds->cpuDescriptor.ptr &&
+        !(ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS &&
+          ds->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS)) {
+        dsv = ds->cpuDescriptor; pdsv = &dsv;
+    }
+    list_OMSetRenderTargets(gl, n, n ? h : NULL, FALSE, pdsv);
+    if (!resuming) {
+        for (i = 0; i < n; i++)
+            if (rts[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR && h[i].ptr)
+                list_ClearRenderTargetView(gl, h[i], rts[i].BeginningAccess.Clear.ClearValue.Color, 0, NULL);
+        if (pdsv) {
+            D3D12_CLEAR_FLAGS cf = 0;
+            FLOAT depth = 0.0f; UINT8 stencil = 0;
+            if (ds->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) {
+                cf |= D3D12_CLEAR_FLAG_DEPTH; depth = ds->DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth;
+            }
+            if (ds->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR) {
+                cf |= D3D12_CLEAR_FLAG_STENCIL; stencil = ds->StencilBeginningAccess.Clear.ClearValue.DepthStencil.Stencil;
+            }
+            if (cf) list_ClearDepthStencilView(gl, dsv, cf, depth, stencil, 0, NULL);
+        }
+    }
+    /* Ending accesses are fixed at Begin; End only carries them out. */
+    for (i = 0; i < n; i++) mad_rp_add_resolve(l, &rts[i].EndingAccess);
+    if (pdsv) { mad_rp_add_resolve(l, &ds->DepthEndingAccess); mad_rp_add_resolve(l, &ds->StencilEndingAccess); }
+}
+static void STDMETHODCALLTYPE list_EndRenderPass(ID3D12GraphicsCommandList7 *This) {
+    struct mad_list *l = (struct mad_list *)This;
+    unsigned i;
+    if (l->closed || !l->rp_open) return;
+    l->rp_open = 0;
+    if (!(l->rp_flags & D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS))
+        for (i = 0; i < l->rp_nresolves; i++) {
+            const struct mad_rp_resolve *r = &l->rp_resolves[i];
+            if (r->src == r->dst && r->src_sub == r->dst_sub) continue;   /* in-place (DECOMPRESS): nothing to move */
+            list_ResolveSubresource((ID3D12GraphicsCommandList *)This, r->dst, r->dst_sub, r->src, r->src_sub, r->format);
+        }
+    l->rp_nresolves = 0;
+}
+
 static void STDMETHODCALLTYPE list_CopyResource(ID3D12GraphicsCommandList *This, ID3D12Resource *dst, ID3D12Resource *src) {
     struct mad_resource *d = (struct mad_resource *)dst, *s = (struct mad_resource *)src;
     if (!d || !s) return;
@@ -11999,6 +12100,8 @@ static void build_vtables(void) {
     g_list_vtbl.IASetIndexBuffer        = (void *)list_IASetIndexBuffer;
     g_list_vtbl.DrawIndexedInstanced    = (void *)list_DrawIndexedInstanced;
     g_list_vtbl.ClearDepthStencilView   = (void *)list_ClearDepthStencilView;
+    g_list_vtbl.BeginRenderPass         = list_BeginRenderPass;   /* wine-lab port: List4+, one table answers List1..7 */
+    g_list_vtbl.EndRenderPass           = list_EndRenderPass;
 
     madeira_fill_ID3D12RootSignature(&g_rootsig_vtbl);
     g_rootsig_vtbl.GetDevice = rootsig_GetDevice;

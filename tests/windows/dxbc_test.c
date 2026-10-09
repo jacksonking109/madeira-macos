@@ -15,6 +15,10 @@
  *       with a static sampler, tinted by a root CBV
  *    3  vertex buffer + input layout (POSITION float3 @0, COLOR float4 @12,
  *       stride 28); a corner outside the triangle must keep the clear colour
+ *    4  ID3D12GraphicsCommandList4::BeginRenderPass (CLEAR) / EndRenderPass
+ *       around a draw: the corner shows the pass's clear, the centre the draw
+ *    5  depth CLEAR through a render pass: clear 0.25, a z=0.5 triangle is
+ *       rejected and a z=0.1 one passes (LESS_EQUAL)
  *
  *  Until the runtime's DXBC backend is built in, pipeline creation is EXPECTED
  *  to fail ("DXBC shaders need the airconv backend"). That is reported as a
@@ -198,6 +202,27 @@ static ID3D12RootSignature *make_rs(const char *name, const D3D12_ROOT_SIGNATURE
     if (blob) ID3D10Blob_Release(blob);
     CHECK(SUCCEEDED(hr) && rs, "%s: root signature serialized and created (%#lx)", name, hr);
     return rs;
+}
+
+/* The raw creation, no CHECK: a depth format turns depth testing on (LESS_EQUAL),
+ * and a cached blob goes into CachedPSO as given. */
+static HRESULT create_pso(ID3D12RootSignature *rs, ID3DBlob *vs, ID3DBlob *ps,
+                          const D3D12_INPUT_ELEMENT_DESC *il, UINT nil, DXGI_FORMAT dsv,
+                          const void *cache, SIZE_T ncache, ID3D12PipelineState **out) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd; ZeroMemory(&pd, sizeof pd);
+    *out = NULL;
+    pd.pRootSignature = rs;
+    pd.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(vs); pd.VS.BytecodeLength = ID3D10Blob_GetBufferSize(vs);
+    pd.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps); pd.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
+    pd.InputLayout.pInputElementDescs = il; pd.InputLayout.NumElements = nil;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.DSVFormat = dsv;
+    pd.SampleDesc.Count = 1;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.CachedPSO.pCachedBlob = cache; pd.CachedPSO.CachedBlobSizeInBytes = ncache;
+    test_pso_defaults(&pd, dsv != DXGI_FORMAT_UNKNOWN);
+    return ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)out);
 }
 
 static ID3D12PipelineState *make_pso(const char *name, ID3D12RootSignature *rs, ID3DBlob *vs, ID3DBlob *ps,
@@ -481,6 +506,148 @@ static void case_vertex_buffer(void) {
     if (ps) ID3D10Blob_Release(ps);
 }
 
+/* ------------------------------------------------------------- cases 4, 5 */
+
+/* Half-size triangle (covers the centre, not the corners) at depth zv.x, in colour col. */
+static const char hlsl_rp[] =
+    "cbuffer RC : register(b0) { float4 col; float4 zv; };\n"
+    "float4 vs_main(uint id : SV_VertexID) : SV_Position {\n"
+    FULLSCREEN_VS_BODY
+    "    return float4(pos.xy * 0.5, zv.x, 1.0);\n"
+    "}\n"
+    "float4 ps_main(float4 p : SV_Position) : SV_Target { return col; }\n";
+
+static ID3D12RootSignature *rp_rs;
+static ID3DBlob *rp_vs, *rp_ps;
+
+static void rp_setup(void) {
+    rp_vs = compile("renderpass", hlsl_rp, "vs_main", "vs_5_0");
+    rp_ps = compile("renderpass", hlsl_rp, "ps_main", "ps_5_0");
+    D3D12_ROOT_PARAMETER rp; ZeroMemory(&rp, sizeof rp);
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp.Constants.ShaderRegister = 0; rp.Constants.Num32BitValues = 8;
+    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd; ZeroMemory(&rd, sizeof rd);
+    rd.NumParameters = 1; rd.pParameters = &rp;
+    rp_rs = make_rs("renderpass", &rd);
+}
+
+static void rp_draw(ID3D12PipelineState *pso, const float col[4], float z) {
+    const float rc[8] = { col[0], col[1], col[2], col[3], z, 0.0f, 0.0f, 0.0f };
+    D3D12_VIEWPORT vp; ZeroMemory(&vp, sizeof vp);
+    vp.Width = (FLOAT)RT_W; vp.Height = (FLOAT)RT_H; vp.MaxDepth = 1.0f;
+    D3D12_RECT sc = { 0, 0, RT_W, RT_H };
+    ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+    ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+    ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rp_rs);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pso);
+    ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 0, 8, rc, 0);
+    ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+}
+
+static void rt_access(D3D12_RENDER_PASS_RENDER_TARGET_DESC *d, const FLOAT clear[4]) {
+    ZeroMemory(d, sizeof *d);
+    d->cpuDescriptor = rtv;
+    d->BeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+    d->BeginningAccess.Clear.ClearValue.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    memcpy(d->BeginningAccess.Clear.ClearValue.Color, clear, 4 * sizeof(FLOAT));
+    d->EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+}
+
+static void case_render_pass(void) {
+    printf("\n[4] BeginRenderPass (CLEAR) + draw + EndRenderPass\n");
+    ID3D12GraphicsCommandList4 *l4 = NULL;
+    HRESULT hr = ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList4, (void **)&l4);
+    CHECK(SUCCEEDED(hr) && l4, "renderpass: list answers ID3D12GraphicsCommandList4 (%#lx)", hr);
+    ID3D12PipelineState *pso = NULL;
+    if (rp_rs && rp_vs && rp_ps) {
+        hr = create_pso(rp_rs, rp_vs, rp_ps, NULL, 0, DXGI_FORMAT_UNKNOWN, NULL, 0, &pso);
+        CHECK(SUCCEEDED(hr) && pso, "renderpass: colour-only PSO created (%#lx)", hr);
+    }
+    if (l4 && pso) {
+        /* A stale clear first, so a pass that clears nothing shows magenta, not a lucky zero. */
+        const FLOAT stale[4] = { 1.0f, 0.0f, 1.0f, 1.0f }, clear[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+        const float green[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+        ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &rtv, FALSE, NULL);
+        ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, stale, 0, NULL);
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC rd; rt_access(&rd, clear);
+        ID3D12GraphicsCommandList4_BeginRenderPass(l4, 1, &rd, NULL, D3D12_RENDER_PASS_FLAG_NONE);
+        rp_draw(pso, green, 0.5f);
+        ID3D12GraphicsCommandList4_EndRenderPass(l4);
+        BYTE c[4] = {0}, k[4] = {0};
+        BOOL ok = finish_and_read(c, k);
+        CHECK(ok, "renderpass: submitted and read back");
+        CHECK(ok && px_near(k, 0, 0, 255, 255),
+              "renderpass: corner = the pass's CLEAR colour: got (%u,%u,%u,%u), expected (0,0,255,255)", k[0], k[1], k[2], k[3]);
+        CHECK(ok && px_near(c, 0, 255, 0, 255),
+              "renderpass: centre = the draw inside the pass: got (%u,%u,%u,%u), expected (0,255,0,255)", c[0], c[1], c[2], c[3]);
+    }
+    if (pso) ID3D12PipelineState_Release(pso);
+    if (l4) ID3D12GraphicsCommandList4_Release(l4);
+}
+
+static void case_render_pass_depth(void) {
+    printf("\n[5] render pass depth CLEAR (0.25) against LESS_EQUAL draws at z=0.5 and z=0.1\n");
+    ID3D12GraphicsCommandList4 *l4 = NULL;
+    ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList4, (void **)&l4);
+    ID3D12PipelineState *pso = NULL;
+    HRESULT hr = E_FAIL;
+    if (rp_rs && rp_vs && rp_ps) hr = create_pso(rp_rs, rp_vs, rp_ps, NULL, 0, DXGI_FORMAT_D32_FLOAT, NULL, 0, &pso);
+    CHECK(SUCCEEDED(hr) && pso, "depthpass: D32_FLOAT depth-tested PSO created (%#lx)", hr);
+
+    D3D12_HEAP_PROPERTIES hp; ZeroMemory(&hp, sizeof hp); hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d; ZeroMemory(&d, sizeof d);
+    d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; d.Width = RT_W; d.Height = RT_H;
+    d.DepthOrArraySize = 1; d.MipLevels = 1; d.Format = DXGI_FORMAT_D32_FLOAT;
+    d.SampleDesc.Count = 1; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    ID3D12Resource *ds = NULL;
+    ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_DEPTH_WRITE, NULL,
+                                         &IID_ID3D12Resource, (void **)&ds);
+    ID3D12DescriptorHeap *dsvh = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC hd; ZeroMemory(&hd, sizeof hd);
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors = 1;
+    ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&dsvh);
+    CHECK(ds && dsvh, "depthpass: D32_FLOAT texture and DSV heap created");
+
+    if (l4 && pso && ds && dsvh) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+        dsvh->lpVtbl->GetCPUDescriptorHandleForHeapStart(dsvh, &dsv);
+        ID3D12Device_CreateDepthStencilView(dev, ds, NULL, dsv);
+        const FLOAT clear[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+        const float red[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+        static const struct { float z; BOOL visible; } runs[2] = { { 0.5f, FALSE }, { 0.1f, TRUE } };
+        for (int i = 0; i < 2; i++) {
+            D3D12_RENDER_PASS_RENDER_TARGET_DESC rd; rt_access(&rd, clear);
+            D3D12_RENDER_PASS_DEPTH_STENCIL_DESC dd; ZeroMemory(&dd, sizeof dd);
+            dd.cpuDescriptor = dsv;
+            dd.DepthBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR;
+            dd.DepthBeginningAccess.Clear.ClearValue.Format = DXGI_FORMAT_D32_FLOAT;
+            dd.DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth = 0.25f;
+            dd.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS;
+            dd.DepthEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD;
+            dd.StencilEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS;
+            ID3D12GraphicsCommandList4_BeginRenderPass(l4, 1, &rd, &dd, D3D12_RENDER_PASS_FLAG_NONE);
+            rp_draw(pso, red, runs[i].z);
+            ID3D12GraphicsCommandList4_EndRenderPass(l4);
+            BYTE c[4] = {0}, k[4] = {0};
+            BOOL ok = finish_and_read(c, k);
+            if (runs[i].visible)
+                CHECK(ok && px_near(c, 255, 0, 0, 255),
+                      "depthpass: z=%.2f passes against the cleared 0.25: centre (%u,%u,%u,%u), expected (255,0,0,255)",
+                      runs[i].z, c[0], c[1], c[2], c[3]);
+            else
+                CHECK(ok && px_near(c, 0, 0, 255, 255),
+                      "depthpass: z=%.2f is rejected by the cleared 0.25: centre (%u,%u,%u,%u), expected the clear (0,0,255,255)",
+                      runs[i].z, c[0], c[1], c[2], c[3]);
+        }
+    }
+    if (dsvh) ID3D12DescriptorHeap_Release(dsvh);
+    if (ds) ID3D12Resource_Release(ds);
+    if (pso) ID3D12PipelineState_Release(pso);
+    if (l4) ID3D12GraphicsCommandList4_Release(l4);
+}
+
 /* --------------------------------------------------------------------- main */
 
 int main(void) {
@@ -528,6 +695,12 @@ int main(void) {
     case_solid();
     case_texture();
     case_vertex_buffer();
+    rp_setup();
+    case_render_pass();
+    case_render_pass_depth();
+    if (rp_rs) ID3D12RootSignature_Release(rp_rs);
+    if (rp_vs) ID3D10Blob_Release(rp_vs);
+    if (rp_ps) ID3D10Blob_Release(rp_ps);
 
     ID3D12DescriptorHeap_Release(rtvh);
     ID3D12Resource_Release(pix);
