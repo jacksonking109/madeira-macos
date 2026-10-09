@@ -1236,6 +1236,7 @@ done:
 static int mad_airconv_convert(struct madeira_ir_convert_args *a, const unsigned char *bc, size_t bclen)
 {
     (void)bc; (void)bclen;
+    a->ret_backend = MADEIRA_IR_BACKEND_AIRCONV;   /* so the refusal is logged as the sm5/dxbc backend's */
     snprintf(a->ret_note, sizeof a->ret_note, "DXBC shaders need the airconv backend, not in this build");
     a->ret_status = MADEIRA_IR_UNSUPPORTED;
     return MADEIRA_IR_UNSUPPORTED;
