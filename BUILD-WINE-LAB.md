@@ -47,7 +47,8 @@ then re-sign it ad hoc: `codesign --force -s - ~/wine-lab/wine11/lib/wine/x86_64
 
 Tests (from out/, after `. ~/wine-lab/env11.sh`): d3d12-m2-x64.exe (expect 2 known failures: the stale fence-cycles
 check, and "unclaimed feature level 12_1" since madeira.cfg claims 12_1); d3d12-dxbc-x64.exe (SM 5.0 DXBC through
-airconv: root constants/CBV, SRV table + static sampler, vertex buffer input layout).
+airconv: root constants/CBV, SRV table + static sampler, vertex buffer input layout;
+plus tier-0 render passes, GetCachedBlob/CachedPSO and the pipeline library).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
 

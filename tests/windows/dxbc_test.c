@@ -19,6 +19,9 @@
  *       around a draw: the corner shows the pass's clear, the centre the draw
  *    5  depth CLEAR through a render pass: clear 0.25, a z=0.5 triangle is
  *       rejected and a z=0.1 one passes (LESS_EQUAL)
+ *    6  ID3D12PipelineState::GetCachedBlob round trip: our blob recreates the
+ *       PSO (which still draws); a corrupted one is D3D12_ERROR_DRIVER_VERSION_MISMATCH
+ *    7  ID3D12PipelineLibrary: store/load/miss, serialize, reload, foreign blob
  *
  *  Until the runtime's DXBC backend is built in, pipeline creation is EXPECTED
  *  to fail ("DXBC shaders need the airconv backend"). That is reported as a
@@ -648,6 +651,102 @@ static void case_render_pass_depth(void) {
     if (l4) ID3D12GraphicsCommandList4_Release(l4);
 }
 
+/* ------------------------------------------------------------- cases 6, 7 */
+
+static void case_cached_blob(void) {
+    printf("\n[6] GetCachedBlob round trip\n");
+    ID3D12PipelineState *pso = NULL, *again = NULL, *bad = NULL;
+    ID3DBlob *blob = NULL;
+    HRESULT hr = E_FAIL;
+    if (rp_rs && rp_vs && rp_ps) hr = create_pso(rp_rs, rp_vs, rp_ps, NULL, 0, DXGI_FORMAT_UNKNOWN, NULL, 0, &pso);
+    CHECK(SUCCEEDED(hr) && pso, "cachedblob: PSO created (%#lx)", hr);
+    if (!pso) return;
+    hr = ID3D12PipelineState_GetCachedBlob(pso, &blob);
+    SIZE_T n = blob ? ID3D10Blob_GetBufferSize(blob) : 0;
+    CHECK(SUCCEEDED(hr) && blob && n > 0 && ID3D10Blob_GetBufferPointer(blob),
+          "cachedblob: GetCachedBlob gave a non-empty blob (%#lx, %lu bytes)", hr, (unsigned long)n);
+    if (blob && n) {
+        hr = create_pso(rp_rs, rp_vs, rp_ps, NULL, 0, DXGI_FORMAT_UNKNOWN, ID3D10Blob_GetBufferPointer(blob), n, &again);
+        CHECK(SUCCEEDED(hr) && again, "cachedblob: PSO recreated with its own cached blob (%#lx)", hr);
+        if (again) {
+            const FLOAT clear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            const float yellow[4] = { 1.0f, 1.0f, 0.0f, 1.0f };
+            begin_pass(clear);
+            rp_draw(again, yellow, 0.5f);
+            BYTE c[4] = {0}, k[4] = {0};
+            BOOL ok = finish_and_read(c, k);
+            CHECK(ok && px_near(c, 255, 255, 0, 255),
+                  "cachedblob: the recreated PSO draws: centre (%u,%u,%u,%u), expected (255,255,0,255)", c[0], c[1], c[2], c[3]);
+        }
+        BYTE *copy = malloc(n);
+        if (copy) {
+            memcpy(copy, ID3D10Blob_GetBufferPointer(blob), n);
+            copy[n / 2] ^= 0x5a;
+            hr = create_pso(rp_rs, rp_vs, rp_ps, NULL, 0, DXGI_FORMAT_UNKNOWN, copy, n, &bad);
+            CHECK(hr == D3D12_ERROR_DRIVER_VERSION_MISMATCH && !bad,
+                  "cachedblob: corrupted blob refused with D3D12_ERROR_DRIVER_VERSION_MISMATCH (%#lx)", hr);
+            hr = create_pso(rp_rs, rp_vs, rp_ps, NULL, 0, DXGI_FORMAT_UNKNOWN, copy, n - 1, &bad);
+            CHECK(hr == D3D12_ERROR_DRIVER_VERSION_MISMATCH && !bad,
+                  "cachedblob: truncated blob refused with D3D12_ERROR_DRIVER_VERSION_MISMATCH (%#lx)", hr);
+            free(copy);
+        }
+    }
+    if (bad) ID3D12PipelineState_Release(bad);
+    if (again) ID3D12PipelineState_Release(again);
+    if (blob) ID3D10Blob_Release(blob);
+    ID3D12PipelineState_Release(pso);
+}
+
+static void case_pipeline_library(void) {
+    printf("\n[7] ID3D12PipelineLibrary\n");
+    ID3D12Device1 *d1 = NULL;
+    ID3D12PipelineLibrary *lib = NULL, *lib2 = NULL, *lib3 = NULL;
+    ID3D12PipelineState *pso = NULL, *got = NULL;
+    HRESULT hr = ID3D12Device_QueryInterface(dev, &IID_ID3D12Device1, (void **)&d1);
+    CHECK(SUCCEEDED(hr) && d1, "pipelinelib: device answers ID3D12Device1 (%#lx)", hr);
+    if (!d1) return;
+    D3D12_FEATURE_DATA_SHADER_CACHE sc; ZeroMemory(&sc, sizeof sc);
+    hr = ID3D12Device_CheckFeatureSupport(dev, D3D12_FEATURE_SHADER_CACHE, &sc, sizeof sc);
+    CHECK(SUCCEEDED(hr) && (sc.SupportFlags & D3D12_SHADER_CACHE_SUPPORT_LIBRARY),
+          "pipelinelib: SHADER_CACHE reports LIBRARY support (%#lx, flags %#x)", hr, (unsigned)sc.SupportFlags);
+    hr = ID3D12Device1_CreatePipelineLibrary(d1, NULL, 0, &IID_ID3D12PipelineLibrary, (void **)&lib);
+    CHECK(SUCCEEDED(hr) && lib, "pipelinelib: empty library created (%#lx)", hr);
+    if (rp_rs && rp_vs && rp_ps) create_pso(rp_rs, rp_vs, rp_ps, NULL, 0, DXGI_FORMAT_UNKNOWN, NULL, 0, &pso);
+    if (lib && pso) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pd; ZeroMemory(&pd, sizeof pd);   /* only has to be non-null here */
+        hr = ID3D12PipelineLibrary_LoadGraphicsPipeline(lib, L"rp", &pd, &IID_ID3D12PipelineState, (void **)&got);
+        CHECK(hr == E_INVALIDARG && !got, "pipelinelib: load before store is E_INVALIDARG (%#lx)", hr);
+        hr = ID3D12PipelineLibrary_StorePipeline(lib, L"rp", pso);
+        CHECK(SUCCEEDED(hr), "pipelinelib: StorePipeline (%#lx)", hr);
+        hr = ID3D12PipelineLibrary_StorePipeline(lib, L"rp", pso);
+        CHECK(hr == E_INVALIDARG, "pipelinelib: storing a taken name again is E_INVALIDARG (%#lx)", hr);
+        hr = ID3D12PipelineLibrary_LoadGraphicsPipeline(lib, L"rp", &pd, &IID_ID3D12PipelineState, (void **)&got);
+        CHECK(SUCCEEDED(hr) && got, "pipelinelib: stored pipeline loads back (%#lx)", hr);
+        if (got) { ID3D12PipelineState_Release(got); got = NULL; }
+        hr = ID3D12PipelineLibrary_LoadGraphicsPipeline(lib, L"other", &pd, &IID_ID3D12PipelineState, (void **)&got);
+        CHECK(hr == E_INVALIDARG && !got, "pipelinelib: unknown name is E_INVALIDARG (%#lx)", hr);
+
+        SIZE_T n = ID3D12PipelineLibrary_GetSerializedSize(lib);
+        BYTE *ser = n ? malloc(n) : NULL;
+        hr = ser ? ID3D12PipelineLibrary_Serialize(lib, ser, n) : E_FAIL;
+        CHECK(n > 0 && SUCCEEDED(hr), "pipelinelib: serialized (%lu bytes, %#lx)", (unsigned long)n, hr);
+        if (ser && SUCCEEDED(hr)) {
+            hr = ID3D12Device1_CreatePipelineLibrary(d1, ser, n, &IID_ID3D12PipelineLibrary, (void **)&lib2);
+            CHECK(SUCCEEDED(hr) && lib2, "pipelinelib: library recreated from its own blob (%#lx)", hr);
+            ser[0] ^= 0xff;
+            hr = ID3D12Device1_CreatePipelineLibrary(d1, ser, n, &IID_ID3D12PipelineLibrary, (void **)&lib3);
+            CHECK(hr == D3D12_ERROR_DRIVER_VERSION_MISMATCH && !lib3,
+                  "pipelinelib: foreign blob refused with D3D12_ERROR_DRIVER_VERSION_MISMATCH (%#lx)", hr);
+        }
+        free(ser);
+    }
+    if (lib3) ID3D12PipelineLibrary_Release(lib3);
+    if (lib2) ID3D12PipelineLibrary_Release(lib2);
+    if (lib) ID3D12PipelineLibrary_Release(lib);
+    if (pso) ID3D12PipelineState_Release(pso);
+    ID3D12Device1_Release(d1);
+}
+
 /* --------------------------------------------------------------------- main */
 
 int main(void) {
@@ -698,6 +797,8 @@ int main(void) {
     rp_setup();
     case_render_pass();
     case_render_pass_depth();
+    case_cached_blob();
+    case_pipeline_library();
     if (rp_rs) ID3D12RootSignature_Release(rp_rs);
     if (rp_vs) ID3D10Blob_Release(rp_vs);
     if (rp_ps) ID3D10Blob_Release(rp_ps);
