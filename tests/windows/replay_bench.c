@@ -91,6 +91,8 @@ static ID3DBlob *compile(pD3DCompile fn, const char *entry, const char *target) 
 
 int main(int argc, char **argv) {
     int ndraws = argc > 1 ? atoi(argv[1]) : 2000, nframes = argc > 2 ? atoi(argv[2]) : 200, i, f;
+    int dpl = argc > 3 ? atoi(argv[3]) : 0, nl, li;   /* draws per list: 0 = one list (Unity records ~33) */
+    ID3D12CommandAllocator *allocs[512]; ID3D12GraphicsCommandList *lists[512]; ID3D12CommandList *cl[512];
     HMODULE dcc = LoadLibraryA("d3dcompiler_47.dll"), d12 = LoadLibraryA("d3d12.dll");
     pD3DCompile comp = dcc ? (pD3DCompile)GetProcAddress(dcc, "D3DCompile") : NULL;
     pfn_create_device create = d12 ? (pfn_create_device)GetProcAddress(d12, "D3D12CreateDevice") : NULL;
@@ -205,31 +207,38 @@ int main(int argc, char **argv) {
         ID3D12Resource_Map(ibuf[i], 0, NULL, (void **)&m); if (m) { memcpy(m, ix, sizeof ix); ID3D12Resource_Unmap(ibuf[i], 0, NULL); }
     }
 
-    /* the list */
-    {
+    /* the lists */
+    if (dpl <= 0 || dpl > ndraws) dpl = ndraws;
+    nl = (ndraws + dpl - 1) / dpl; if (nl > 512) { printf("bench: too many lists\n"); return 2; }
+    for (li = 0; li < nl; li++) {
+        const int first = li * dpl, last = first + dpl < ndraws ? first + dpl : ndraws;
+
         const FLOAT clear[4] = { 0, 0, 1, 1 };
         D3D12_VIEWPORT vp; D3D12_RECT sc = { 0, 0, RT_W, RT_H }; ID3D12DescriptorHeap *heaps[2];
         UINT64 cva = ID3D12Resource_GetGPUVirtualAddress(cbuf);
         ZeroMemory(&vp, sizeof vp); vp.Width = RT_W; vp.Height = RT_H; vp.MaxDepth = 1;
         heaps[0] = srvh; heaps[1] = smph;
+        ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&allocs[li]);
+        ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocs[li], NULL, &IID_ID3D12GraphicsCommandList, (void **)&lists[li]);
+        list = lists[li];
         ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &rtv, FALSE, NULL);
-        ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, clear, 0, NULL);
+        if (li == 0) ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, clear, 0, NULL);
         ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
         ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
         ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
         ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
         ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, cva + (UINT64)(ndraws + NMAT) * OBJ_STRIDE);
-        for (i = 0; i < ndraws; i++) {
-            if (i % 12 == 0) ID3D12GraphicsCommandList_SetPipelineState(list, pso[(i / 12) % NPSO]);
-            if (i % 3 == 0) {
+        for (i = first; i < last; i++) {
+            if (i % 12 == 0 || i == first) ID3D12GraphicsCommandList_SetPipelineState(list, pso[(i / 12) % NPSO]);
+            if (i % 3 == 0 || i == first) {
                 D3D12_VERTEX_BUFFER_VIEW vbv; D3D12_INDEX_BUFFER_VIEW ibv; int b = (i / 3) % NVB;
                 vbv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(vbuf[b]); vbv.SizeInBytes = 96; vbv.StrideInBytes = 32;
                 ibv.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(ibuf[b]); ibv.SizeInBytes = 6; ibv.Format = DXGI_FORMAT_R16_UINT;
                 ID3D12GraphicsCommandList_IASetVertexBuffers(list, 0, 1, &vbv);
                 ID3D12GraphicsCommandList_IASetIndexBuffer(list, &ibv);
             }
-            if (i % 6 == 0) {
+            if (i % 6 == 0 || i == first) {
                 int m = (i / 6) % NMAT; D3D12_GPU_DESCRIPTOR_HANDLE g = sg, s = mg;
                 g.ptr += (UINT64)m * 3 * inc_srv; s.ptr += (UINT64)m * inc_smp;
                 ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 2, cva + (UINT64)(ndraws + m) * OBJ_STRIDE);
@@ -240,7 +249,7 @@ int main(int argc, char **argv) {
             { float rc[4] = { 1, 1, 1, 1 }; rc[0] = (float)(i % 5) / 5.0f; ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 5, 4, rc, 0); }
             ID3D12GraphicsCommandList_DrawIndexedInstanced(list, 3, 1, 0, 0, 0);
         }
-        {   /* RT -> readback, back to RT, so every frame ends with the same image */
+        if (li == nl - 1) {   /* RT -> readback, back to RT, so every frame ends with the same image */
             D3D12_RESOURCE_BARRIER b; D3D12_TEXTURE_COPY_LOCATION dl, sl;
             ZeroMemory(&b, sizeof b); b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = rt;
             b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -256,19 +265,19 @@ int main(int argc, char **argv) {
             ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
         }
         ID3D12GraphicsCommandList_Close(list);
+        cl[li] = (ID3D12CommandList *)list;
     }
 
     QueryPerformanceFrequency(&qf);
     for (f = 0; f < nframes; f++) {
-        ID3D12CommandList *l[1] = { (ID3D12CommandList *)list };
         QueryPerformanceCounter(&q0);
-        ID3D12CommandQueue_ExecuteCommandLists(queue, 1, l);
+        ID3D12CommandQueue_ExecuteCommandLists(queue, nl, cl);
         QueryPerformanceCounter(&q1);
         if (f >= 10) tot += (double)(q1.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
         wait_idle();
     }
-    printf("bench: %d draws x %d frames: ExecuteCommandLists %.3f ms/frame = %.3f us/draw (caller thread, frames 10..)\n",
-           ndraws, nframes, 1000.0 * tot / (nframes - 10), 1e6 * tot / ((double)(nframes - 10) * ndraws));
+    printf("bench: %d draws in %d lists x %d frames: ExecuteCommandLists %.3f ms/frame = %.3f us/draw (caller thread, frames 10..)\n",
+           ndraws, nl, nframes, 1000.0 * tot / (nframes - 10), 1e6 * tot / ((double)(nframes - 10) * ndraws));
     {   /* image hash of the last frame: must not change when the replay is optimised */
         BYTE *p = NULL; unsigned long long h = 1469598103934665603ull; int nz = 0;
         ID3D12Resource_Map(pix, 0, NULL, (void **)&p);
