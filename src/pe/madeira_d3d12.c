@@ -749,7 +749,7 @@ struct mad_air_out {
  * converter's headers, and the three fields are the whole contract. Taken from
  * IRDescriptorTableEntry and its Set* helpers in the converter's runtime
  * header, which is also where the encodings below come from. */
-struct mad_rtvp { UINT16 level, slice, layers, plane; };
+struct mad_rtvp { UINT16 level, slice, layers, plane, pf; };   /* wine-lab port: pf = the RTV's Metal format when it differs from the resource's, else 0 */
 struct mad_rtv { struct mad_resource *res; struct mad_rtvp p; };
 struct mad_descriptor {
     UINT64 gpu_va;          /* sampler resource id, or a buffer address */
@@ -792,8 +792,10 @@ static struct mad_resource *mad_slot_resource(SIZE_T handle) {
     return handle ? *(struct mad_resource **)handle : NULL;
 }
 static void mad_view_all(struct mad_resource *r, struct mad_rtvp *p, UINT first, UINT count, int is3d);
+struct mad_device;
+static obj_handle_t mad_rt_texture(struct mad_device *d, struct mad_resource *r, const struct mad_rtvp *v);
 static struct mad_rtvp mad_slot_view(SIZE_T handle) {
-    struct mad_rtvp z = { 0, 0, 1, 0 };
+    struct mad_rtvp z = { 0, 0, 1, 0, 0 };
     return handle ? ((struct mad_rtv *)handle)->p : z;
 }
 
@@ -2103,7 +2105,7 @@ static int mad_pso_lazy_on(void) {   /* madeira.cfg pso-lazy (default 1): pipeli
 }
 
 static int mad_rtvp_eq(const struct mad_rtvp *a, const struct mad_rtvp *b) {
-    return a->level == b->level && a->slice == b->slice && a->layers == b->layers && a->plane == b->plane;
+    return a->level == b->level && a->slice == b->slice && a->layers == b->layers && a->plane == b->plane && a->pf == b->pf;
 }
 static int exec_pending_index(struct mad_exec *e, struct mad_resource *r, const struct mad_rtvp *v) {
     unsigned i;
@@ -2145,7 +2147,7 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
             rpi.stencil.clear_stencil = e->pend[i].stencil;
         }
     } else {
-        rpi.colors[0].texture = e->pend[i].res->texture;
+        rpi.colors[0].texture = mad_rt_texture(e->q->device, e->pend[i].res, &e->pend[i].v);   /* wine-lab port: the RTV's format */
         mad_attach_view(&rpi.colors[0], e->pend[i].res, &e->pend[i].v);
         rpi.colors[0].load_action = WMTLoadActionClear; rpi.colors[0].store_action = WMTStoreActionStore;
         rpi.colors[0].clear_color.r = e->pend[i].rgba[0]; rpi.colors[0].clear_color.g = e->pend[i].rgba[1];
@@ -2273,7 +2275,7 @@ static int exec_begin_render(struct mad_exec *e) {
         int p;
         if (!r || !r->texture) continue;
         p = exec_pending_index(e, r, &e->rtp[i]);
-        rpi.colors[i].texture = r->texture;
+        rpi.colors[i].texture = mad_rt_texture(e->q->device, r, &e->rtp[i]);   /* wine-lab port: the RTV's format */
         mad_attach_view(&rpi.colors[i], r, &e->rtp[i]);   /* ml925 */
         if (e->rtp[i].layers > 1 && e->rtp[i].layers > rpi.render_target_array_length) rpi.render_target_array_length = e->rtp[i].layers;
         rpi.colors[i].load_action = p >= 0 ? WMTLoadActionClear : WMTLoadActionLoad;
@@ -6582,6 +6584,24 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     return id;
 }
 
+/* wine-lab port: the texture a render pass attaches for an RTV: the resource's
+ * own, or a whole-resource view in the RTV's format (cached with the SRV views,
+ * so attachment level/slice indices keep their meaning). */
+static obj_handle_t mad_rt_texture(struct mad_device *d, struct mad_resource *r, const struct mad_rtvp *v) {
+    UINT64 id; unsigned k; obj_handle_t tex = r->texture;
+    static unsigned said;
+    if (!v->pf || v->pf == (UINT16)r->tex_pf || !r->texture || r->is_depth) return r->texture;
+    id = mad_texture_view_id(d, r, r->tex_type, 0, ~0u, 0, ~0u, (enum WMTPixelFormat)v->pf, 0);
+    if (!id || id == r->gpu_resource_id) return r->texture;
+    EnterCriticalSection(&d->view_lock);
+    for (k = 0; k < r->nxview; k++) if (r->xview[k].id == id) { tex = r->xview[k].tex; break; }
+    LeaveCriticalSection(&d->view_lock);
+    if (said++ < 8)
+        d3d12_log("[madeira-d3d12] render target view in format %u of a format-%u texture (%ux%u %s): attached through a view\n",
+                  (unsigned)v->pf, (unsigned)r->tex_pf, r->width, r->height, r->name);
+    return tex;
+}
+
 /* Texture UAV clears. A texture UAV descriptor holds only the Metal view's
  * resource id; ClearUnorderedAccessView* needs the mip, slices and format
  * behind it, so every texture UAV's shape is remembered by id (a small
@@ -8718,7 +8738,7 @@ static void STDMETHODCALLTYPE device_CreateDepthStencilView(ID3D12Device *This,
     static unsigned said;
     (void)This;
     if (!v) return;
-    v->res = r; v->p.level = 0; v->p.slice = 0; v->p.plane = 0; v->p.layers = 1;
+    v->res = r; v->p.level = 0; v->p.slice = 0; v->p.plane = 0; v->p.layers = 1; v->p.pf = 0;
     if (!r) return;
     if (!desc) { mad_view_all(r, &v->p, 0, (UINT)-1, 0); }
     else switch (desc->ViewDimension) {   /* ml925 */
@@ -8748,8 +8768,19 @@ static void STDMETHODCALLTYPE device_CreateRenderTargetView(ID3D12Device *This,
     static unsigned said;
     (void)This;
     if (!v) return;
-    v->res = r; v->p.level = 0; v->p.slice = 0; v->p.plane = 0; v->p.layers = 1;
+    v->res = r; v->p.level = 0; v->p.slice = 0; v->p.plane = 0; v->p.layers = 1; v->p.pf = 0;
     if (!r) return;
+    /* wine-lab port: an RTV may name another format of the resource's family
+     * (sRGB on a UNORM/TYPELESS texture, SNORM on TYPELESS). The pass used to
+     * attach the texture in its own format, so Metal saw a pipeline format that
+     * did not match the attachment (validation: "RGBA8Unorm_sRGB / RGBA8Snorm
+     * does not match RGBA8Unorm") and Unity 6's post-processing wrote nothing
+     * usable: PEAK's colour-grading LUT came out black, so did the menu. */
+    if (desc && desc->Format != DXGI_FORMAT_UNKNOWN && !r->is_depth && r->texture) {
+        enum WMTPixelFormat pf; int isd = 0;
+        if (mad_map_texture_format(desc->Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, &pf, &isd) && !isd && pf != r->tex_pf)
+            v->p.pf = (UINT16)pf;
+    }
     if (!desc) { mad_view_all(r, &v->p, 0, (UINT)-1, r->tex_type == WMTTextureType3D); }
     else switch (desc->ViewDimension) {   /* ml925 */
     case D3D12_RTV_DIMENSION_TEXTURE1D: v->p.level = (UINT16)desc->Texture1D.MipSlice; break;
