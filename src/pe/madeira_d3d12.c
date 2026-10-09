@@ -10134,6 +10134,9 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
                               air_vs.cb_bind == ~0u ? -1 : (int)air_vs.cb_bind,
                               air_vs.arg_bind == ~0u ? -1 : (int)air_vs.arg_bind,
                               air_vs.arg_qwords, air_vs.nranges, desc->InputLayout.NumElements);
+                /* wine-lab port: this backend fetches vertices itself and fills no
+                 * vsin[] (only the count), so the matching below read stack garbage. */
+                nvsin = 0;
             } else {
                 mad_apply_reflected_layout(p, rs, locs, nl, "VS");
             }
@@ -10281,7 +10284,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
             p->vb_stride[i] = vd.layouts[6 + i].stride;
             p->vb_mask |= 1u << i;
         }
-    } else if (desc->InputLayout.NumElements) {
+    } else if (desc->InputLayout.NumElements && p->backend != MADEIRA_IR_BACKEND_AIRCONV) {
         d3d12_log("[madeira-d3d12] input layout has %u elements but the vertex shader reported no inputs\n",
                   desc->InputLayout.NumElements);
     }
