@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/stat.h>
 
 /* What Wine's unixlib.h provides; DXMT's unix side defines these itself too. */
@@ -441,6 +442,15 @@ static NTSTATUS ctl(void *args)
     struct madeira_ctl_args *a = args;
     a->ret = 0;
     switch (a->op) {
+    case 0: {   /* wine-lab port: capture request -- creating $MADEIRA_DOCS_DIR/capture-now captures the next frame */
+        const char *dir = getenv("MADEIRA_DOCS_DIR");
+        char path[1024];
+        if (dir && snprintf(path, sizeof path, "%s/capture-now", dir) < (int)sizeof path && unlink(path) == 0) {
+            fprintf(stderr, "[d3d12.so] capture-now: capturing the next frame\n");
+            a->ret = 1;
+        }
+        break;
+    }
     case 2: {
         char env[300] = "MADEIRA_", *q = env + 8;
         const char *k, *v;
