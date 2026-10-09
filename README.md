@@ -9,8 +9,9 @@ Hobby project, early stage. Madeira's original README is in [README.madeira.md](
 ## Status
 
 - Madeira's API test passes 89/90 (the one failure is a stale synchronous-fence expectation); its D3D12 cube renders.
-- Shaders: **DXIL only**, through Apple's Metal Shader Converter. DXBC (shader model 5.x) needs DXMT's airconv
-  backend, not built yet, so most Unity D3D12 games don't run yet.
+- Shaders: DXIL through Apple's Metal Shader Converter; DXBC (shader model 5.x) through DXMT's airconv, linked
+  into `d3d12.so` (needs dxmt-src's `d3d12-airconv` APIs). The DXBC test (root constants/CBV, SRV table + static
+  sampler, vertex-buffer input layout) passes; real games' DXBC is still largely untried.
 - Geometry/tessellation emulation pipelines build but are untested with real shaders.
 
 ## How it differs from Madeira
