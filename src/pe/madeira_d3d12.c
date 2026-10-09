@@ -3131,6 +3131,7 @@ static int mad_air_build_vb_table(struct mad_exec *e, const struct mad_pso *pso,
 
 /* Build the two argument buffers for one dispatch. Returns 0 and logs the first
  * unresolvable range rather than dispatching against a half-filled table. */
+static UINT64 mad_air_plain_view(struct mad_device *d, UINT64 view_id);   /* wine-lab port */
 static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
                                    UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
@@ -3222,8 +3223,10 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                 tab[off + 0] = de.texture_view_id;
                 tab[off + 1] = ((UINT64)count << 32) | (UINT64)first;
             } else {
-                tab[off + 0] = de.texture_view_id;
-                tab[off + 1] = ((UINT64)mad_air_array_len(d, de.texture_view_id) << 32)
+                /* wine-lab port: a range not declared as an array gets the plain twin */
+                UINT64 vid = (rg->flags & MADEIRA_IR_AIR_F_TEXTURE_ARRAY) ? de.texture_view_id : mad_air_plain_view(d, de.texture_view_id);
+                tab[off + 0] = vid;
+                tab[off + 1] = ((UINT64)mad_air_array_len(d, vid) << 32)
                              | (de.metadata & 0xffffffffull);     /* min LOD clamp */
             }
         } else {
@@ -6602,6 +6605,48 @@ static obj_handle_t mad_rt_texture(struct mad_device *d, struct mad_resource *r,
     return tex;
 }
 
+/* wine-lab port: NON-ARRAY TWINS for the DXBC backend. Every texture here is a
+ * Metal array texture and every view an array view (ml932: Apple's converter
+ * reads all 2D/cube textures as arrays). airconv declares exactly what the
+ * shader declares -- texture2d for a Texture2D -- and Metal sampling a
+ * texture2d argument that holds a texture2d_array returned ZERO (sample_b /
+ * sample_l): PEAK's colour-grading LUT, TAA, bloom and the whole post chain
+ * were black or flat while the scene itself rendered. Each one-layer 2D array
+ * view (6-layer cube array, one-layer MS array) gets a plain twin view with
+ * the same mips, format and swizzle; the view map remembers it (b), and the
+ * DXBC table builder binds the twin to any texture range not declared as an
+ * array. */
+static void mad_air_make_twin(struct mad_device *d, struct mad_resource *r, UINT64 view_id) {
+    enum WMTTextureType type, plain; UINT lvl0, nlvl, sl0, nsl, pf, swz; unsigned k; int found = 0;
+    UINT64 twin;
+    static unsigned said_big;
+    if (!r || !r->texture || !view_id) return;
+    if (view_id == r->gpu_resource_id && r->borrowed) return;   /* its id outlives our bookkeeping */
+    EnterCriticalSection(&d->view_lock);
+    if (view_id == r->gpu_resource_id) {
+        type = r->tex_type; lvl0 = 0; nlvl = r->tex_mips; sl0 = 0; nsl = r->tex_layers ? r->tex_layers : 1; pf = r->tex_pf; swz = MAD_SWZ_IDENTITY; found = 1;
+    } else for (k = 0; k < r->nxview; k++) if (r->xview[k].id == view_id) {
+        type = (enum WMTTextureType)r->xview[k].type; lvl0 = r->xview[k].lvl0; nlvl = r->xview[k].nlvl;
+        sl0 = r->xview[k].sl0; nsl = r->xview[k].nsl; pf = r->xview[k].pf; swz = r->xview[k].swz; found = 1; break;
+    }
+    LeaveCriticalSection(&d->view_lock);
+    if (!found) return;
+    if (type == WMTTextureType2DArray && nsl == 1) plain = WMTTextureType2D;
+    else if (type == WMTTextureTypeCubeArray && nsl == 6) plain = WMTTextureTypeCube;
+    else if (type == WMTTextureType2DMultisampleArray && nsl == 1) plain = WMTTextureType2DMultisample;
+    else return;
+    twin = mad_texture_view_id(d, r, plain, lvl0, nlvl, sl0, nsl, (enum WMTPixelFormat)pf, swz);
+    if (!twin || twin == view_id || twin == r->gpu_resource_id) return;
+    if (twin > 0xffffffffull) { if (!said_big++) d3d12_log("[madeira-d3d12] non-array twin view id %#llx does not fit the view map; DXBC shaders keep the array view\n", (unsigned long long)twin); return; }
+    EnterCriticalSection(&d->view_lock);
+    mad_vmap_put_locked(d, view_id, nsl, (UINT32)twin);
+    LeaveCriticalSection(&d->view_lock);
+}
+static UINT64 mad_air_plain_view(struct mad_device *d, UINT64 view_id) {
+    UINT32 a = 0, b = 0;
+    return (mad_vmap_get(d, view_id, &a, &b) && b) ? (UINT64)b : view_id;
+}
+
 /* Texture UAV clears. A texture UAV descriptor holds only the Metal view's
  * resource id; ClearUnorderedAccessView* needs the mip, slices and format
  * behind it, so every texture UAV's shape is remembered by id (a small
@@ -6803,6 +6848,7 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
         }
         mad_uavtex_put(view_id, r, clr_level, clr_sl0, clr_nsl, clr_fmt);
         e->gpu_va = 0; e->texture_view_id = view_id; e->metadata = 0;
+        mad_air_make_twin((struct mad_device *)This, r, view_id);   /* wine-lab port */
         return;
     }
     if (!said_kind++) d3d12_log("[madeira-d3d12] CreateUnorderedAccessView: resource has no backend object\n");
@@ -8913,6 +8959,7 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
     e->gpu_va = 0;
     e->texture_view_id = view_id;
     e->metadata = (UINT64)lod_bits;
+    mad_air_make_twin((struct mad_device *)This, r, view_id);   /* wine-lab port */
 
     mad_view_list_add((struct mad_device *)This, 0, r);
 }
