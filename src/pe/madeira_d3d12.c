@@ -1265,7 +1265,6 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
                                             ID3D12CommandAllocator *allocator,
                                             ID3D12PipelineState *pso) {
     struct mad_list *l = (struct mad_list *)This;
-    (void)pso;
     if (!l->closed) return E_FAIL;         /* reset while recording */
     if (!allocator) return E_INVALIDARG;
     if (l->inflight) mad_list_wait_idle(l);   /* ml1120: the submission worker still replays it */
@@ -1282,6 +1281,10 @@ static HRESULT STDMETHODCALLTYPE list_Reset(ID3D12GraphicsCommandList *This,
     l->ncdata = 0;
     l->rp_open = 0; l->rp_nresolves = 0;   /* wine-lab port: render pass state */
     mad_list_rings_rewind(l);   /* ml1061: only reuses chunks the GPU has finished with */
+    /* wine-lab port: the initial pipeline state is bound as if by SetPipelineState.
+     * It used to be dropped, and Unity (PEAK) resets lists with the pipeline its
+     * first draw uses: 1406 draws reached replay with no pipeline at all. */
+    if (pso) { struct mad_cmd *c = mad_list_push(l, MC_PSO); if (c) c->u.pso = (struct mad_pso *)pso; }
     return S_OK;
 }
 static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(ID3D12GraphicsCommandList *This) {
@@ -6053,7 +6056,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandAllocator(ID3D12Device *Thi
 static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UINT node,
         D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *allocator,
         ID3D12PipelineState *pso, REFIID riid, void **out) {
-    (void)This; (void)node; (void)pso;
+    (void)This; (void)node;
     if (!out || !allocator) return E_INVALIDARG;
     if (!mad_list_type_ok(type)) return mad_silent_notimpl(__LINE__);
     if (((struct mad_alloc *)allocator)->type != type) return E_INVALIDARG;
@@ -6066,6 +6069,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandList(ID3D12Device *This, UI
     ID3D12CommandAllocator_AddRef(allocator);
     InterlockedIncrement(&l->alloc->recording);   /* lists are created recording */
     l->recorded_generation = l->alloc->generation;
+    if (pso) { struct mad_cmd *c = mad_list_push(l, MC_PSO); if (c) c->u.pso = (struct mad_pso *)pso; }   /* wine-lab port: initial state */
     HRESULT hr = list_QI((ID3D12GraphicsCommandList *)l, riid, out);
     list_Release((ID3D12GraphicsCommandList *)l);
     return hr;
