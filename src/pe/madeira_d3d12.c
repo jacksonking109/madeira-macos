@@ -1498,6 +1498,7 @@ struct mad_exec {
     int f7_next_rts;            /* ml1137: exec_end called by exec_begin_render: rt/depth are the NEXT pass's targets */
     /* resources already declared (useResource) on the current encoder, see mad_use_seen */
     obj_handle_t ud_enc; unsigned ud_n, ud_committed;
+    obj_handle_t ud_done_enc; const struct mad_list *ud_done_l; UINT32 ud_done_stages; int ud_pend_done;   /* wine-lab port: see exec_draw */
     struct { obj_handle_t h; UINT32 usage, stages; } ud[96];
 };
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
@@ -4090,6 +4091,7 @@ static int g_use_dedup = -1;
 static void mad_use_begin(struct mad_exec *e, obj_handle_t enc) {
     if (e->ud_enc != enc) { e->ud_enc = enc; e->ud_n = e->ud_committed = 0; }
     else e->ud_n = e->ud_committed;
+    e->ud_pend_done = 0;
 }
 static void mad_use_commit(struct mad_exec *e) { e->ud_committed = e->ud_n; }
 static int mad_use_seen(struct mad_exec *e, obj_handle_t enc, obj_handle_t h, UINT32 usage, UINT32 stages) {
@@ -4454,9 +4456,15 @@ tess_go:
         for (i = 0; i < 16; i++) if (e->vb[i].res) MAD_USE(e->vb[i].res->buffer);
         if (e->ib) MAD_USE(e->ib->buffer);
     }
-    for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
-        struct mad_resource *r = e->l->used[i];
-        if (r) MAD_USE(r->texture ? r->texture : r->buffer);
+    /* wine-lab port: the resources a list reached by address are declared from the same last-64 window for
+     * EVERY draw of the list; once one draw of this encoder has declared them for these stages (and was
+     * encoded), the loop is skipped -- each pass over it was 64 dedupe scans of up to 96 entries. */
+    if (!(e->ud_done_enc == e->renc && e->ud_done_l == e->l && e->ud_done_stages == use_stages)) {
+        for (i = e->l->nused > 64 ? e->l->nused - 64 : 0; i < e->l->nused; i++) {
+            struct mad_resource *r = e->l->used[i];
+            if (r) MAD_USE(r->texture ? r->texture : r->buffer);
+        }
+        if (nur < 256) e->ud_pend_done = 1;   /* nothing was dropped for want of room */
     }
     /* ml1060: with a residency set (ml880) these two loops are a fallback, and once
      * the application has more than 256 viewed resources they are not even that:
@@ -4673,6 +4681,7 @@ tess_go:
             exec_bat_submit(e, &c_head);
         }
         e->enc_dirty = 0;
+        if (e->ud_pend_done) { e->ud_done_enc = e->renc; e->ud_done_l = e->l; e->ud_done_stages = use_stages; e->ud_pend_done = 0; }
         if (want != ~(UINT64)0) v->dirty = 1;
         PR_LAP(pr_t, PR_ENCODE);
     }
