@@ -1572,6 +1572,7 @@ static void mad_perf_replay_report(void) {
     d3d12_log("%s\n", line);
     d3d12_log("[perf-replay] table reuse: constant-buffer tables %lld built / %lld reused, argument tables %lld built / %lld reused\n",
               (long long)g_pr_x[4], (long long)g_pr_x[5], (long long)g_pr_x[6], (long long)g_pr_x[7]);
+    d3d12_log("[perf-replay] encoders: %lld created, %.2f us each in the unix call, %.2f us each in the fence waits\n", (long long)g_pr_x[1], g_pr_x[1] ? g_pr_x[0] * us / g_pr_x[1] : 0.0, g_pr_x[1] ? g_pr_x[2] * us / g_pr_x[1] : 0.0);
     memset(g_pr_x, 0, sizeof g_pr_x);
     memset(g_pr_t, 0, sizeof g_pr_t); g_pr_draws = g_pr_lists = g_pr_cmds = 0;
     g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
@@ -2489,13 +2490,15 @@ static int exec_begin_render_impl(struct mad_exec *e) {
         if (e->depth && e->depth->texture)
             InterlockedExchangeAdd64(rpi.depth.load_action == WMTLoadActionClear ? &g_ac_clear : &g_ac_load, f7_att_bytes(e->depth, e->dp.level));
     }
+    LONG64 px0 = PR_NOW();
     e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
+    if (g_perf_replay > 0) { g_pr_x[0] += PR_NOW() - px0; g_pr_x[1]++; }
     memset(&e->sh, 0, sizeof e->sh);   /* wine-lab port: a new encoder knows nothing */
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
     for (i = 0; i < e->nrt && e->f6_natt < 8; i++) if (e->rt[i]) e->f6_att[e->f6_natt++] = e->rt[i];
     if (e->depth) e->f6_att[e->f6_natt++] = e->depth;
-    if (e->renc) exec_fence_render(e, e->renc, 0);   /* ml1091 */
+    if (e->renc) { LONG64 px1 = PR_NOW(); exec_fence_render(e, e->renc, 0); if (g_perf_replay > 0) g_pr_x[2] += PR_NOW() - px1; }   /* ml1091 */
     if (e->renc) {   /* ml1070 */
         LONG64 bytes = 0;
         for (i = 0; i < e->nrt; i++) if (e->rt[i]) bytes += (LONG64)e->rt[i]->width * e->rt[i]->height * 4 * (e->rt[i]->samples ? e->rt[i]->samples : 1);
