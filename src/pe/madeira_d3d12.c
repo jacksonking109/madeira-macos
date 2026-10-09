@@ -2116,23 +2116,29 @@ static long long mad_cfg_int_pe(const char *key, long long dflt) {
 enum { PR_DRAW, PR_BEGIN, PR_ARGSLOT, PR_PSO, PR_TABLES, PR_USE, PR_BUILD, PR_ENCODE, PR_LIST, PR_N };
 static int g_perf_replay = -1;
 static LONG64 g_pr_t[PR_N]; static LONG64 g_pr_draws, g_pr_lists, g_pr_cmds;
+/* QueryPerformanceCounter costs ~0.4 us here (Rosetta), more than most phases; the phase timers read the
+ * time stamp counter (a few ns) and the report converts ticks to seconds against QPC over the same interval. */
+static LONG64 g_pr_tsc0, g_pr_qpc0;
+#define PR_NOW() ((LONG64)__builtin_ia32_rdtsc())
 static int mad_perf_replay_on(void) {
     if (g_perf_replay < 0) { g_perf_replay = mad_cfg_int_pe("perf-replay", 0) ? 1 : 0;
+                             g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
                              d3d12_log("[madeira-d3d12] perf-replay = %d\n", g_perf_replay); }
     return g_perf_replay;
 }
-#define PR_LAP(var_, idx_) do { if (g_perf_replay > 0) { LONG64 n_ = mad_qpc(); g_pr_t[idx_] += n_ - (var_); (var_) = n_; } } while (0)
+#define PR_LAP(var_, idx_) do { if (g_perf_replay > 0) { LONG64 n_ = PR_NOW(); g_pr_t[idx_] += n_ - (var_); (var_) = n_; } } while (0)
 static void mad_perf_replay_report(void) {
     static const char *nm[PR_N] = { "draw-total", "begin-render", "arg-slot", "pso-select", "tables", "use-res", "cmd-build", "encode", "list-total" };
     LARGE_INTEGER f; char line[600]; int n; unsigned i; double us, d;
     QueryPerformanceFrequency(&f);
     d = g_pr_draws ? (double)g_pr_draws : 1.0;
-    us = 1e6 / (double)f.QuadPart;
+    us = 1e6 * ((double)(mad_qpc() - g_pr_qpc0) / (double)f.QuadPart) / (double)(PR_NOW() - g_pr_tsc0);   /* microseconds per tsc tick */
     n = snprintf(line, sizeof line, "[perf-replay] %lld draws in %lld lists (%lld cmds): per draw us:", (long long)g_pr_draws, (long long)g_pr_lists, (long long)g_pr_cmds);
     for (i = 0; i < PR_N; i++) n += snprintf(line + n, sizeof line - n, " %s %.3f", nm[i], g_pr_t[i] * us / d);
     n += snprintf(line + n, sizeof line - n, " | list-total minus draw-total: %.3f", (g_pr_t[PR_LIST] - g_pr_t[PR_DRAW]) * us / d);
     d3d12_log("%s\n", line);
     memset(g_pr_t, 0, sizeof g_pr_t); g_pr_draws = g_pr_lists = g_pr_cmds = 0;
+    g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
 }
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
@@ -3950,7 +3956,7 @@ static int mad_use_seen(struct mad_exec *e, obj_handle_t enc, obj_handle_t h, UI
 }
 
 static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
-    LONG64 pr_t = g_perf_replay > 0 ? mad_qpc() : 0;   /* perf-replay */
+    LONG64 pr_t = g_perf_replay > 0 ? PR_NOW() : 0;   /* perf-replay */
     struct wmtcmd_render_setpso c_pso;
     struct wmtcmd_render_draw_indirect c_di;
     struct wmtcmd_render_setblendcolor c_bl;
@@ -4517,9 +4523,9 @@ tess_go:
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     LONG64 t0;
     if (g_perf_replay <= 0) { exec_draw_impl(e, c); return; }
-    t0 = mad_qpc();
+    t0 = PR_NOW();
     exec_draw_impl(e, c);
-    g_pr_t[PR_DRAW] += mad_qpc() - t0; g_pr_draws++;
+    g_pr_t[PR_DRAW] += PR_NOW() - t0; g_pr_draws++;
 }
 
 /* Depth-stencil plane copies. Metal copies one plane of a combined
@@ -4989,7 +4995,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    LONG64 pr_list_t0 = mad_perf_replay_on() ? mad_qpc() : 0;   /* perf-replay */
+    LONG64 pr_list_t0 = mad_perf_replay_on() ? PR_NOW() : 0;   /* perf-replay */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         e.cur = i;   /* ml1137 */
@@ -5084,7 +5090,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         }
     }
     if (g_perf_replay > 0) {   /* perf-replay: the command loop only (ends of passes and clears are outside it) */
-        g_pr_t[PR_LIST] += mad_qpc() - pr_list_t0; g_pr_lists++; g_pr_cmds += l->ncmds;
+        g_pr_t[PR_LIST] += PR_NOW() - pr_list_t0; g_pr_lists++; g_pr_cmds += l->ncmds;
         if (g_pr_draws >= 20000) mad_perf_replay_report();
     }
     q->open_draws += e.draws;   /* wine-lab port: batch-draws */

@@ -34,7 +34,7 @@
 typedef HRESULT (WINAPI *pfn_create_device)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *pfn_serialize_rs)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
 
-enum { RT_W = 64, RT_H = 64, NPSO = 4, NMAT = 16, NVB = 8, OBJ_STRIDE = 256 };
+enum { RT_W = 64, RT_H = 64, NPSO = 4, NMAT = 96, NVB = 8, OBJ_STRIDE = 256 };
 
 static ID3D12Device *dev; static ID3D12CommandQueue *queue; static ID3D12CommandAllocator *alloc;
 static ID3D12GraphicsCommandList *list; static ID3D12Fence *fence; static UINT64 fence_v;
