@@ -1428,6 +1428,20 @@ struct mad_encsh {
     struct wmtcmd_render_setrasterizerstate ras; int has_ras;
     struct { obj_handle_t buf; UINT64 off; } buf[4][32];   /* vertex, fragment, object, mesh stage x index */
 };
+/* wine-lab port: TABLE REUSE. A draw's constant-buffer table and argument table are functions of the
+ * pipeline stage's range list, the root signature, the two bound heaps and the root arguments the
+ * ranges actually read (a descriptor table's base, a root CBV's address). When the same stage is built
+ * again with the same inputs inside one list, the table already in the ring is bound again: no ring
+ * space, no resolve, no descriptor copies, and the binding itself is elided by the encoder shadow.
+ * Tables that read root constants (copied into the ring per build) are never reused. The cache lives
+ * in the replay state and starts empty for every list: a ring chunk belongs to its list. */
+#define MAD_TC_N 8
+#define MAD_TC_DEP 12
+struct mad_tcpart { int valid; obj_handle_t buf; UINT64 off; UINT32 dep; UINT64 rv[MAD_TC_DEP]; };
+struct mad_tcent {
+    const void *airv; const struct mad_rootsig *rs; const void *srv, *smp; unsigned vis_mask, nair, cb_bind, arg_bind, arg_qwords;
+    struct mad_tcpart cb, arg;
+};
 struct mad_exec {
     int fence_needed;
     struct mad_resource *wr[64]; unsigned nwr; int wr_all;   /* ml1116: written since the last fence wait (mode 3) */   /* ml1111: fence-chain = 2: a barrier (or list start) was seen since the last wait */
@@ -1444,6 +1458,8 @@ struct mad_exec {
     struct mad_rootsig *rs;
     unsigned cap_after;   /* ml918: capture rt[0] texels after the current draw */
     struct mad_encsh sh; int enc_dirty;   /* wine-lab port: redundant-state elision */
+    UINT32 dep_acc;   /* wine-lab port: root parameters the range being resolved read (bit i = root[i]); bit 31 = root constants, not cacheable */
+    struct mad_tcent tc[MAD_TC_N];
     unsigned char *bat; size_t bat_used; struct wmtcmd_base *bat_tail; struct wmtcmd_base bat_head;   /* wine-lab port: draw chains not yet sent to the encoder */
     unsigned char *arg_cpu;   /* wine-lab port: the CPU view of the slot exec_arg_slot_for just filled */
     struct mad_resource *cap_after_cs;   /* ml920: texture to capture after the current dispatch */
@@ -2201,7 +2217,7 @@ static int g_perf_replay = -1;
 static LONG64 g_pr_t[PR_N]; static LONG64 g_pr_draws, g_pr_lists, g_pr_cmds;
 /* QueryPerformanceCounter costs ~0.4 us here (Rosetta), more than most phases; the phase timers read the
  * time stamp counter (a few ns) and the report converts ticks to seconds against QPC over the same interval. */
-static LONG64 g_pr_tsc0, g_pr_qpc0;
+static LONG64 g_pr_tsc0, g_pr_qpc0; static LONG64 g_pr_x[8];   /* 4/5: cb-table miss/hit, 6/7: arg-table miss/hit */
 #include <stddef.h>
 #define PR_NOW() ((LONG64)__builtin_ia32_rdtsc())
 static int mad_perf_replay_on(void) {
@@ -2221,6 +2237,9 @@ static void mad_perf_replay_report(void) {
     for (i = 0; i < PR_N; i++) n += snprintf(line + n, sizeof line - n, " %s %.3f", nm[i], g_pr_t[i] * us / d);
     n += snprintf(line + n, sizeof line - n, " | list-total minus draw-total: %.3f", (g_pr_t[PR_LIST] - g_pr_t[PR_DRAW]) * us / d);
     d3d12_log("%s\n", line);
+    d3d12_log("[perf-replay] table reuse: constant-buffer tables %lld built / %lld reused, argument tables %lld built / %lld reused\n",
+              (long long)g_pr_x[4], (long long)g_pr_x[5], (long long)g_pr_x[6], (long long)g_pr_x[7]);
+    memset(g_pr_x, 0, sizeof g_pr_x);
     memset(g_pr_t, 0, sizeof g_pr_t); g_pr_draws = g_pr_lists = g_pr_cmds = 0;
     g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
 }
@@ -3207,6 +3226,7 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
 
                 idx = range_off + (rg->lower_bound - rr->base_register);
                 table_gpu = root[i];
+                e->dep_acc |= 1u << i;
                 if (!table_gpu) { *why = "descriptor table root argument never set"; return 0; }
                 h = (rg->type == MADEIRA_IR_AIR_SAMPLER) ? e->smp : e->srv;
                 if (!h || !h->cpu || !h->gpu_address) { *why = "the matching descriptor heap is not bound"; return 0; }
@@ -3229,6 +3249,7 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
             obj_handle_t cb; UINT64 coff, cgpu; void *ccpu;
             if (rg->type != MADEIRA_IR_AIR_CBV) continue;
             if (pp->shader_register != rg->lower_bound || pp->register_space != rg->space) continue;
+            e->dep_acc |= 0x80000000u;
             n = pp->num_constants > 64 ? 64 : pp->num_constants;
             if (!exec_ring_take_z(e, 256, 256, &cb, &coff, &ccpu, &cgpu)) { *why = "no ring slot for root constants"; return 0; }   /* ml1130 */
             memcpy(ccpu, consts[i], (size_t)n * 4);
@@ -3238,6 +3259,7 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
 
         if (pp->type == want_param) {
             if (pp->shader_register != rg->lower_bound || pp->register_space != rg->space) continue;
+            e->dep_acc |= 1u << i;
             if (!root[i]) { *why = "root descriptor never set"; return 0; }
             /* A root SRV/UAV carries an address and no length, and the backend
              * needs a byte length for buffer bindings. Refuse rather than
@@ -3342,16 +3364,33 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
     void *cpu;
     unsigned k;
     static unsigned said_fail;
+    struct mad_tcent *ent; int cb_hit = 0, arg_hit = 0; UINT32 dep_cb = 0, dep_arg = 0;
 
     *cb_buf = *arg_buf = 0; *cb_off = *arg_off = 0;
 
-    if (cb_bind != ~0u) {
+    /* wine-lab port: table reuse (see mad_tcent) */
+    ent = &e->tc[(unsigned)(((uintptr_t)airv >> 4) ^ ((uintptr_t)rs >> 6) ^ vis_mask) & (MAD_TC_N - 1)];
+    if (ent->airv != airv || ent->rs != rs || ent->srv != e->srv || ent->smp != e->smp || ent->vis_mask != vis_mask || ent->nair != nair ||
+        ent->cb_bind != cb_bind || ent->arg_bind != arg_bind || ent->arg_qwords != arg_qwords) {
+        memset(ent, 0, sizeof *ent);
+        ent->airv = airv; ent->rs = rs; ent->srv = e->srv; ent->smp = e->smp; ent->vis_mask = vis_mask; ent->nair = nair;
+        ent->cb_bind = cb_bind; ent->arg_bind = arg_bind; ent->arg_qwords = arg_qwords;
+    }
+#define MAD_TC_MATCH(part_) ({ int m_ = (part_).valid; UINT32 b_ = (part_).dep; unsigned j_ = 0; \
+        while (m_ && b_) { unsigned i_ = (unsigned)__builtin_ctz(b_); b_ &= b_ - 1; if (root[i_] != (part_).rv[j_++]) m_ = 0; } m_; })
+    if (cb_bind != ~0u && MAD_TC_MATCH(ent->cb)) { cb_hit = 1; *cb_buf = ent->cb.buf; *cb_off = ent->cb.off; }
+    if (arg_bind != ~0u && MAD_TC_MATCH(ent->arg)) { arg_hit = 1; *arg_buf = ent->arg.buf; *arg_off = ent->arg.off; }
+    if (g_perf_replay > 0) { g_pr_x[4 + cb_hit] += cb_bind != ~0u; g_pr_x[6 + arg_hit] += arg_bind != ~0u; }
+    if (cb_hit && (arg_hit || arg_bind == ~0u)) return 1;
+    if (arg_hit && cb_bind == ~0u) return 1;
+
+    if (cb_bind != ~0u && !cb_hit) {
         size_t cbz = 8;   /* ml1130: up to the highest constant-buffer entry this stage has */
         for (k = 0; k < nair; k++) if (airv[k].cb_table && ((size_t)airv[k].ptr_offset + 3) * 8 > cbz) cbz = ((size_t)airv[k].ptr_offset + 3) * 8;
         if (!exec_ring_take_z(e, cbz, cbz, cb_buf, cb_off, &cpu, &gpu)) return 0;
         cb_words = (UINT64 *)cpu;
     }
-    if (arg_bind != ~0u) {
+    if (arg_bind != ~0u && !arg_hit) {
         if ((UINT64)arg_qwords * 8 > MAD_ARG_RING_BYTES) {   /* ml1087; wine-lab port: the table is taken by the granule now */
             if (said_fail++ < 8)
                 d3d12_log("[madeira-d3d12] ml1008 '%s' wants a %u-qword argument table; a whole ring chunk holds %u\n",
@@ -3370,7 +3409,9 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
         UINT64 *tab = rg->cb_table ? cb_words : arg_words;
         UINT off = rg->ptr_offset;
 
+        if (rg->cb_table ? cb_hit : arg_hit) continue;   /* wine-lab port: that table is already built */
         if (!tab) { why = "the table this range belongs to was not reported"; goto bad; }
+        e->dep_acc = 0;
         if (!mad_air_resolve(e, rs, root, consts, rg, vis_mask, &de, &direct, &why)) {
             /* If the stage filter is what lost it, the signature's visibility
              * was parsed wrong or the engine relies on lax behaviour: bind as
@@ -3379,6 +3420,7 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
             if (vis_mask == ~0u || !mad_air_resolve(e, rs, root, consts, rg, ~0u, &de, &direct, &why2)) goto bad;
             InterlockedIncrement(&g_vis_fallback);
         }
+        if (rg->cb_table) dep_cb |= e->dep_acc; else dep_arg |= e->dep_acc;
 
         if (g_dump_tables)   /* ml1106 */
             d3d12_log("[capture-draw]   %s%u space%u -> %s word %u: va=0x%llx view=%llu meta=0x%llx direct=0x%llx flags=%#x\n",
@@ -3448,6 +3490,14 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
         }
         return 0;
     }
+#define MAD_TC_STORE(part_, dep_, buf_, off_) do { \
+        UINT32 b_ = (dep_); unsigned j_ = 0; \
+        if (!(b_ & 0x80000000u) && __builtin_popcount(b_) <= MAD_TC_DEP) { \
+            (part_).valid = 1; (part_).buf = (buf_); (part_).off = (off_); (part_).dep = b_; \
+            while (b_) { unsigned i_ = (unsigned)__builtin_ctz(b_); b_ &= b_ - 1; (part_).rv[j_++] = root[i_]; } \
+        } else (part_).valid = 0; } while (0)
+    if (cb_bind != ~0u && !cb_hit) MAD_TC_STORE(ent->cb, dep_cb, *cb_buf, *cb_off);
+    if (arg_bind != ~0u && !arg_hit) MAD_TC_STORE(ent->arg, dep_arg, *arg_buf, *arg_off);
     return 1;
 }
 static int mad_air_build_tables(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
