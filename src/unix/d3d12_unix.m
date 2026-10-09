@@ -256,30 +256,30 @@ static NSError *geom_error(NSString *fmt, ...)
 
 /* A mesh pipeline must have a fragment function (Metal asserts on a nil one,
  * where a vertex pipeline accepts it), so a pipeline without a pixel shader
- * (depth-only passes) gets an empty one. One per device, kept for the process. */
+ * (depth-only passes) gets an empty one. One per device, kept for the process; a compile that failed is
+ * remembered (cached_fn nil) rather than retried on every pipeline. The result is autoreleased so a caller
+ * on another thread keeps it alive across a switch of device. */
 static id<MTLFunction> empty_fragment_function(id<MTLDevice> dev)
 {
     static id<MTLDevice> cached_dev;
     static id<MTLFunction> cached_fn;
     id<MTLFunction> fn = nil;
     @synchronized ([MTLMeshRenderPipelineDescriptor class]) {
-        if (cached_dev == dev && cached_fn) {
-            fn = cached_fn;
-        } else {
+        if (cached_dev != dev) {
             NSError *e = nil;
             id<MTLLibrary> l = [dev newLibraryWithSource:@"fragment void madeira_empty_fragment() {}" options:nil error:&e];
-            fn = [l newFunctionWithName:@"madeira_empty_fragment"];
+            [cached_fn release];
+            [cached_dev release];
+            cached_fn = [l newFunctionWithName:@"madeira_empty_fragment"];
+            cached_dev = [dev retain];
             [l release];
-            if (fn) {
-                [cached_fn release];
-                [cached_dev release];
-                cached_fn = fn;
-                cached_dev = [dev retain];
-            }
+            if (!cached_fn) fprintf(stderr, "[d3d12.so] empty fragment function did not compile: %s\n",
+                                    e ? [[e localizedDescription] UTF8String] : "(no error)");
         }
     }
     return fn;
 }
+        fn = [[cached_fn retain] autorelease];
 
 static NTSTATUS new_geometry_emulation_pipeline_state(void *args)
 {
