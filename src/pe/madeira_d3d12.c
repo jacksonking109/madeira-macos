@@ -522,6 +522,7 @@ static void mad_skip_report(void) {
 
 static void mad_log_nserror(const char *what, obj_handle_t err);
 static void mad_nserror_text(obj_handle_t err, char *text, size_t cap);
+static void mad_nserror_drop(obj_handle_t err);
 static void mad_queue_revive(struct mad_device *d);
 struct mad_list; struct mad_queue;
 static void mad_list_rings_rewind(struct mad_list *l);
@@ -670,7 +671,7 @@ struct mad_pso {
     obj_handle_t rps;          /* Metal render pipeline state */
     UINT ps_rt_unwritten;   /* wine-lab port: render targets bound but not written by the PS (write mask 0) */
     /* wine-lab port: variants for passes that attach colour targets the pipeline does not declare */
-    struct { UINT16 fmt[8]; UINT strides[16]; obj_handle_t rps; } tvar[4]; unsigned ntvar; SRWLOCK tvar_lock; int has_rp;
+    struct { UINT16 fmt[8]; UINT strides[16]; obj_handle_t rps; } *tvar; unsigned ntvar, tvar_cap; SRWLOCK tvar_lock; int has_rp;   /* rps 0: Metal refused it */
     obj_handle_t vs_lib, ps_lib, vs_fn, ps_fn;
     int uses_depth, uses_stencil;
     UINT8 dbg_denable, dbg_dfunc, dbg_dwrite, dbg_wmask[8], dbg_senable, dbg_sfunc, dbg_srmask, dbg_swmask;   /* ml903/ml904: census only */
@@ -682,7 +683,7 @@ struct mad_pso {
      * pipeline assumes the tightest stride; when a draw binds a different one
      * the pipeline is rebuilt with the real strides and cached here. */
     struct WMTRenderPipelineInfo rp; struct WMTVertexDescriptorInfo vd; int has_vd;
-    struct { UINT strides[16]; obj_handle_t rps; } var[8]; unsigned nvar;
+    struct { UINT strides[16]; obj_handle_t rps; } *var; unsigned nvar, var_cap;   /* rps 0: Metal refused it */
     CRITICAL_SECTION var_lock;
     obj_handle_t device_handle;
     int lazy;                                       /* plain render pipeline built at its first draw (mad_pso_realize) */
@@ -1418,8 +1419,8 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
         free(q->carry);   /* wine-lab port */
-        free(q);
         free(q->bat);     /* wine-lab port: the draw-batch arena */
+        free(q);
     }
     return (ULONG)r;
 }
@@ -2809,6 +2810,9 @@ static void mad_pso_identity(const struct mad_pso *p, char *buf, size_t cap) {
         snprintf(buf + w, cap - w, "%s DS %u x%u%s%s", p->dbg_nrt ? "" : " none", p->dbg_dsvfmt, p->dbg_samples,
                  p->has_vd ? " VD" : "", p->is_compute ? " compute" : "");
 }
+/* wine-lab port: pipeline variants live until the pipeline's Release (a queued draw batch may still name an old one),
+ * so the caches are capped, not evicted; past the cap a draw uses the base pipeline. A refusal is cached too. */
+#define MAD_PSO_VARIANTS_MAX 64
 static obj_handle_t mad_pso_realize(struct mad_pso *p) {
     if (p->rps || !p->lazy) return p->rps;
     AcquireSRWLockExclusive(&p->rlock);   /* per pipeline: builds of different pipelines run in parallel */
@@ -2826,6 +2830,7 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
             p->lazy = 0;   /* draws with it are skipped from now on */
             mad_nserror_text(err, text, sizeof text);
+            if (p->has_vd) mad_nserror_drop(err);
             mad_pso_identity(p, id, sizeof id);
             if (n <= 200 && !InterlockedExchange(&p->said_fail, 1))
                 d3d12_log("[madeira-d3d12] lazy pipeline FAILED at first draw (#%ld; %s): %s; its draws are skipped\n",
@@ -2948,7 +2953,11 @@ static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides[16
     if (i == 16) return p->rps;                      /* the base pipeline already matches */
     EnterCriticalSection(&p->var_lock);
     for (k = 0; k < p->nvar; k++) if (!memcmp(p->var[k].strides, strides, sizeof p->var[k].strides)) {
-        rps = p->var[k].rps; LeaveCriticalSection(&p->var_lock); return rps;
+        rps = p->var[k].rps ? p->var[k].rps : p->rps; LeaveCriticalSection(&p->var_lock); return rps;
+    }
+    if (p->nvar >= MAD_PSO_VARIANTS_MAX || !mad_grow((void **)&p->var, &p->var_cap, p->nvar + 1, sizeof p->var[0])) {
+        if (said++ < 8) d3d12_log("[madeira-d3d12] stride variants: cap of %d reached; using the base pipeline\n", MAD_PSO_VARIANTS_MAX);
+        LeaveCriticalSection(&p->var_lock); return p->rps;
     }
     vd = p->vd;
     for (i = 0; i < 16; i++) if (p->vb_mask & (1u << i)) {
@@ -2962,24 +2971,25 @@ static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides[16
     }
     rps = MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &vd, &err);
     if (err) mad_log_nserror("render pipeline (vertex-descriptor variant)", err);
+    mad_nserror_drop(err);
     if (!rps) {
         /* ml904: second try for the constant case with a zero stride, in case
          * this Metal wants the layout that way. */
         int retry = 0;
         for (i = 0; i < 16; i++) if ((p->vb_mask & (1u << i)) && strides[i] == 0) { vd.layouts[6 + i].stride = 0; retry = 1; }
-        if (retry) { err = 0; rps = MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &vd, &err); if (err) mad_log_nserror("render pipeline (retry)", err); }
+        if (retry) {
+            err = 0; rps = MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &vd, &err);
+            if (err) mad_log_nserror("render pipeline (retry)", err);
+            mad_nserror_drop(err);
+        }
     }
-    if (!rps) {
-        if (said++ < 8) d3d12_log("[madeira-d3d12] stride variant failed (slot0 stride %u vs assumed %u, slot1 stride %u); using the base pipeline\n",
-                                  strides[0], p->vb_stride[0], strides[1]);
-        LeaveCriticalSection(&p->var_lock); return p->rps;
-    }
-    if (p->nvar < 8) { memcpy(p->var[p->nvar].strides, strides, sizeof p->var[0].strides); p->var[p->nvar].rps = rps; p->nvar++; }
-    else { NSObject_release(p->var[0].rps); memmove(&p->var[0], &p->var[1], sizeof p->var[0] * 7);
-           memcpy(p->var[7].strides, strides, sizeof p->var[0].strides); p->var[7].rps = rps; }
-    if (said < 8) { said++; d3d12_log("[madeira-d3d12] pipeline stride variant built (%u variants cached)\n", p->nvar); }
+    if (!rps && said++ < 8)
+        d3d12_log("[madeira-d3d12] stride variant failed (slot0 stride %u vs assumed %u, slot1 stride %u); using the base pipeline\n",
+                  strides[0], p->vb_stride[0], strides[1]);
+    memcpy(p->var[p->nvar].strides, strides, sizeof p->var[0].strides); p->var[p->nvar].rps = rps; p->nvar++;   /* a refusal is remembered too */
+    if (rps && said < 8) { said++; d3d12_log("[madeira-d3d12] pipeline stride variant built (%u variants cached)\n", p->nvar); }
     LeaveCriticalSection(&p->var_lock);
-    return rps;
+    return rps ? rps : p->rps;
 }
 
 /* wine-lab port: COLOUR TARGETS THE PIPELINE DOES NOT DECLARE.
@@ -3014,8 +3024,14 @@ static obj_handle_t mad_pso_for_targets(struct mad_pso *p, obj_handle_t base, st
     AcquireSRWLockExclusive(&p->tvar_lock);
     for (k = 0; k < p->ntvar; k++)
         if (!memcmp(p->tvar[k].fmt, fmt, sizeof fmt) && !memcmp(p->tvar[k].strides, st, sizeof st)) {
-            rps = p->tvar[k].rps; ReleaseSRWLockExclusive(&p->tvar_lock); return rps;
+            rps = p->tvar[k].rps ? p->tvar[k].rps : base; ReleaseSRWLockExclusive(&p->tvar_lock); return rps;
         }
+    if (p->ntvar >= MAD_PSO_VARIANTS_MAX || !mad_grow((void **)&p->tvar, &p->tvar_cap, p->ntvar + 1, sizeof p->tvar[0])) {
+        if (InterlockedIncrement(&said_fail) <= 8)
+            d3d12_log("[madeira-d3d12] target variants of ps '%s': cap of %d reached; drawing with the base pipeline\n", p->ps_name, MAD_PSO_VARIANTS_MAX);
+        ReleaseSRWLockExclusive(&p->tvar_lock);
+        return base;
+    }
     rp = p->rp;
     for (i = 0; i < 8; i++) if (extra & (1u << i)) {
         memset(&rp.colors[i], 0, sizeof rp.colors[i]);
@@ -3033,12 +3049,14 @@ static obj_handle_t mad_pso_for_targets(struct mad_pso *p, obj_handle_t base, st
     if (!rps) {
         char text[400];
         mad_nserror_text(err, text, sizeof text);
+        if (p->has_vd) mad_nserror_drop(err);
         if (InterlockedIncrement(&said_fail) <= 8)
             d3d12_log("[madeira-d3d12] target variant of ps '%s' (extra targets %#x) failed: %s; drawing with the base pipeline\n", p->ps_name, extra, text);
+        memcpy(p->tvar[p->ntvar].fmt, fmt, sizeof fmt); memcpy(p->tvar[p->ntvar].strides, st, sizeof st);   /* remembered: not retried per draw */
+        p->tvar[p->ntvar].rps = 0; p->ntvar++;
         ReleaseSRWLockExclusive(&p->tvar_lock);
         return base;
     }
-    if (p->ntvar == 4) { NSObject_release(p->tvar[0].rps); memmove(&p->tvar[0], &p->tvar[1], sizeof p->tvar[0] * 3); p->ntvar = 3; }
     memcpy(p->tvar[p->ntvar].fmt, fmt, sizeof fmt); memcpy(p->tvar[p->ntvar].strides, st, sizeof st);
     p->tvar[p->ntvar].rps = rps; p->ntvar++;
     ReleaseSRWLockExclusive(&p->tvar_lock);
@@ -5669,6 +5687,11 @@ static void mad_nserror_text(obj_handle_t err, char *text, size_t cap) {
     desc = NSObject_description(err);
     if (desc) NSString_getCString(desc, text, cap, WMTUTF8StringEncoding);
     if (!text[0]) snprintf(text, cap, "(NSError without a description)");
+}
+/* wine-lab port: newRenderPipelineStateVD and newGeometryEmulationPipelineState hand back a RETAINED NSError (their
+ * @autoreleasepool would otherwise drain it); the caller drops it once read. Not for errors from winemetal's own calls. */
+static void mad_nserror_drop(obj_handle_t err) {
+    if (err) NSObject_release(err);
 }
 static void mad_log_nserror(const char *what, obj_handle_t err) {
     /* ml1049: the bridge hands back Metal's AUTORELEASED NSError. Releasing it
@@ -8474,6 +8497,7 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->rps) NSObject_release(p->rps);
         { unsigned k; for (k = 0; k < p->nvar; k++) if (p->var[k].rps) NSObject_release(p->var[k].rps); }
         { unsigned k; for (k = 0; k < p->ntvar; k++) if (p->tvar[k].rps) NSObject_release(p->tvar[k].rps); }   /* wine-lab port */
+        free(p->var); free(p->tvar);
         if (p->has_vd) DeleteCriticalSection(&p->var_lock);
         if (p->vs_fn) NSObject_release(p->vs_fn);
         if (p->ps_fn) NSObject_release(p->ps_fn);
@@ -10974,6 +10998,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
         }
         p->rps = MTLDevice_newGeometryEmulationPipelineState(d->mtl_device, &mp, &ge, &err);
         if (err) mad_log_nserror("geometry-emulation pipeline", err);
+        mad_nserror_drop(err);
         { static unsigned said; if (said++ < 8) d3d12_log("[madeira-d3d12] geometry pipeline %s: vs '%s' gs '%s' ps '%s' (vertex %u B, %u prims/tg, %u targets)\n",
                                                         p->rps ? "created" : "FAILED", ge.vertex_function, ge.geometry_function, ge.fragment_function,
                                                         p->gs_vertex_size, p->gs_max_prims, desc->NumRenderTargets); }
@@ -10998,6 +11023,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
             p->rps = has_vd ? MTLDevice_newRenderPipelineStateVD(d->mtl_device, &rp, &vd, &err)
                             : MTLDevice_newRenderPipelineState(d->mtl_device, &rp, &err);
             if (err) mad_log_nserror(p->vs_name, err);
+            if (has_vd) mad_nserror_drop(err);
         }
     }
     /* ml1083: hull+domain -> object/mesh pipeline, DXBC backend only (the DXIL

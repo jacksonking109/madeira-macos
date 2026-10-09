@@ -166,10 +166,11 @@ static NTSTATUS new_render_pipeline_state_vd(void *args)
     struct madeira_unix_pso_params *p = args;
     const struct WMTRenderPipelineInfo *info = (const void *)(uintptr_t)p->info;
     const struct WMTVertexDescriptorInfo *vd = (const void *)(uintptr_t)p->extra;
-    MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
     NSError *err = nil;
     unsigned i;
 
+    @autoreleasepool {
+    MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
     for (i = 0; i < 8; i++) {
         d.colorAttachments[i].pixelFormat = to_metal_pixel_format(info->colors[i].pixel_format);
         d.colorAttachments[i].blendingEnabled = info->colors[i].blending_enabled;
@@ -216,8 +217,10 @@ static NTSTATUS new_render_pipeline_state_vd(void *args)
     }
 
     p->ret_pso = (obj_handle_t)[(id<MTLDevice>)p->device newRenderPipelineStateWithDescriptor:d error:&err];
-    p->ret_error = (obj_handle_t)(err ? [err retain] : nil);
+    /* outlives the pool; the caller owns it (mad_nserror_drop) */
+    p->ret_error = (obj_handle_t)(!p->ret_pso && err ? [err retain] : nil);
     [d release];
+    }
     return STATUS_SUCCESS;
 }
 
@@ -276,10 +279,10 @@ static id<MTLFunction> empty_fragment_function(id<MTLDevice> dev)
             if (!cached_fn) fprintf(stderr, "[d3d12.so] empty fragment function did not compile: %s\n",
                                     e ? [[e localizedDescription] UTF8String] : "(no error)");
         }
+        fn = [[cached_fn retain] autorelease];
     }
     return fn;
 }
-        fn = [[cached_fn retain] autorelease];
 
 static NTSTATUS new_geometry_emulation_pipeline_state(void *args)
 {
