@@ -1842,15 +1842,17 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     UINT w = 0, h = 0, d = 0, bytes = 0, block = 1; UINT64 bpr, total; obj_handle_t buf;
     struct WMTBufferInfo bi; struct wmtcmd_blit_copy_from_texture_to_buffer k; struct mad_capbuf *cb;
     static unsigned said_budget;
-    if (!r || !r->texture || r->samples > 1 || r->tex_type == WMTTextureType3D) return;
+    if (!r || !r->texture || r->samples > 1) return;
     mad_mip_dims(r, v->level, &w, &h, &d);
+    if (r->tex_type != WMTTextureType3D) d = 1;   /* wine-lab port: a 3D texture is captured whole, its z-slices stacked vertically */
+    if (!d) d = 1;
     if (options == 2) bytes = 1;                                              /* stencil aspect */
     else if (r->is_depth) { bytes = r->tex_pf == WMTPixelFormatDepth16Unorm ? 2 : 4; options = r->has_stencil ? 1 : 0; }
     else { mad_format_info(r->desc.Format, &bytes, &block); if (!bytes || (block != 1 && block != 4)) return; }
     if (!w || !h) return;
     /* ml1141: block-compressed textures (sampled inputs, never targets) copy out
      * as whole 4x4 blocks: bytes is per BLOCK there. */
-    bpr = (UINT64)((w + block - 1) / block) * bytes; total = bpr * ((h + block - 1) / block);
+    bpr = (UINT64)((w + block - 1) / block) * bytes; total = bpr * ((h + block - 1) / block) * d;
     {   /* ml1140: big atlases (Lumen surface cache, shadow maps: 4096^2 at 16-64 MB
          * each) ate the whole budget in the first capture of a UE5 frame, so the
          * G-buffer, lighting and final image were never written. Skip targets over
@@ -1875,17 +1877,18 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     memset(&k, 0, sizeof k);
     k.type = WMTBlitCommandCopyFromTextureToBuffer;
     k.src = r->texture; k.slice = v->slice; k.level = v->level;
-    k.size.width = w; k.size.height = h; k.size.depth = 1;
-    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)total; (void)options;   /* wine-lab port: DXMT v0.80 has no blit options; capture-only path */
+    k.size.width = w; k.size.height = h; k.size.depth = d;
+    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)(total / d); (void)options;   /* wine-lab port: DXMT v0.80 has no blit options; capture-only path */
     MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
     if (!mad_grow((void **)&g_capbufs, &g_capbufs_cap, g_ncapbufs + 1, sizeof *g_capbufs)) { NSObject_release(buf); return; }
     cb = &g_capbufs[g_ncapbufs++];
     memset(cb, 0, sizeof *cb);
-    cb->buf = buf; cb->cpu = bi.memory.ptr; cb->bytes = total; cb->w = w; cb->h = h; cb->bpr = (UINT)bpr;
+    cb->buf = buf; cb->cpu = bi.memory.ptr; cb->bytes = total; cb->w = w; cb->h = h * d; cb->bpr = (UINT)bpr;
     cb->pf = options == 2 ? (UINT)WMTPixelFormatStencil8 : (r->is_depth ? (UINT)WMTPixelFormatDepth32Float : (UINT)r->tex_pf);
     cb->dxgi = (UINT)r->desc.Format; cb->enc = seq; cb->idx = idx;
     snprintf(cb->kind, sizeof cb->kind, "%s", kind);
-    { const char *n = r->name ? r->name : "res"; unsigned i; for (i = 0; i < sizeof cb->name - 1 && n[i]; i++) cb->name[i] = isalnum((unsigned char)n[i]) ? n[i] : '_'; cb->name[i] = 0; }
+    { const char *n = r->name ? r->name : "res"; unsigned i; for (i = 0; i < sizeof cb->name - 12 && n[i]; i++) cb->name[i] = isalnum((unsigned char)n[i]) ? n[i] : '_'; cb->name[i] = 0;
+      snprintf(cb->name + i, sizeof cb->name - i, "_%06x", (unsigned)(((ULONG_PTR)r >> 4) & 0xffffff)); }   /* wine-lab port: which resource */
     g_cap_bytes += total;
 }
 static void mad_capture_pass(struct mad_exec *e, struct mad_resource **rt, unsigned nrt, const struct mad_rtvp *rtp,
@@ -1987,8 +1990,9 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
         }
         r = mad_texture_of_view(e->q->device, de.texture_view_id, &xv);
         if (!r || !r->texture) continue;
-        d3d12_log("[capture-draw] t%u -> view %llu = %s %ux%u pf%u dx%u mips %u layers %u (subview %d)\n", rg->lower_bound,
-                  (unsigned long long)de.texture_view_id, r->name ? r->name : "?", r->width, r->height, (unsigned)r->tex_pf, (unsigned)r->desc.Format, r->tex_mips, r->tex_layers, xv);
+        d3d12_log("[capture-draw] t%u -> view %llu = %s %ux%u pf%u dx%u mips %u layers %u type %u depth %u (subview %d)\n", rg->lower_bound,
+                  (unsigned long long)de.texture_view_id, r->name ? r->name : "?", r->width, r->height, (unsigned)r->tex_pf, (unsigned)r->desc.Format, r->tex_mips, r->tex_layers,
+                  (unsigned)r->tex_type, r->tex_depth, xv);
         if (said_tex++ < 64) mad_capture_one(e, benc, r, &v0, seq, 100 + rg->lower_bound, "tex", 0);
     }
     exec_fence_blit(e, benc, 1);
