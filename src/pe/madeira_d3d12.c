@@ -8936,7 +8936,15 @@ static void mad_sampler_info(struct WMTSamplerInfo *si, UINT filter, UINT au, UI
     si->s_address_mode = am[au < 6 ? au : 3]; si->t_address_mode = am[av < 6 ? av : 3]; si->r_address_mode = am[aw < 6 ? aw : 3];
     si->border_color = border == 2 ? WMTSamplerBorderColorOpaqueWhite : border == 1 ? WMTSamplerBorderColorOpaqueBlack : WMTSamplerBorderColorTransparentBlack;
     si->compare_function = (filter & 0x80) ? mad_compare((D3D12_COMPARISON_FUNC)cmp) : WMTCompareFunctionNever;
-    si->lod_min_clamp = minlod; si->lod_max_clamp = maxlod > 1000.0f ? 1000.0f : maxlod;
+    /* wine-lab port: Metal's lodMinClamp/lodMaxClamp must lie in [0, ...]. D3D
+     * samplers commonly say MinLOD = -FLT_MAX, MaxLOD = FLT_MAX (Unity 6 does for
+     * every sampler); passed through, the negative minimum made every sample
+     * through such a sampler return zero: PEAK's colour-grading LUT, TAA and
+     * all post-processing came out black or flat. */
+    if (!(minlod > 0.0f)) minlod = 0.0f;                   /* also catches NaN */
+    if (!(maxlod < 1000.0f)) maxlod = 1000.0f;
+    if (maxlod < minlod) maxlod = minlod;
+    si->lod_min_clamp = minlod; si->lod_max_clamp = maxlod;
     si->max_anisotroy = (filter & 0x40) ? (aniso ? aniso : 16) : 1;
     si->normalized_coords = true;
     si->support_argument_buffers = true;
