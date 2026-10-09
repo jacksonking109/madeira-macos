@@ -22,6 +22,10 @@
  *    6  ID3D12PipelineState::GetCachedBlob round trip: our blob recreates the
  *       PSO (which still draws); a corrupted one is D3D12_ERROR_DRIVER_VERSION_MISMATCH
  *    7  ID3D12PipelineLibrary: store/load/miss, serialize, reload, foreign blob
+ *    8  a second bound render target the pipeline does not write keeps its
+ *       contents: (a) the PSO declares one target while two are bound (Unity's
+ *       copy-colour pass; Metal zeroed the undeclared attachment), (b) the PSO
+ *       declares both but the pixel shader writes only SV_Target0
  *
  *  Until the runtime's DXBC backend is built in, pipeline creation is EXPECTED
  *  to fail ("DXBC shaders need the airconv backend"). That is reported as a
@@ -749,6 +753,102 @@ static void case_pipeline_library(void) {
 
 /* --------------------------------------------------------------------- main */
 
+/* ------------------------------------------------------------------- case 8 */
+
+static const char hlsl_mrt[] =
+    "float4 vs_main(uint id : SV_VertexID) : SV_Position {\n"
+    FULLSCREEN_VS_BODY
+    "    return pos;\n"
+    "}\n"
+    "float4 ps_main(float4 p : SV_Position) : SV_Target0 { return float4(1.0, 0.5, 0.0, 1.0); }\n";
+
+/* One render target -> readback; the centre pixel. */
+static BOOL read_centre(ID3D12Resource *r, BYTE centre[4]) {
+    D3D12_TEXTURE_COPY_LOCATION dl, sl; ZeroMemory(&dl, sizeof dl); ZeroMemory(&sl, sizeof sl);
+    BYTE *p = NULL;
+    dl.pResource = pix; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dl.PlacedFootprint.Footprint.Width = RT_W; dl.PlacedFootprint.Footprint.Height = RT_H;
+    dl.PlacedFootprint.Footprint.Depth = 1; dl.PlacedFootprint.Footprint.RowPitch = RT_W * 4;
+    sl.pResource = r; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    barrier(r, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &dl, 0, 0, 0, &sl, NULL);
+    barrier(r, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!submit_and_wait()) return FALSE;
+    ID3D12Resource_Map(pix, 0, NULL, (void **)&p);
+    if (!p) return FALSE;
+    memcpy(centre, p + ((RT_H / 2) * RT_W + RT_W / 2) * 4, 4);
+    ID3D12Resource_Unmap(pix, 0, NULL);
+    return TRUE;
+}
+
+static void case_unwritten_target(void) {
+    printf("\n[8] a bound render target the pipeline does not write keeps its contents\n");
+    ID3DBlob *vs = compile("mrt", hlsl_mrt, "vs_main", "vs_5_0");
+    ID3DBlob *ps = compile("mrt", hlsl_mrt, "ps_main", "ps_5_0");
+    D3D12_ROOT_SIGNATURE_DESC rd; ZeroMemory(&rd, sizeof rd);
+    ID3D12RootSignature *rs = make_rs("mrt", &rd);
+    ID3D12Resource *rt2 = make_tex2d(RT_W, RT_H, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    ID3D12DescriptorHeap *h = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC hd; ZeroMemory(&hd, sizeof hd);
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 2;
+    ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&h);
+    CHECK(rt2 && h, "mrt: second render target and a two-entry RTV heap created");
+    if (vs && ps && rs && rt2 && h) {
+        D3D12_CPU_DESCRIPTOR_HANDLE hs[2];
+        UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        int variant;
+        h->lpVtbl->GetCPUDescriptorHandleForHeapStart(h, &hs[0]);
+        hs[1].ptr = hs[0].ptr + inc;
+        ID3D12Device_CreateRenderTargetView(dev, rt, NULL, hs[0]);
+        ID3D12Device_CreateRenderTargetView(dev, rt2, NULL, hs[1]);
+        for (variant = 0; variant < 2; variant++) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd; ZeroMemory(&pd, sizeof pd);
+            ID3D12PipelineState *pso = NULL;
+            const char *what = variant ? "PSO declares 2 targets, PS writes SV_Target0 only" : "PSO declares 1 target, 2 are bound";
+            pd.pRootSignature = rs;
+            pd.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(vs); pd.VS.BytecodeLength = ID3D10Blob_GetBufferSize(vs);
+            pd.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(ps); pd.PS.BytecodeLength = ID3D10Blob_GetBufferSize(ps);
+            pd.NumRenderTargets = variant ? 2 : 1;
+            pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (variant) pd.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            pd.SampleDesc.Count = 1;
+            pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            test_pso_defaults(&pd, FALSE);
+            HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&pso);
+            CHECK(SUCCEEDED(hr) && pso, "mrt (%s): PSO created (%#lx)", what, hr);
+            if (!pso) continue;
+            {
+                const FLOAT c0[4] = { 0.0f, 0.0f, 0.0f, 1.0f }, c1[4] = { 0.2f, 0.4f, 0.6f, 1.0f };
+                D3D12_VIEWPORT vp; ZeroMemory(&vp, sizeof vp);
+                D3D12_RECT sc = { 0, 0, RT_W, RT_H };
+                BYTE a[4] = {0}, b[4] = {0}; BOOL ok;
+                vp.Width = (FLOAT)RT_W; vp.Height = (FLOAT)RT_H; vp.MaxDepth = 1.0f;
+                ID3D12GraphicsCommandList_ClearRenderTargetView(list, hs[0], c0, 0, NULL);
+                ID3D12GraphicsCommandList_ClearRenderTargetView(list, hs[1], c1, 0, NULL);
+                ID3D12GraphicsCommandList_OMSetRenderTargets(list, 2, hs, FALSE, NULL);
+                ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
+                ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
+                ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+                ID3D12GraphicsCommandList_SetPipelineState(list, pso);
+                ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+                ok = read_centre(rt, a) && read_centre(rt2, b);
+                CHECK(ok && px_near(a, 255, 128, 0, 255), "mrt (%s): RT0 drawn: got (%u,%u,%u,%u), expected (255,128,0,255)",
+                      what, a[0], a[1], a[2], a[3]);
+                CHECK(ok && px_near(b, 51, 102, 153, 255), "mrt (%s): RT1 keeps its clear: got (%u,%u,%u,%u), expected (51,102,153,255)",
+                      what, b[0], b[1], b[2], b[3]);
+            }
+            ID3D12PipelineState_Release(pso);
+        }
+    }
+    if (h) ID3D12DescriptorHeap_Release(h);
+    if (rt2) ID3D12Resource_Release(rt2);
+    if (rs) ID3D12RootSignature_Release(rs);
+    if (vs) ID3D10Blob_Release(vs);
+    if (ps) ID3D10Blob_Release(ps);
+}
+
 int main(void) {
     HRESULT hr;
     printf("wine-lab d3d12: DXBC (SM 5.0) shader test\n\n");
@@ -799,6 +899,7 @@ int main(void) {
     case_render_pass_depth();
     case_cached_blob();
     case_pipeline_library();
+    case_unwritten_target();
     if (rp_rs) ID3D12RootSignature_Release(rp_rs);
     if (rp_vs) ID3D10Blob_Release(rp_vs);
     if (rp_ps) ID3D10Blob_Release(rp_ps);

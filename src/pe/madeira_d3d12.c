@@ -175,6 +175,7 @@ static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shot
  * every material in compute, so this is how to see what a material samples. */
 static char g_capture_cs[64]; static int g_capture_cs_shots, g_capture_cs_max = 12, g_capture_cs_ind;
 static LONG g_barrier_renc_closed, g_stencil_srv, g_barrier_seen;
+static LONG g_said_rt_unwritten;   /* wine-lab port */
 struct mad_obj {
     void *vtbl;
     LONG refs;
@@ -657,6 +658,9 @@ struct mad_rootsig {
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
     obj_handle_t rps;          /* Metal render pipeline state */
+    UINT ps_rt_unwritten;   /* wine-lab port: render targets bound but not written by the PS (write mask 0) */
+    /* wine-lab port: variants for passes that attach colour targets the pipeline does not declare */
+    struct { UINT16 fmt[8]; UINT strides[16]; obj_handle_t rps; } tvar[4]; unsigned ntvar; SRWLOCK tvar_lock; int has_rp;
     obj_handle_t vs_lib, ps_lib, vs_fn, ps_fn;
     int uses_depth, uses_stencil;
     UINT8 dbg_denable, dbg_dfunc, dbg_dwrite, dbg_wmask[8], dbg_senable, dbg_sfunc, dbg_srmask, dbg_swmask;   /* ml903/ml904: census only */
@@ -2807,6 +2811,72 @@ static obj_handle_t mad_pso_for_strides(struct mad_pso *p, const UINT strides[16
     return rps;
 }
 
+/* wine-lab port: COLOUR TARGETS THE PIPELINE DOES NOT DECLARE.
+ *
+ * D3D12 leaves a bound render target alone when the pipeline's RTVFormats do
+ * not name it (or its pixel shader writes no SV_Target for it). On Apple GPUs a
+ * render pass attachment the pipeline has NO colour attachment for is
+ * overwritten with zeros by every draw (tests: an attachment the pipeline
+ * declares with write mask 0 keeps its contents; one it omits comes out
+ * 0x00000000). Unity 6 URP copies the opaque colour with a one-target pipeline
+ * while the camera target stays bound as RT1: in PEAK every lit surface drawn
+ * before that copy came out black, only later transparents survived.
+ *
+ * Such a draw gets a variant of its pipeline that declares the extra
+ * attachments in the pass's formats with write mask 0 (and the strides the
+ * draw binds, when the pipeline has a vertex descriptor). */
+static obj_handle_t mad_pso_for_targets(struct mad_pso *p, obj_handle_t base, struct mad_resource *const *rt,
+                                        const struct mad_rtvp *rtp, unsigned nrt, const UINT *strides) {
+    UINT16 fmt[8]; UINT st[16]; unsigned i, k, extra = 0; obj_handle_t rps, err = 0;
+    struct WMTRenderPipelineInfo rp; struct WMTVertexDescriptorInfo vd;
+    static LONG said, said_fail;
+    if (!p->has_rp || !base) return base;
+    memset(fmt, 0, sizeof fmt);
+    for (i = 0; i < nrt && i < 8; i++) {
+        if (!rt[i] || !rt[i]->texture || p->rp.colors[i].pixel_format != WMTPixelFormatInvalid) continue;
+        fmt[i] = rtp[i].pf ? rtp[i].pf : (UINT16)rt[i]->tex_pf;
+        extra |= 1u << i;
+    }
+    if (!extra) return base;
+    memset(st, 0, sizeof st);
+    if (p->has_vd && strides) memcpy(st, strides, sizeof st);
+    AcquireSRWLockExclusive(&p->tvar_lock);
+    for (k = 0; k < p->ntvar; k++)
+        if (!memcmp(p->tvar[k].fmt, fmt, sizeof fmt) && !memcmp(p->tvar[k].strides, st, sizeof st)) {
+            rps = p->tvar[k].rps; ReleaseSRWLockExclusive(&p->tvar_lock); return rps;
+        }
+    rp = p->rp;
+    for (i = 0; i < 8; i++) if (extra & (1u << i)) {
+        memset(&rp.colors[i], 0, sizeof rp.colors[i]);
+        rp.colors[i].pixel_format = (enum WMTPixelFormat)fmt[i];
+        rp.colors[i].write_mask = 0;
+    }
+    if (p->has_vd) {
+        vd = p->vd;
+        if (strides) for (i = 0; i < 16; i++) if (p->vb_mask & (1u << i)) {
+            if (strides[i] == 0) { vd.layouts[6 + i].step_function = 0; vd.layouts[6 + i].step_rate = 0; vd.layouts[6 + i].stride = p->vb_stride[i]; }
+            else vd.layouts[6 + i].stride = strides[i];
+        }
+        rps = MTLDevice_newRenderPipelineStateVD(p->device_handle, &rp, &vd, &err);
+    } else rps = MTLDevice_newRenderPipelineState(p->device_handle, &rp, &err);
+    if (!rps) {
+        char text[400];
+        mad_nserror_text(err, text, sizeof text);
+        if (InterlockedIncrement(&said_fail) <= 8)
+            d3d12_log("[madeira-d3d12] target variant of ps '%s' (extra targets %#x) failed: %s; drawing with the base pipeline\n", p->ps_name, extra, text);
+        ReleaseSRWLockExclusive(&p->tvar_lock);
+        return base;
+    }
+    if (p->ntvar == 4) { NSObject_release(p->tvar[0].rps); memmove(&p->tvar[0], &p->tvar[1], sizeof p->tvar[0] * 3); p->ntvar = 3; }
+    memcpy(p->tvar[p->ntvar].fmt, fmt, sizeof fmt); memcpy(p->tvar[p->ntvar].strides, st, sizeof st);
+    p->tvar[p->ntvar].rps = rps; p->ntvar++;
+    ReleaseSRWLockExclusive(&p->tvar_lock);
+    if (InterlockedIncrement(&said) <= 8)
+        d3d12_log("[madeira-d3d12] ps '%s' drawn into a pass with colour targets %#x it does not declare: variant with write mask 0 for them\n",
+                  p->ps_name[0] ? p->ps_name : "-", extra);
+    return rps;
+}
+
 static unsigned g_cap_kinds;   /* ml910: kinds captured since the last flush */
 static unsigned g_k9_n;        /* ml929: K9 captures since the last flush */
 static struct mad_resource *mad_resolve_address(struct mad_device *d, UINT64 addr, UINT64 *off);
@@ -3291,6 +3361,54 @@ static int mad_air_build_tess_tables(struct mad_exec *e, const struct mad_tess_s
  * Invalid and the caller refuses the pipeline by name instead of guessing. */
 /* ml1023: is this render-target format UNORM? The DXBC backend clamps a
  * pixel shader's output differently for UNORM targets, so it has to be told. */
+/* wine-lab port: WHICH render targets a pixel shader writes, from the output
+ * signature of its container (OSGN / OSG5 for DXBC, OSG1 for DXIL): bit i is
+ * set when an SV_Target i element is declared. Returns -1 if the container
+ * carries no output signature we can read.
+ *
+ * D3D leaves a bound render target that the pixel shader never writes
+ * untouched; Metal (like Vulkan) leaves an attachment the fragment function
+ * does not write UNDEFINED, and Apple GPUs store zeros. Unity 6 URP copies the
+ * opaque colour with a one-output shader while the camera target is still
+ * bound as RT1, which zeroed every lit surface in PEAK (black silhouettes,
+ * only later transparents and the UI survived). The pipeline gives such
+ * targets a write mask of 0, as DXVK and vkd3d-proton do. */
+static int mad_ps_target_mask(const void *bc, SIZE_T len) {
+    const unsigned char *b = (const unsigned char *)bc;
+    UINT32 nchunks, i;
+    if (!b || len < 32 || memcmp(b, "DXBC", 4)) return -1;
+    memcpy(&nchunks, b + 28, 4);
+    if (nchunks > 64 || 32 + (SIZE_T)nchunks * 4 > len) return -1;
+    for (i = 0; i < nchunks; i++) {
+        UINT32 off, size, n, k, stride, base;
+        const unsigned char *c;
+        memcpy(&off, b + 32 + i * 4, 4);
+        if ((SIZE_T)off + 8 > len) return -1;
+        c = b + off; memcpy(&size, c + 4, 4);
+        if ((SIZE_T)off + 8 + size > len) return -1;
+        if (!memcmp(c, "OSGN", 4)) { stride = 24; base = 0; }
+        else if (!memcmp(c, "OSG5", 4)) { stride = 28; base = 4; }
+        else if (!memcmp(c, "OSG1", 4)) { stride = 32; base = 4; }
+        else continue;
+        c += 8;   /* the chunk's data; name offsets are relative to it */
+        if (size < 8) return -1;
+        memcpy(&n, c, 4);
+        if ((UINT64)8 + (UINT64)n * stride > size) return -1;
+        {
+            int mask = 0;
+            for (k = 0; k < n; k++) {
+                const unsigned char *el = c + 8 + k * stride + base;
+                UINT32 name_off, reg;
+                memcpy(&name_off, el, 4); memcpy(&reg, el + 16, 4);
+                if (name_off >= size || size - name_off < 10) continue;
+                if (_strnicmp((const char *)c + name_off, "SV_Target", 9) || c[name_off + 9]) continue;
+                if (reg < 8) mask |= 1 << reg;
+            }
+            return mask;
+        }
+    }
+    return -1;
+}
 static int mad_format_is_unorm(DXGI_FORMAT f) {
     switch (f) {
     case DXGI_FORMAT_R8G8B8A8_UNORM:      case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -3914,7 +4032,8 @@ tess_go:
          * a per-draw constant stream. Unbound slots keep the assumed stride. */
         for (i = 0; i < 16; i++) strides[i] = e->vb[i].res ? e->vb[i].stride : e->pso->vb_stride[i];
         c_pso.pso = mad_pso_for_strides(e->pso, strides);
-    }
+        c_pso.pso = mad_pso_for_targets(e->pso, c_pso.pso, e->enc_rt, e->enc_rtp, e->enc_nrt, strides);   /* wine-lab port */
+    } else if (!gsemu && !tv) c_pso.pso = mad_pso_for_targets(e->pso, c_pso.pso, e->enc_rt, e->enc_rtp, e->enc_nrt, NULL);   /* wine-lab port */
     tail = (struct wmtcmd_base *)&c_pso;
 #define MAD_APPEND(node) do { tail->next.ptr = (node); tail = (struct wmtcmd_base *)(node); } while (0)
     if (e->has_vp) {
@@ -7986,6 +8105,7 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
         if (p->rps) NSObject_release(p->rps);
         { unsigned k; for (k = 0; k < p->nvar; k++) if (p->var[k].rps) NSObject_release(p->var[k].rps); }
+        { unsigned k; for (k = 0; k < p->ntvar; k++) if (p->tvar[k].rps) NSObject_release(p->tvar[k].rps); }   /* wine-lab port */
         if (p->has_vd) DeleteCriticalSection(&p->var_lock);
         if (p->vs_fn) NSObject_release(p->vs_fn);
         if (p->ps_fn) NSObject_release(p->ps_fn);
@@ -10403,6 +10523,16 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
         rp.raster_sample_count = use;
     }
     rp.alpha_to_coverage_enabled = desc->BlendState.AlphaToCoverageEnable != 0;
+    {   /* wine-lab port: render targets the pixel shader never writes stay untouched */
+        int written = desc->PS.pShaderBytecode ? mad_ps_target_mask(desc->PS.pShaderBytecode, desc->PS.BytecodeLength) : 0;
+        p->ps_rt_unwritten = 0;
+        if (written >= 0)
+            for (i = 0; i < desc->NumRenderTargets && i < 8; i++)
+                if (desc->RTVFormats[i] != DXGI_FORMAT_UNKNOWN && !(written & (1 << i))) p->ps_rt_unwritten |= 1u << i;
+        if (p->ps_rt_unwritten && InterlockedIncrement(&g_said_rt_unwritten) <= 8)
+            d3d12_log("[madeira-d3d12] pipeline ps='%s': render target mask %#x is bound but never written by the pixel shader; those targets get write mask 0\n",
+                      p->ps_name, (unsigned)p->ps_rt_unwritten);
+    }
     for (i = 0; i < desc->NumRenderTargets && i < 8; i++) {
         const D3D12_RENDER_TARGET_BLEND_DESC *b = &desc->BlendState.RenderTarget[desc->BlendState.IndependentBlendEnable ? i : 0];
         enum WMTPixelFormat pf;
@@ -10419,7 +10549,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
         rp.colors[i].dst_rgb_blend_factor = mad_blend_factor(b->DestBlend);
         rp.colors[i].src_alpha_blend_factor = mad_blend_factor(b->SrcBlendAlpha);
         rp.colors[i].dst_alpha_blend_factor = mad_blend_factor(b->DestBlendAlpha);
-        rp.colors[i].write_mask = mad_write_mask(b->RenderTargetWriteMask);
+        rp.colors[i].write_mask = (p->ps_rt_unwritten & (1u << i)) ? 0 : mad_write_mask(b->RenderTargetWriteMask);   /* wine-lab port */
         if (b->LogicOpEnable) { static unsigned said; if (!said++) d3d12_log("[madeira-d3d12] logic ops are not implemented\n"); }
         {   /* ml1106, ml1107: every render target's blend state (D3D values; Metal values for rt0) */
             size_t used = strlen(p->blend);
@@ -10546,6 +10676,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
         return E_FAIL;
     }
     if (has_vd && (p->rps || p->lazy)) { p->rp = rp; p->vd = vd; p->has_vd = 1; p->device_handle = d->mtl_device; InitializeCriticalSection(&p->var_lock); }
+    if (p->rps || p->lazy) { p->rp = rp; p->has_rp = 1; p->device_handle = d->mtl_device; }   /* wine-lab port: mad_pso_for_targets builds from it */
 
     /* Depth-stencil state is encoder state in Metal; one object per pipeline. */
     memset(&dsi, 0, sizeof dsi);
