@@ -8537,9 +8537,24 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
  *   table       : u32 range count, u32 range offset
  *   range       : u32 type, u32 count, u32 base register, u32 space,
  *                 u32 flags, u32 table offset                          (1.1)
+ *   sampler     : D3D12_STATIC_SAMPLER_DESC, 13 words; 1.2 appends a
+ *                 u32 D3D12_SAMPLER_FLAGS (D3D12_STATIC_SAMPLER_DESC1)
  *
- * Every offset is relative to the start of the chunk payload. */
+ * Every offset is relative to the start of the chunk payload. Version is 1, 2
+ * or 3 for 1.0, 1.1 and 1.2; 1.2 lays out everything but the samplers as 1.1. */
 /* rsdeser-test:begin (tests/windows/rsdeser_test.c compiles the marked regions on their own) */
+/* wine-lab port: root signature 1.2 (Agility SDK 1.610). llvm-mingw's d3d12.h
+ * predates it, so the two structures are spelled out here, laid out as D3D12's
+ * D3D12_STATIC_SAMPLER_DESC1 and D3D12_ROOT_SIGNATURE_DESC2 (the latter is
+ * D3D12_ROOT_SIGNATURE_DESC1 with the new samplers). */
+#define MAD_RS_VERSION_1_2 ((D3D_ROOT_SIGNATURE_VERSION)0x3)
+struct mad_static_sampler_desc1 { D3D12_STATIC_SAMPLER_DESC d; UINT32 flags; };
+struct mad_root_signature_desc2 {
+    UINT NumParameters; const D3D12_ROOT_PARAMETER1 *pParameters;
+    UINT NumStaticSamplers; const struct mad_static_sampler_desc1 *pStaticSamplers;
+    D3D12_ROOT_SIGNATURE_FLAGS Flags;
+};
+struct mad_versioned_rs_desc12 { D3D_ROOT_SIGNATURE_VERSION Version; struct mad_root_signature_desc2 Desc_1_2; };
 static UINT32 rs_rd(const unsigned char *b, SIZE_T n, SIZE_T off, int *bad) {
     if (off + 4 > n) { *bad = 1; return 0; }
     return (UINT32)b[off] | ((UINT32)b[off+1] << 8) |
@@ -8600,7 +8615,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
     UINT32 nsampler  = rs_rd(p, n, 12, &bad);
     UINT32 rs_flags  = rs_rd(p, n, 20, &bad);
     if (bad) { d3d12_log("[madeira-d3d12] CreateRootSignature: truncated RTS0 header\n"); return E_INVALIDARG; }
-    if (version != 1 && version != 2) {
+    if (version < 1 || version > 3) {
         d3d12_log("[madeira-d3d12] CreateRootSignature: root signature version %u is not supported\n", version);
         return E_NOTIMPL;
     }
@@ -8658,18 +8673,28 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
         }
     }
     /* Static samplers: 13 dwords each, the D3D12 description verbatim, the
-     * same in root signature versions 1.0 and 1.1 (1.2 adds a flags word and
-     * is refused above by version). */
+     * same in root signature versions 1.0 and 1.1. 1.2 adds a flags word
+     * (UINT_BORDER_COLOR, NON_NORMALIZED_COORDINATES) that neither backend can
+     * express: the converter's static sampler has no such field. The UINT
+     * border colours become their float twins, which Metal uses for integer
+     * textures too; non-normalized coordinates are logged and not honoured. */
     r->nsamplers = nsampler;
     r->stab = 0; r->stab_gpu = 0; r->stab_cpu = NULL;
     for (UINT32 i = 0; i < nsampler; i++) {
         struct madeira_ir_static_sampler *ss = &r->samplers[i];
-        UINT32 at = soff + 52 * i, w[13], k;
-        for (k = 0; k < 13; k++) w[k] = rs_rd(p, n, at + 4 * k, &bad);
+        UINT32 nw = version == 3 ? 14 : 13, at = soff + 4 * nw * i, w[14] = {0}, k;
+        for (k = 0; k < nw; k++) w[k] = rs_rd(p, n, at + 4 * k, &bad);
         if (bad) goto truncated;
+        if (w[13] & 0x2u) {   /* D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES */
+            static LONG said;
+            if (InterlockedIncrement(&said) <= 4)
+                d3d12_log("[madeira-d3d12] CreateRootSignature: static sampler s%u space %u asks for non-normalized "
+                          "coordinates (flags %#x), which this runtime does not honour\n", w[10], w[11], w[13]);
+        }
         ss->filter = w[0]; ss->address_u = w[1]; ss->address_v = w[2]; ss->address_w = w[3];
         memcpy(&ss->mip_lod_bias, &w[4], 4);
-        ss->max_anisotropy = w[5]; ss->comparison = w[6]; ss->border_color = w[7];
+        ss->max_anisotropy = w[5]; ss->comparison = w[6];
+        ss->border_color = w[7] == 3 ? 1 : w[7] == 4 ? 2 : w[7];   /* OPAQUE_BLACK_UINT / OPAQUE_WHITE_UINT */
         memcpy(&ss->min_lod, &w[8], 4); memcpy(&ss->max_lod, &w[9], 4);
         ss->shader_register = w[10]; ss->register_space = w[11];
         ss->visibility = w[12] == 1 ? MADEIRA_IR_VIS_VERTEX : w[12] == 2 ? MADEIRA_IR_VIS_HULL : w[12] == 3 ? MADEIRA_IR_VIS_DOMAIN
@@ -8739,8 +8764,9 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
             r->params[i].num_ranges = nr;
             /* 1.0 ranges have five words, 1.1 adds a flags word before the
              * table offset. Reading a 1.0 blob with the 1.1 stride would shift
-             * every later range, so the stride follows the declared version. */
-            UINT32 stride = (version == 2) ? 24 : 20;
+             * every later range, so the stride follows the declared version
+             * (1.2 ranges are 1.1's). */
+            UINT32 stride = (version >= 2) ? 24 : 20;
             for (UINT32 j = 0; j < nr; j++) {
                 struct madeira_ir_root_range *rg = &r->ranges[r->nranges + j];
                 SIZE_T b0 = roff + (SIZE_T)stride * j;
@@ -8774,7 +8800,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
     { static LONG said; if (InterlockedIncrement(&said) <= 24)   /* ml1053: was 15,589 lines a run */
     d3d12_log("[madeira-d3d12] root signature parsed from the application blob: "
               "version 1.%u, %u parameter(s), %u descriptor range(s), %u static sampler(s), flags %#x\n",
-              version == 2 ? 1u : 0u, r->nparams, r->nranges, r->nsamplers, r->flags); }
+              version - 1, r->nparams, r->nranges, r->nsamplers, r->flags); }
     HRESULT hr = rootsig_QI((ID3D12RootSignature *)r, riid, out);
     rootsig_Release((ID3D12RootSignature *)r);
     return hr;
@@ -8789,11 +8815,15 @@ truncated:
 /* Emits the same container the parser above reads, so a test can build a real
  * root signature instead of the runtime accepting a private shortcut. The DXBC
  * digest is left zero: nothing in this path verifies it, and writing a
- * plausible-looking but wrong checksum would be worse than an obvious zero. */
-__declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
-        const D3D12_ROOT_SIGNATURE_DESC1 *desc, unsigned char *out, SIZE_T *io_len) {
+ * plausible-looking but wrong checksum would be worse than an obvious zero.
+ *
+ * wine-lab port: with s12 the samplers are 1.2's (they replace
+ * desc->pStaticSamplers) and the blob is version 1.2; otherwise it is 1.1. */
+static HRESULT rs_serialize(const D3D12_ROOT_SIGNATURE_DESC1 *desc, const struct mad_static_sampler_desc1 *s12,
+                            unsigned char *out, SIZE_T *io_len) {
     if (!desc || !io_len) return E_INVALIDARG;
-    if (desc->NumStaticSamplers && !desc->pStaticSamplers) return E_INVALIDARG;
+    if (desc->NumStaticSamplers && !(s12 ? (const void *)s12 : (const void *)desc->pStaticSamplers)) return E_INVALIDARG;
+    const UINT32 sampler_size = s12 ? sizeof *s12 : sizeof *desc->pStaticSamplers;   /* 56 or 52 */
 
     UINT32 nparam = desc->NumParameters;
     UINT32 nrange = 0;
@@ -8807,7 +8837,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
     for (UINT32 i = 0; i < nparam; i++)
         payload_bodies += (desc->pParameters[i].ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) ? 8 : 12;
     UINT32 sampler_at = 24 + payload_params + payload_bodies + 24 * nrange;
-    UINT32 chunk = sampler_at + 52 * desc->NumStaticSamplers;
+    UINT32 chunk = sampler_at + sampler_size * desc->NumStaticSamplers;
     UINT32 total = 32 + 4 /*one chunk offset*/ + 8 + chunk;
 
     if (!out || *io_len < total) { *io_len = total; return out ? E_NOT_SUFFICIENT_BUFFER : S_OK; }
@@ -8821,7 +8851,7 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
     rs_wr(out, 40, chunk);
 
     unsigned char *p = out + 44;   /* chunk payload; offsets are relative here */
-    rs_wr(p, 0, 2);                /* root signature version 1.1 */
+    rs_wr(p, 0, s12 ? 3 : 2);      /* root signature version 1.2 or 1.1 */
     rs_wr(p, 4, nparam);
     rs_wr(p, 8, 24);               /* parameters follow the header */
     rs_wr(p, 12, desc->NumStaticSamplers);
@@ -8830,8 +8860,10 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
      * dxc blob: byte-identical apart from the digest left zero). */
     rs_wr(p, 16, sampler_at);
     for (UINT32 i = 0; i < desc->NumStaticSamplers; i++) {
-        /* The D3D12 description is thirteen 32-bit words in declaration order. */
-        memcpy(p + sampler_at + 52 * i, &desc->pStaticSamplers[i], 52);
+        /* The D3D12 description is thirteen 32-bit words in declaration order
+         * (fourteen in 1.2, the flags last). */
+        memcpy(p + sampler_at + sampler_size * i,
+               s12 ? (const void *)&s12[i] : (const void *)&desc->pStaticSamplers[i], sampler_size);
     }
     rs_wr(p, 20, (UINT32)desc->Flags);
 
@@ -8871,6 +8903,10 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
     *io_len = total;
     return S_OK;
 }
+__declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
+        const D3D12_ROOT_SIGNATURE_DESC1 *desc, unsigned char *out, SIZE_T *io_len) {
+    return rs_serialize(desc, NULL, out, io_len);
+}
 
 /* ---- ml1980: root signature deserializers ---------------------------------
  * D3D12CreateRootSignatureDeserializer and its versioned sibling turn a
@@ -8880,13 +8916,16 @@ __declspec(dllexport) HRESULT WINAPI MadeiraD3D12SerializeRootSignature(
  * rules -- the same chunk lookup, version check, range stride and bounds --
  * but fills the public D3D12 structures instead of the converter's.
  *
- * Both description versions are built once, at creation, each in one heap
+ * Every description version is built once, at creation, each in one heap
  * block the object owns. Every pointer handed out therefore stays valid until
  * the last Release, and no method allocates or races another thread.
  *
  * Converting 1.0 up to 1.1 uses the flags D3D12 defines as 1.0's behaviour:
  * ranges DESCRIPTORS_VOLATILE (plus DATA_VOLATILE unless they hold samplers),
  * root descriptors DATA_VOLATILE. Converting 1.1 down to 1.0 drops the flags.
+ * wine-lab port: the 1.2 view is the 1.1 one (its parameters are shared) with
+ * each static sampler's flags word, zero for blobs older than 1.2; going below
+ * 1.2 drops those flags.
  * MADEIRA_D3D12_RS_DESERIALIZER=0 restores the old E_NOTIMPL. */
 struct mad_rsd {
     union {
@@ -8897,6 +8936,7 @@ struct mad_rsd {
     int versioned;                        /* which of the two interfaces this is */
     D3D_ROOT_SIGNATURE_VERSION native;    /* the version the blob declared */
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v10, *v11;
+    struct mad_versioned_rs_desc12 *v12;  /* wine-lab port: points into v11's parameters */
     UINT32 nranges;
 };
 
@@ -8936,8 +8976,9 @@ static D3D12_VERSIONED_ROOT_SIGNATURE_DESC *rsd_alloc(int v11, UINT32 np, UINT32
     return v;
 }
 
-/* Parses the blob into o->v11 (1.0 blobs get 1.0's flags), then derives
- * o->v10 from it. On failure the caller frees whatever was allocated. */
+/* Parses the blob into o->v11 (1.0 blobs get 1.0's flags) and o->v12's sampler
+ * flags, then derives o->v10 from it. On failure the caller frees whatever was
+ * allocated. */
 static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
     SIZE_T n = 0;
     const char *why = "?";
@@ -8945,6 +8986,7 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
     UINT32 version, nparam, poff, nsampler, soff, flags, total_ranges = 0, used = 0, i, j;
     D3D12_ROOT_PARAMETER1 *p11; D3D12_DESCRIPTOR_RANGE1 *r11; D3D12_STATIC_SAMPLER_DESC *s11;
     D3D12_ROOT_PARAMETER *p10;  D3D12_DESCRIPTOR_RANGE *r10;  D3D12_STATIC_SAMPLER_DESC *s10;
+    struct mad_static_sampler_desc1 *s12;
     void *vp, *vr;
     int bad = 0;
 
@@ -8956,11 +8998,7 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
     soff     = rs_rd(p, n, 16, &bad);
     flags    = rs_rd(p, n, 20, &bad);
     if (bad) { RSD_REFUSE("[d3d12-rsdeser] truncated RTS0 header\n"); return E_INVALIDARG; }
-    if (version == 3) {   /* 1.2 adds a flags word per static sampler; not read here */
-        RSD_REFUSE("[d3d12-rsdeser] root signature version 1.2 is not supported\n");
-        return mad_silent_notimpl(__LINE__);
-    }
-    if (version != 1 && version != 2) {
+    if (version < 1 || version > 3) {
         RSD_REFUSE("[d3d12-rsdeser] unknown root signature version %u\n", version);
         return E_INVALIDARG;
     }
@@ -9025,14 +9063,14 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
             /* 1.0 root descriptors are two words; 1.1 adds the flags word. */
             q->Descriptor.ShaderRegister = rs_rd(p, n, off,     &bad);
             q->Descriptor.RegisterSpace  = rs_rd(p, n, off + (SIZE_T)4, &bad);
-            q->Descriptor.Flags = version == 2
+            q->Descriptor.Flags = version >= 2
                 ? (D3D12_ROOT_DESCRIPTOR_FLAGS)rs_rd(p, n, off + (SIZE_T)8, &bad)
                 : D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE;
             break;
         default: {   /* descriptor table; the pre-pass refused anything else */
             UINT32 nr   = rs_rd(p, n, off,     &bad);
             UINT32 roff = rs_rd(p, n, off + (SIZE_T)4, &bad);
-            UINT32 stride = (version == 2) ? 24 : 20;   /* same rule as CreateRootSignature */
+            UINT32 stride = (version >= 2) ? 24 : 20;   /* same rule as CreateRootSignature */
             if (bad) goto truncated;
             if (used + nr > total_ranges) {   /* our bug if it trips: the pre-pass read the same words */
                 RSD_REFUSE("[d3d12-rsdeser] range count disagrees with the pre-pass (%u + %u > %u)\n",
@@ -9071,12 +9109,23 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
         }
         if (bad) goto truncated;
     }
-    /* Static samplers: thirteen words, the same in 1.0 and 1.1. */
+    /* The 1.2 view: v11's header and parameters, its own samplers. */
+    o->v12 = calloc(1, RSD_ALIGN8(sizeof(D3D12_VERSIONED_ROOT_SIGNATURE_DESC)) + sizeof *s12 * nsampler);
+    if (!o->v12) return E_OUTOFMEMORY;
+    s12 = nsampler ? (struct mad_static_sampler_desc1 *)((char *)o->v12 + RSD_ALIGN8(sizeof(D3D12_VERSIONED_ROOT_SIGNATURE_DESC))) : NULL;
+    o->v12->Version = MAD_RS_VERSION_1_2;
+    o->v12->Desc_1_2.NumParameters = nparam;
+    o->v12->Desc_1_2.pParameters = p11;
+    o->v12->Desc_1_2.NumStaticSamplers = nsampler;
+    o->v12->Desc_1_2.pStaticSamplers = s12;
+    o->v12->Desc_1_2.Flags = (D3D12_ROOT_SIGNATURE_FLAGS)flags;
+    /* Static samplers: thirteen words, the same in 1.0 and 1.1; 1.2 appends
+     * the flags. */
     for (i = 0; i < nsampler; i++) {
         D3D12_STATIC_SAMPLER_DESC *ss = &s11[i];
-        SIZE_T at = (SIZE_T)soff + 52 * (SIZE_T)i;
-        UINT32 w[13], k;
-        for (k = 0; k < 13; k++) w[k] = rs_rd(p, n, at + 4 * k, &bad);
+        UINT32 nw = version == 3 ? 14 : 13, w[14] = {0}, k;
+        SIZE_T at = (SIZE_T)soff + 4 * nw * (SIZE_T)i;
+        for (k = 0; k < nw; k++) w[k] = rs_rd(p, n, at + 4 * k, &bad);
         if (bad) goto truncated;
         ss->Filter = (D3D12_FILTER)w[0];
         ss->AddressU = (D3D12_TEXTURE_ADDRESS_MODE)w[1];
@@ -9091,6 +9140,8 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
         ss->ShaderRegister = w[10];
         ss->RegisterSpace = w[11];
         ss->ShaderVisibility = (D3D12_SHADER_VISIBILITY)w[12];
+        s12[i].d = *ss;
+        s12[i].flags = w[13];
     }
 
     /* The 1.0 view: the same description without the flags. */
@@ -9131,7 +9182,8 @@ static HRESULT rsd_parse(const void *blob, SIZE_T blob_len, struct mad_rsd *o) {
     }
     if (nsampler) memcpy(s10, s11, sizeof *s10 * nsampler);
 
-    o->native = version == 2 ? D3D_ROOT_SIGNATURE_VERSION_1_1 : D3D_ROOT_SIGNATURE_VERSION_1_0;
+    o->native = version == 3 ? MAD_RS_VERSION_1_2 : version == 2 ? D3D_ROOT_SIGNATURE_VERSION_1_1
+                                                                 : D3D_ROOT_SIGNATURE_VERSION_1_0;
     o->nranges = total_ranges;
     return S_OK;
 
@@ -9143,7 +9195,7 @@ truncated:
 static ULONG rsd_addref(struct mad_rsd *o) { return (ULONG)InterlockedIncrement(&o->refs); }
 static ULONG rsd_release(struct mad_rsd *o) {
     LONG n = InterlockedDecrement(&o->refs);
-    if (n == 0) { free(o->v10); free(o->v11); free(o); }
+    if (n == 0) { free(o->v10); free(o->v11); free(o->v12); free(o); }
     return (ULONG)n;
 }
 static HRESULT rsd_qi(struct mad_rsd *o, REFIID riid, void **out) {
@@ -9181,6 +9233,7 @@ static HRESULT STDMETHODCALLTYPE rsdv_GetRootSignatureDescAtVersion(ID3D12Versio
     if (!desc) return E_INVALIDARG;
     if (version == D3D_ROOT_SIGNATURE_VERSION_1_0) { *desc = o->v10; return S_OK; }
     if (version == D3D_ROOT_SIGNATURE_VERSION_1_1) { *desc = o->v11; return S_OK; }
+    if (version == MAD_RS_VERSION_1_2) { *desc = (const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)o->v12; return S_OK; }
     *desc = NULL;
     RSD_REFUSE("[d3d12-rsdeser] conversion to root signature version %#x is not supported\n", (unsigned)version);
     return E_INVALIDARG;
@@ -9188,7 +9241,8 @@ static HRESULT STDMETHODCALLTYPE rsdv_GetRootSignatureDescAtVersion(ID3D12Versio
 static const D3D12_VERSIONED_ROOT_SIGNATURE_DESC * STDMETHODCALLTYPE rsdv_GetUnconvertedRootSignatureDesc(
         ID3D12VersionedRootSignatureDeserializer *T) {
     struct mad_rsd *o = (struct mad_rsd *)T;
-    return o->native == D3D_ROOT_SIGNATURE_VERSION_1_1 ? o->v11 : o->v10;
+    return o->native == MAD_RS_VERSION_1_2 ? (const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *)o->v12
+         : o->native == D3D_ROOT_SIGNATURE_VERSION_1_1 ? o->v11 : o->v10;
 }
 static const ID3D12VersionedRootSignatureDeserializerVtbl g_rsdv_vtbl = {
     rsdv_QI, rsdv_AddRef, rsdv_Release, rsdv_GetRootSignatureDescAtVersion, rsdv_GetUnconvertedRootSignatureDesc,
@@ -9233,7 +9287,7 @@ static HRESULT mad_rsd_create(const void *blob, SIZE_T n, REFIID riid, void **ou
         const D3D12_ROOT_SIGNATURE_DESC1 *d = &o->v11->Desc_1_1;
         if (InterlockedIncrement(&said) <= 8)
             d3d12_log("[d3d12-rsdeser] ml1980 version=1.%u params=%u ranges=%u samplers=%u\n",
-                      o->native == D3D_ROOT_SIGNATURE_VERSION_1_1 ? 1u : 0u,
+                      (unsigned)o->native - 1,
                       d->NumParameters, o->nranges, d->NumStaticSamplers);
     }
     hr = rsd_qi(o, riid, out);
@@ -13987,7 +14041,8 @@ static HRESULT mad_make_blob(const void *bytes, SIZE_T n, ID3D10Blob **out) {
 /* A 1.0 description differs from 1.1 only by the absence of flags on ranges
  * and root descriptors, so it is lifted to 1.1 with default flags and
  * serialized through the one serializer this runtime has. Bounded: a layout
- * bigger than the parser's own limits is refused here rather than truncated. */
+ * bigger than the parser's own limits is refused here rather than truncated.
+ * A 1.2 description is 1.1's with flagged samplers, and serializes as 1.2. */
 static HRESULT mad_serialize_any(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v,
                                  ID3D10Blob **blob, ID3D10Blob **err) {
     D3D12_ROOT_PARAMETER1 params[MAD_ROOT_PARAM_MAX];
@@ -13997,6 +14052,7 @@ static HRESULT mad_serialize_any(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v,
     D3D12_DESCRIPTOR_RANGE1 *ranges = NULL;
     D3D12_ROOT_SIGNATURE_DESC1 d1;
     const D3D12_ROOT_SIGNATURE_DESC1 *use;
+    const struct mad_static_sampler_desc1 *s12 = NULL;   /* wine-lab port: root signature 1.2 */
     unsigned char *out = NULL;
     SIZE_T out_cap = 0;
     SIZE_T n;
@@ -14006,6 +14062,15 @@ static HRESULT mad_serialize_any(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v,
     if (!v || !blob) return E_INVALIDARG;
     if (v->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
         use = &v->Desc_1_1;
+    } else if (v->Version == MAD_RS_VERSION_1_2) {
+        const struct mad_root_signature_desc2 *d2 = &((const struct mad_versioned_rs_desc12 *)v)->Desc_1_2;
+        memset(&d1, 0, sizeof d1);
+        d1.NumParameters = d2->NumParameters;
+        d1.pParameters = d2->pParameters;
+        d1.NumStaticSamplers = d2->NumStaticSamplers;
+        d1.Flags = d2->Flags;
+        s12 = d2->pStaticSamplers;
+        use = &d1;
     } else if (v->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
         const D3D12_ROOT_SIGNATURE_DESC *d0 = &v->Desc_1_0;
         UINT nr = 0, i, j, want = 0;
@@ -14076,7 +14141,7 @@ static HRESULT mad_serialize_any(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v,
     /* ml1009: ask for the size, then serialize into a buffer that fits, instead
      * of a fixed 4096 that a large signature silently outgrows. */
     n = 0;
-    hr = MadeiraD3D12SerializeRootSignature(use, NULL, &n);
+    hr = rs_serialize(use, s12, NULL, &n);
     if (FAILED(hr) && hr != E_NOT_SUFFICIENT_BUFFER) {
         d3d12_log("[madeira-d3d12] root signature serialization refused while sizing (%#lx)\n", (unsigned long)hr);
         free(ranges);
@@ -14087,7 +14152,7 @@ static HRESULT mad_serialize_any(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *v,
     out = malloc(out_cap);
     if (!out) { free(ranges); return E_OUTOFMEMORY; }
     n = out_cap;
-    hr = MadeiraD3D12SerializeRootSignature(use, out, &n);
+    hr = rs_serialize(use, s12, out, &n);
     if (FAILED(hr)) {
         d3d12_log("[madeira-d3d12] root signature serialization refused (%#lx, %llu byte buffer)\n",
                   (unsigned long)hr, (unsigned long long)out_cap);

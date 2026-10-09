@@ -39,6 +39,7 @@ static void d3d12_log(const char *fmt, ...) {
     vprintf(fmt, ap);
     va_end(ap);
 }
+static HRESULT mad_silent_notimpl(int line) { (void)line; return E_NOTIMPL; }
 
 #include "rsdeser_extract.inc"
 
@@ -313,9 +314,16 @@ static void check_blob(const char *tag, const unsigned char *blob, SIZE_T len, i
         CHECK(un == (is_v10 ? at10 : at11), "%s: unconverted is the native view", tag);
         hr = ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(vd, D3D_ROOT_SIGNATURE_VERSION_1_1, &again);
         CHECK(hr == S_OK && again == at11, "%s: cached 1.1 pointer is stable", tag);
+        again = NULL;
+        hr = ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(vd, MAD_RS_VERSION_1_2, &again);
+        CHECK(hr == S_OK && again && again->Version == MAD_RS_VERSION_1_2 &&
+              ((const struct mad_versioned_rs_desc12 *)again)->Desc_1_2.pParameters == at11->Desc_1_1.pParameters &&
+              (!g_desc.NumStaticSamplers ||
+               ((const struct mad_versioned_rs_desc12 *)again)->Desc_1_2.pStaticSamplers[0].flags == 0),
+              "%s: at 1.2 (shared parameters, sampler flags 0)", tag);
         again = (const void *)1;
-        hr = ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(vd, (D3D_ROOT_SIGNATURE_VERSION)3, &again);
-        CHECK(hr == E_INVALIDARG && !again, "%s: 1.2 conversion refused", tag);
+        hr = ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(vd, (D3D_ROOT_SIGNATURE_VERSION)4, &again);
+        CHECK(hr == E_INVALIDARG && !again, "%s: unknown version conversion refused", tag);
         CHECK(ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(vd, D3D_ROOT_SIGNATURE_VERSION_1_1, NULL)
               == E_INVALIDARG, "%s: NULL desc out", tag);
         hr = ID3D12VersionedRootSignatureDeserializer_QueryInterface(vd, &IID_IUnknown, &unk);
@@ -417,7 +425,7 @@ int main(void) {
 
     {   /* Specific corruptions of the payload (which starts at byte 44). */
         struct { SIZE_T at; UINT32 v; HRESULT want; const char *what; } cases[] = {
-            { 44 + 0,  3,          E_NOTIMPL,    "version 1.2" },
+            { 44 + 0,  3,          E_INVALIDARG, "version 1.2 (its larger samplers overrun the chunk)" },
             { 44 + 0,  7,          E_INVALIDARG, "unknown version" },
             { 44 + 0,  0,          E_INVALIDARG, "version 0" },
             { 44 + 4,  33,         E_NOTIMPL,    "too many parameters" },
@@ -488,6 +496,33 @@ int main(void) {
         }
         g_quiet = 0;
         printf("fuzz: 20000 corrupted blobs, %u accepted, no crash\n", accepted);
+    }
+
+    {   /* A 1.2 blob: the same description, each sampler with a flags word. */
+        struct mad_static_sampler_desc1 s12[2];
+        SIZE_T n12 = 0; unsigned char *b12 = NULL;
+        ID3D12VersionedRootSignatureDeserializer *vd = NULL;
+        for (i = 0; i < 2; i++) { s12[i].d = g_samplers[i]; s12[i].flags = (UINT32)(i + 1); }
+        if (rs_serialize(&g_desc, s12, NULL, &n12) == S_OK && n12 == n11 + 8 && (b12 = malloc(n12)))
+            hr = rs_serialize(&g_desc, s12, b12, &n12);
+        else hr = E_FAIL;
+        CHECK(hr == S_OK, "1.2: serialized, 4 bytes per sampler larger than 1.1");
+        hr = b12 ? mad_rsd_create(b12, n12, &IID_ID3D12VersionedRootSignatureDeserializer, (void **)&vd, 1) : E_FAIL;
+        CHECK(hr == S_OK && vd, "1.2: versioned create hr=%#lx", (unsigned long)hr);
+        if (vd) {
+            const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *un = ID3D12VersionedRootSignatureDeserializer_GetUnconvertedRootSignatureDesc(vd);
+            const struct mad_root_signature_desc2 *d2 = &((const struct mad_versioned_rs_desc12 *)un)->Desc_1_2;
+            const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *at11 = NULL;
+            CHECK(un->Version == MAD_RS_VERSION_1_2 && d2->NumStaticSamplers == 2 &&
+                  same_sampler(&d2->pStaticSamplers[1].d, &g_samplers[1]) &&
+                  d2->pStaticSamplers[0].flags == 1 && d2->pStaticSamplers[1].flags == 2,
+                  "1.2: unconverted description keeps the sampler flags");
+            hr = ID3D12VersionedRootSignatureDeserializer_GetRootSignatureDescAtVersion(vd, D3D_ROOT_SIGNATURE_VERSION_1_1, &at11);
+            CHECK(hr == S_OK && at11, "1.2: at 1.1");
+            if (hr == S_OK) check_v11("v1.2", &at11->Desc_1_1, 0);
+            ID3D12VersionedRootSignatureDeserializer_Release(vd);
+        }
+        free(b12);
     }
 
     {   /* An empty root signature: no parameters, no samplers, NULL arrays. */
