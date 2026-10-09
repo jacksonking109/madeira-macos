@@ -510,6 +510,7 @@ static void mad_skip_report(void) {
 }
 
 static void mad_log_nserror(const char *what, obj_handle_t err);
+static void mad_nserror_text(obj_handle_t err, char *text, size_t cap);
 static void mad_queue_revive(struct mad_device *d);
 struct mad_list; struct mad_queue;
 static void mad_list_rings_rewind(struct mad_list *l);
@@ -674,6 +675,8 @@ struct mad_pso {
     int lazy_cs;                                    /* compute pipeline built at its first dispatch (mad_cpso_realize) */
     SRWLOCK rlock;                                  /* serialises this pipeline's lazy build (zero = SRWLOCK_INIT) */
     char vs_name[64], ps_name[64];                  /* ml879: for the draw dump */
+    UINT16 dbg_rtfmt[8], dbg_dsvfmt; UINT8 dbg_nrt, dbg_samples;   /* wine-lab port: identity for failure logs */
+    volatile LONG said_fail;                        /* wine-lab port: this pipeline's failure was logged */
     char blend[400];                                /* ml1106/ml1107: every RT's blend state for the draw dump */
     UINT root_off[MAD_ROOT_PARAM_MAX]; int has_root_off; /* ml882: offsets from the converter's reflection */
     UINT static_off; int has_static_off;                  /* ml923: the implicit static-sampler table slot */
@@ -2606,6 +2609,17 @@ static enum WMTPrimitiveType mad_prim(D3D12_PRIMITIVE_TOPOLOGY t) {
  * logged and its draws are skipped. madeira.cfg pso-lazy = 0 restores eager
  * creation. */
 static volatile LONG g_pso_lazy_built, g_pso_lazy_failed;
+/* wine-lab port: "vs 'x' ps 'y' sm5/dxbc RT 28,0 DS 40 x1 VD" for failure logs */
+static void mad_pso_identity(const struct mad_pso *p, char *buf, size_t cap) {
+    int w; unsigned i;
+    w = snprintf(buf, cap, "vs '%s' ps '%s' %s RT", p->vs_name, p->ps_name[0] ? p->ps_name : "-",
+                 p->backend == MADEIRA_IR_BACKEND_AIRCONV ? "sm5/dxbc" : "dxil");
+    for (i = 0; i < p->dbg_nrt && w > 0 && (size_t)w < cap; i++)
+        w += snprintf(buf + w, cap - w, "%s%u", i ? "," : " ", p->dbg_rtfmt[i]);
+    if (w > 0 && (size_t)w < cap)
+        snprintf(buf + w, cap - w, "%s DS %u x%u%s%s", p->dbg_nrt ? "" : " none", p->dbg_dsvfmt, p->dbg_samples,
+                 p->has_vd ? " VD" : "", p->is_compute ? " compute" : "");
+}
 static obj_handle_t mad_pso_realize(struct mad_pso *p) {
     if (p->rps || !p->lazy) return p->rps;
     AcquireSRWLockExclusive(&p->rlock);   /* per pipeline: builds of different pipelines run in parallel */
@@ -2613,16 +2627,20 @@ static obj_handle_t mad_pso_realize(struct mad_pso *p) {
         obj_handle_t err = 0;
         p->rps = p->has_vd ? MTLDevice_newRenderPipelineStateVD(p->device_handle, &p->rp, &p->vd, &err)
                            : MTLDevice_newRenderPipelineState(p->device_handle, &p->rp, &err);
-        if (err) mad_log_nserror(p->vs_name, err);
         if (p->rps) {
             LONG n = InterlockedIncrement(&g_pso_lazy_built);
             if (n == 1 || (n % 500) == 0)
                 d3d12_log("[madeira-d3d12] lazy pipelines built at first draw: %ld (failed %ld)\n", n, g_pso_lazy_failed);
         } else {
+            /* wine-lab port: every failed realization says why, once per pipeline */
+            char text[600], id[200];
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
             p->lazy = 0;   /* draws with it are skipped from now on */
-            if (n <= 8) d3d12_log("[madeira-d3d12] lazy pipeline failed at first draw (vs '%s', ps '%s'); its draws are skipped\n",
-                                  p->vs_name, p->ps_name);
+            mad_nserror_text(err, text, sizeof text);
+            mad_pso_identity(p, id, sizeof id);
+            if (n <= 200 && !InterlockedExchange(&p->said_fail, 1))
+                d3d12_log("[madeira-d3d12] lazy pipeline FAILED at first draw (#%ld; %s): %s; its draws are skipped\n",
+                          n, id, text);
         }
     }
     ReleaseSRWLockExclusive(&p->rlock);
@@ -2637,11 +2655,14 @@ static obj_handle_t mad_cpso_realize(struct mad_pso *p) {
         memset(&ci, 0, sizeof ci);
         ci.compute_function = p->vs_fn;
         p->cps = MTLDevice_newComputePipelineState(p->device_handle, &ci, &err);
-        if (err) mad_log_nserror("compute pipeline", err);
         if (!p->cps) {
+            char text[600];
             LONG n = InterlockedIncrement(&g_pso_lazy_failed);
             p->lazy_cs = 0;   /* dispatches with it are skipped from now on */
-            if (n <= 8) d3d12_log("[madeira-d3d12] lazy compute pipeline failed at first dispatch (%s); its dispatches are skipped\n", p->vs_name);
+            mad_nserror_text(err, text, sizeof text);
+            if (n <= 200 && !InterlockedExchange(&p->said_fail, 1))
+                d3d12_log("[madeira-d3d12] lazy compute pipeline FAILED at first dispatch (#%ld; cs '%s' sm%s, tg %ux%ux%u): %s; its dispatches are skipped\n",
+                          n, p->vs_name, p->backend == MADEIRA_IR_BACKEND_AIRCONV ? "5/dxbc" : "6/dxil", p->tg[0], p->tg[1], p->tg[2], text);
         } else InterlockedIncrement(&g_pso_lazy_built);
     }
     ReleaseSRWLockExclusive(&p->rlock);
@@ -3791,7 +3812,19 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     if ((c->kind == MC_DRAW && !c->u.draw.icount) || (c->kind == MC_DRAW_INDEXED && !c->u.drawi.inst)) { InterlockedIncrement(&g_zero_inst); return; }
     if (e->pso && !e->pso->rps && e->pso->lazy) mad_pso_realize(e->pso);
     if (!e->pso || (!e->pso->rps && !e->pso->tess)) {   /* ml1086: a tessellation pipeline may have no plain pipeline */
-        if (!said_nopso++) d3d12_log("[madeira-d3d12] draw without a pipeline state; skipped\n");
+        /* wine-lab port: say WHICH case: no pipeline bound at all (list began
+         * without one), a compute pipeline bound, or a pipeline that has no
+         * Metal render pipeline (its failure, if any, was logged once). */
+        if (!e->pso) {
+            if (said_nopso++ < 4)
+                d3d12_log("[madeira-d3d12] draw with NO graphics pipeline bound (compute %p bound, list %u cmds, cmd %u); skipped\n",
+                          (void *)e->cpso, e->l ? e->l->ncmds : 0, e->cur);
+        } else if (!InterlockedCompareExchange(&e->pso->said_fail, 2, 0)) {
+            char id[200];
+            mad_pso_identity(e->pso, id, sizeof id);
+            d3d12_log("[madeira-d3d12] draw with a pipeline that has no Metal render pipeline (%s; lazy %d gs_emu %d tess %d); skipped\n",
+                      id, e->pso->lazy, e->pso->gs_emu, e->pso->has_tess);
+        }
         MAD_SKIP(e);
         return;
     }
@@ -4591,7 +4624,9 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     static unsigned said_nopso;
     if (e->cpso && !e->cpso->cps && e->cpso->lazy_cs) mad_cpso_realize(e->cpso);
     if (!e->cpso || !e->cpso->cps) {
-        if (!said_nopso++) d3d12_log("[madeira-d3d12] Dispatch without a compute pipeline; skipped\n");
+        if (!e->cpso) { if (said_nopso++ < 4) d3d12_log("[madeira-d3d12] Dispatch with NO compute pipeline bound; skipped\n"); }
+        else if (!InterlockedCompareExchange(&e->cpso->said_fail, 2, 0))
+            d3d12_log("[madeira-d3d12] Dispatch with a pipeline that has no Metal compute pipeline (cs '%s'); skipped\n", e->cpso->vs_name);
         MAD_SKIP(e);
         return;
     }
@@ -5133,6 +5168,16 @@ static void mad_queue_revive(struct mad_device *d) {
     d->mtl_queue = nq;
     d3d12_log("[madeira-d3d12] ml1067 driver ignored our submissions after a GPU fault; command queue REPLACED (#%ld)\n",
               InterlockedIncrement(&d->queues_recreated));
+}
+/* wine-lab port: Metal's error text (autoreleased NSError, not released here) */
+static void mad_nserror_text(obj_handle_t err, char *text, size_t cap) {
+    obj_handle_t desc;
+    if (!cap) return;
+    text[0] = 0;
+    if (!err) { snprintf(text, cap, "Metal returned no pipeline and no NSError"); return; }
+    desc = NSObject_description(err);
+    if (desc) NSString_getCString(desc, text, cap, WMTUTF8StringEncoding);
+    if (!text[0]) snprintf(text, cap, "(NSError without a description)");
 }
 static void mad_log_nserror(const char *what, obj_handle_t err) {
     /* ml1049: the bridge hands back Metal's AUTORELEASED NSError. Releasing it
@@ -10403,6 +10448,9 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
     /* Depth-stencil state is encoder state in Metal; one object per pipeline. */
     memset(&dsi, 0, sizeof dsi);
     p->dbg_denable = desc->DepthStencilState.DepthEnable != 0;
+    { unsigned fi; p->dbg_nrt = (UINT8)(desc->NumRenderTargets > 8 ? 8 : desc->NumRenderTargets);
+      for (fi = 0; fi < 8; fi++) p->dbg_rtfmt[fi] = (UINT16)desc->RTVFormats[fi];
+      p->dbg_dsvfmt = (UINT16)desc->DSVFormat; p->dbg_samples = (UINT8)desc->SampleDesc.Count; }
     p->dbg_dfunc = (UINT8)desc->DepthStencilState.DepthFunc;
     p->dbg_dwrite = desc->DepthStencilState.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ALL;
     { unsigned wi; for (wi = 0; wi < 8; wi++) p->dbg_wmask[wi] = desc->BlendState.RenderTarget[wi].RenderTargetWriteMask; }
