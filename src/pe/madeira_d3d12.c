@@ -1371,6 +1371,7 @@ struct mad_queue {
     /* wine-lab port: the render pass the previous list of this replay left open
      * (pass-carry), see mad_exec_list. Touched only under submit_lock. */
     struct mad_exec *carry; int carry_live;
+    unsigned char *bat;   /* wine-lab port: arena for the draw chains of one render encoder (see exec_bat_*) */
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
@@ -1443,6 +1444,7 @@ struct mad_exec {
     struct mad_rootsig *rs;
     unsigned cap_after;   /* ml918: capture rt[0] texels after the current draw */
     struct mad_encsh sh; int enc_dirty;   /* wine-lab port: redundant-state elision */
+    unsigned char *bat; size_t bat_used; struct wmtcmd_base *bat_tail; struct wmtcmd_base bat_head;   /* wine-lab port: draw chains not yet sent to the encoder */
     unsigned char *arg_cpu;   /* wine-lab port: the CPU view of the slot exec_arg_slot_for just filled */
     struct mad_resource *cap_after_cs;   /* ml920: texture to capture after the current dispatch */
     struct { struct mad_resource *r; UINT64 off; char label[96]; } cap_after_buf[6]; unsigned ncap_after_buf;   /* ml922 */
@@ -1839,9 +1841,74 @@ static void f7_store_census(struct mad_exec *e, const struct mad_resource *r, UI
 done:
     InterlockedExchangeAdd64(cls, b);
 }
+/* wine-lab port: ONE CROSSING PER BATCH OF DRAWS. Every encodeCommands call is a trip into the unix
+ * library (~0.35 us under Rosetta, more than the Metal calls it carries). A draw's chain is copied into
+ * a per-queue arena and linked behind the previous draws' chains; the whole thing is sent when the
+ * arena fills, when the encoder ends (exec_end), and at the end of every list. Nothing else touches
+ * the render encoder, so the Metal call order is exactly the draw order. madeira.cfg draw-batch = 0
+ * sends each draw's chain by itself again. */
+#define MAD_BAT_BYTES (256u * 1024u)
+#define MAD_BAT_SLACK (24u * 1024u)   /* the largest chain a draw builds (256 useResource entries and the rest) */
+static int g_draw_batch = -1;
+static size_t mad_render_node_size(uint16_t t) {
+    switch ((enum WMTRenderCommandType)t) {
+    case WMTRenderCommandNop: return sizeof(struct wmtcmd_base);
+    case WMTRenderCommandUseResource: return sizeof(struct wmtcmd_render_useresource);
+    case WMTRenderCommandSetVertexBuffer: case WMTRenderCommandSetFragmentBuffer:
+    case WMTRenderCommandSetObjectBuffer: case WMTRenderCommandSetMeshBuffer: return sizeof(struct wmtcmd_render_setbuffer);
+    case WMTRenderCommandSetVertexBufferOffset: case WMTRenderCommandSetFragmentBufferOffset:
+    case WMTRenderCommandSetObjectBufferOffset: case WMTRenderCommandSetMeshBufferOffset: return sizeof(struct wmtcmd_render_setbufferoffset);
+    case WMTRenderCommandSetRasterizerState: return sizeof(struct wmtcmd_render_setrasterizerstate);
+    case WMTRenderCommandSetPSO: return sizeof(struct wmtcmd_render_setpso);
+    case WMTRenderCommandSetDSSO: return sizeof(struct wmtcmd_render_setdsso);
+    case WMTRenderCommandSetBlendFactorAndStencilRef: return sizeof(struct wmtcmd_render_setblendcolor);
+    case WMTRenderCommandSetVisibilityMode: return sizeof(struct wmtcmd_render_setvisibilitymode);
+    case WMTRenderCommandSetViewport: return sizeof(struct wmtcmd_render_setviewport);
+    case WMTRenderCommandSetScissorRect: return sizeof(struct wmtcmd_render_setscissorrect);
+    case WMTRenderCommandDraw: return sizeof(struct wmtcmd_render_draw);
+    case WMTRenderCommandDrawIndexed: return sizeof(struct wmtcmd_render_draw_indexed);
+    case WMTRenderCommandDrawIndirect: return sizeof(struct wmtcmd_render_draw_indirect);
+    case WMTRenderCommandDrawIndexedIndirect: return sizeof(struct wmtcmd_render_draw_indexed_indirect);
+    case WMTRenderCommandDrawMeshThreadgroups: return sizeof(struct wmtcmd_render_draw_meshthreadgroups);
+    case WMTRenderCommandDXMTGeometryDraw: return sizeof(struct wmtcmd_render_dxmt_geometry_draw);
+    case WMTRenderCommandDXMTGeometryDrawIndexed: return sizeof(struct wmtcmd_render_dxmt_geometry_draw_indexed);
+    default: return 0;
+    }
+}
+static void exec_bat_flush(struct mad_exec *e) {
+    if (!e->bat_tail) return;
+    e->bat_tail->next.ptr = NULL;
+    MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)e->bat_head.next.ptr);
+    e->bat_tail = NULL; e->bat_used = 0; e->bat_head.next.ptr = NULL;
+}
+/* Sends or queues the chain `head` (a Nop head node followed by the commands). */
+static void exec_bat_submit(struct mad_exec *e, struct wmtcmd_base *head) {
+    const struct wmtcmd_base *n; size_t total = 0, sz;
+    if (g_draw_batch < 0) { g_draw_batch = mad_cfg_int_pe("draw-batch", 1) ? 1 : 0;
+                            d3d12_log("[madeira-d3d12] draw-batch = %d (%s)\n", g_draw_batch, g_draw_batch ? "draw chains reach the render encoder in batches" : "one unix call per draw"); }
+    if (g_draw_batch && !e->bat && e->q->bat) e->bat = e->q->bat;
+    if (g_draw_batch && !e->bat) { e->q->bat = malloc(MAD_BAT_BYTES); e->bat = e->q->bat; }
+    if (!g_draw_batch || !e->bat) { exec_bat_flush(e); MTLRenderCommandEncoder_encodeCommands(e->renc, head); return; }
+    for (n = (const struct wmtcmd_base *)head->next.ptr; n; n = (const struct wmtcmd_base *)n->next.ptr) {
+        sz = mad_render_node_size(n->type);
+        if (!sz) { exec_bat_flush(e); MTLRenderCommandEncoder_encodeCommands(e->renc, head); return; }   /* a node this does not know: by itself */
+        total += (sz + 7) & ~(size_t)7;
+    }
+    if (e->bat_used + total > MAD_BAT_BYTES) exec_bat_flush(e);
+    if (!e->bat_tail) { e->bat_tail = &e->bat_head; e->bat_head.next.ptr = NULL; }
+    for (n = (const struct wmtcmd_base *)head->next.ptr; n; n = (const struct wmtcmd_base *)n->next.ptr) {
+        struct wmtcmd_base *dst = (struct wmtcmd_base *)(e->bat + e->bat_used);
+        sz = mad_render_node_size(n->type);
+        memcpy(dst, n, sz);
+        dst->next.ptr = NULL;
+        e->bat_tail->next.ptr = dst; e->bat_tail = dst;
+        e->bat_used += (sz + 7) & ~(size_t)7;
+    }
+    if (e->bat_used + MAD_BAT_SLACK > MAD_BAT_BYTES) exec_bat_flush(e);
+}
 static void exec_end(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
-    if (e->renc) exec_fence_render(e, e->renc, 1);     /* ml1091 */
+    if (e->renc) { exec_bat_flush(e); exec_fence_render(e, e->renc, 1); }     /* ml1091; wine-lab port: the draws first */
     if (e->benc) exec_fence_blit(e, e->benc, 1);
     if (e->cenc) exec_fence_compute(e, e->cenc, 1);
     if (e->renc && g_att_census && e->l) {   /* ml1137 */
@@ -4535,10 +4602,11 @@ tess_go:
             c_vis.next.ptr = &c_head;
             e->vis_prev = want;
             tail->next.ptr = NULL;
-            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_vis);
+            c_vis.next.ptr = c_head.next.ptr; c_head.next.ptr = &c_vis;
+            exec_bat_submit(e, &c_head);
         } else {
             tail->next.ptr = NULL;
-            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_head);
+            exec_bat_submit(e, &c_head);
         }
         e->enc_dirty = 0;
         if (want != ~(UINT64)0) v->dirty = 1;
@@ -5143,6 +5211,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
     }
+    if (e.renc) exec_bat_flush(&e);   /* wine-lab port: batched draws go out before the list ends (the encoder may be carried) */
     if (g_perf_replay > 0) {   /* perf-replay: the command loop only (ends of passes and clears are outside it) */
         g_pr_t[PR_LIST] += PR_NOW() - pr_list_t0; g_pr_lists++; g_pr_cmds += l->ncmds;
         if (g_pr_draws >= 20000) mad_perf_replay_report();
