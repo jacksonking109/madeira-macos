@@ -286,7 +286,7 @@ struct mad_device {
     obj_handle_t enc_fence;
     LONG f5_nonrender;   /* ml1118: a compute/blit encoder ended since the last vertex-stage render wait */
     CRITICAL_SECTION fence_lock;
-    struct mad_fence_job { UINT64 serial; ID3D12Fence *fence; UINT64 value; obj_handle_t cbs[16]; unsigned ncbs; } *fence_jobs;
+    struct mad_fence_job { UINT64 serial; ID3D12Fence *fence; UINT64 value; obj_handle_t cbs[64]; unsigned ncbs; } *fence_jobs;   /* wine-lab port: 64 (was 16), see pending[] */
     unsigned nfence_jobs, fence_jobs_cap;
     HANDLE fence_wake, fence_thread;
     volatile LONG fence_quit;   /* ml1064: device teardown stops the worker */
@@ -1311,7 +1311,9 @@ struct mad_queue {
     /* Command buffers submitted but not yet known complete. A fence signal must
      * wait for these, otherwise it reports GPU work finished that has only been
      * submitted -- which is the difference between a fence and a counter. */
-    obj_handle_t pending[16];
+    obj_handle_t pending[64];   /* wine-lab port: 64 (was 16): with earlier commits a frame commits more
+                                 * buffers between Signals, and a full array makes mad_queue_flush
+                                 * WAIT for every one of them */
     unsigned npending;
     UINT64 untracked;   /* submissions the fence could not be made to cover */
     /* ml884: one Metal command buffer per BATCH of submissions, not per
@@ -5411,7 +5413,7 @@ static void mad_queue_flush(struct mad_queue *q) {
     EnterCriticalSection(&q->submit_lock);   /* ml1021 */
     if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
     mad_carry_end(q);   /* wine-lab port: pass-carry */
-    if (q->npending == 16) {
+    if (q->npending == sizeof q->pending / sizeof q->pending[0]) {
         for (unsigned k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
         q->npending = 0;
     }
@@ -7141,7 +7143,13 @@ static HRESULT STDMETHODCALLTYPE device_CreateQueryHeap(ID3D12Device *This,
     q->results = calloc(desc->Count ? desc->Count : 1, sizeof *q->results);   /* ml1088 */
     if (!q->results) { free(q); return E_OUTOFMEMORY; }
     InitializeCriticalSection(&q->lock);
-    InterlockedExchange(&q->device->has_query_heaps, 1);
+    /* wine-lab port: only an OCCLUSION heap is counted on the GPU (ml1088); the
+     * others resolve to zero. Any heap used to switch every render pass to the
+     * visibility-slot path, which looks the slot chunk up at every draw
+     * (exec_same_targets): Unity creates a timestamp heap, and that lookup was
+     * ~3 ms of PEAK's 7.5 ms replay per frame. */
+    if (desc->Type == D3D12_QUERY_HEAP_TYPE_OCCLUSION)
+        InterlockedExchange(&q->device->has_query_heaps, 1);
     d3d12_log("[madeira-d3d12] query heap: type %u, %u queries (%s)\n",
               (unsigned)desc->Type, desc->Count,
               (desc->Type == D3D12_QUERY_HEAP_TYPE_OCCLUSION) ? "ml1088: counted on the GPU" : "results resolve to zero");
