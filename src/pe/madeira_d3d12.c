@@ -22,6 +22,7 @@
 #include <d3d12.h>
 #include <dxgi1_5.h>
 #include <stdarg.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1540,6 +1541,40 @@ static void exec_query_resolve(struct mad_exec *e, const struct mad_cmd *c);
 static void mad_vis_flush(struct mad_queue *q, obj_handle_t cb);
 
 static long long mad_cfg_int_pe(const char *key, long long dflt);
+/* wine-lab port: perf-replay. Phase timers around the replay of a draw (madeira.cfg
+ * perf-replay = 1; off by default, the checks below are one predictable branch each).
+ * Logged every 20000 draws as microseconds per draw. Replay of one queue runs on one
+ * thread; the counters are not atomic. */
+enum { PR_DRAW, PR_BEGIN, PR_ARGSLOT, PR_PSO, PR_TABLES, PR_USE, PR_BUILD, PR_ENCODE, PR_LIST, PR_LTOTAL, PR_PASSB, PR_PASSE, PR_FLUSH, PR_N };
+static int g_perf_replay = -1;
+static LONG64 g_pr_t[PR_N]; static LONG64 g_pr_draws, g_pr_lists, g_pr_cmds;
+/* QueryPerformanceCounter costs ~0.4 us here (Rosetta), more than most phases; the phase timers read the
+ * time stamp counter (a few ns) and the report converts ticks to seconds against QPC over the same interval. */
+static LONG64 g_pr_tsc0, g_pr_qpc0; static LONG64 g_pr_x[8];   /* 4/5: cb-table miss/hit, 6/7: arg-table miss/hit */
+#define PR_NOW() ((LONG64)__builtin_ia32_rdtsc())
+static int mad_perf_replay_on(void) {
+    if (g_perf_replay < 0) { g_perf_replay = mad_cfg_int_pe("perf-replay", 0) ? 1 : 0;
+                             g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
+                             d3d12_log("[madeira-d3d12] perf-replay = %d\n", g_perf_replay); }
+    return g_perf_replay;
+}
+#define PR_LAP(var_, idx_) do { if (g_perf_replay > 0) { LONG64 n_ = PR_NOW(); g_pr_t[idx_] += n_ - (var_); (var_) = n_; } } while (0)
+static void mad_perf_replay_report(void) {
+    static const char *nm[PR_N] = { "draw-total", "begin-render", "arg-slot", "pso-select", "tables", "use-res", "cmd-build", "encode", "list-total", "whole-list", "pass-begin", "pass-end", "queue-flush" };
+    LARGE_INTEGER f; char line[600]; int n; unsigned i; double us, d;
+    QueryPerformanceFrequency(&f);
+    d = g_pr_draws ? (double)g_pr_draws : 1.0;
+    us = 1e6 * ((double)(mad_qpc() - g_pr_qpc0) / (double)f.QuadPart) / (double)(PR_NOW() - g_pr_tsc0);   /* microseconds per tsc tick */
+    n = snprintf(line, sizeof line, "[perf-replay] %lld draws in %lld lists (%lld cmds): per draw us:", (long long)g_pr_draws, (long long)g_pr_lists, (long long)g_pr_cmds);
+    for (i = 0; i < PR_N; i++) n += snprintf(line + n, sizeof line - n, " %s %.3f", nm[i], g_pr_t[i] * us / d);
+    n += snprintf(line + n, sizeof line - n, " | list-total minus draw-total: %.3f", (g_pr_t[PR_LIST] - g_pr_t[PR_DRAW]) * us / d);
+    d3d12_log("%s\n", line);
+    d3d12_log("[perf-replay] table reuse: constant-buffer tables %lld built / %lld reused, argument tables %lld built / %lld reused\n",
+              (long long)g_pr_x[4], (long long)g_pr_x[5], (long long)g_pr_x[6], (long long)g_pr_x[7]);
+    memset(g_pr_x, 0, sizeof g_pr_x);
+    memset(g_pr_t, 0, sizeof g_pr_t); g_pr_draws = g_pr_lists = g_pr_cmds = 0;
+    g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
+}
 static D3D_FEATURE_LEVEL mad_max_feature_level(void);   /* wine-lab port */
 /* ml1091 */
 static int g_fence_chain = -1;   /* ml1110: madeira.cfg fence-chain = 0 disables the per-encoder fence (perf experiment; expect flicker) */
@@ -1922,7 +1957,13 @@ static void exec_bat_submit(struct mad_exec *e, struct wmtcmd_base *head) {
     }
     if (e->bat_used + MAD_BAT_SLACK > MAD_BAT_BYTES) exec_bat_flush(e);
 }
+static void exec_end_impl(struct mad_exec *e);
 static void exec_end(struct mad_exec *e) {
+    LONG64 t0;
+    if (g_perf_replay <= 0) { exec_end_impl(e); return; }
+    t0 = PR_NOW(); exec_end_impl(e); g_pr_t[PR_PASSE] += PR_NOW() - t0;
+}
+static void exec_end_impl(struct mad_exec *e) {
     struct mad_resource *crt[8]; struct mad_resource *cdepth = NULL; struct mad_rtvp crtp[8], cdp; unsigned cn = 0, cseq = 0, cdraws = 0;   /* ml1098 */
     if (e->renc) { exec_bat_flush(e); exec_fence_render(e, e->renc, 1); }     /* ml1091; wine-lab port: the draws first */
     if (e->benc) exec_fence_blit(e, e->benc, 1);
@@ -2208,41 +2249,6 @@ static long long mad_cfg_int_pe(const char *key, long long dflt) {
     MadeiraCtl(&a);
     return (a.ret && v[0]) ? _strtoi64(v, NULL, 0) : dflt;
 }
-/* wine-lab port: perf-replay. Phase timers around the replay of a draw (madeira.cfg
- * perf-replay = 1; off by default, the checks below are one predictable branch each).
- * Logged every 20000 draws as microseconds per draw. Replay of one queue runs on one
- * thread; the counters are not atomic. */
-enum { PR_DRAW, PR_BEGIN, PR_ARGSLOT, PR_PSO, PR_TABLES, PR_USE, PR_BUILD, PR_ENCODE, PR_LIST, PR_N };
-static int g_perf_replay = -1;
-static LONG64 g_pr_t[PR_N]; static LONG64 g_pr_draws, g_pr_lists, g_pr_cmds;
-/* QueryPerformanceCounter costs ~0.4 us here (Rosetta), more than most phases; the phase timers read the
- * time stamp counter (a few ns) and the report converts ticks to seconds against QPC over the same interval. */
-static LONG64 g_pr_tsc0, g_pr_qpc0; static LONG64 g_pr_x[8];   /* 4/5: cb-table miss/hit, 6/7: arg-table miss/hit */
-#include <stddef.h>
-#define PR_NOW() ((LONG64)__builtin_ia32_rdtsc())
-static int mad_perf_replay_on(void) {
-    if (g_perf_replay < 0) { g_perf_replay = mad_cfg_int_pe("perf-replay", 0) ? 1 : 0;
-                             g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
-                             d3d12_log("[madeira-d3d12] perf-replay = %d\n", g_perf_replay); }
-    return g_perf_replay;
-}
-#define PR_LAP(var_, idx_) do { if (g_perf_replay > 0) { LONG64 n_ = PR_NOW(); g_pr_t[idx_] += n_ - (var_); (var_) = n_; } } while (0)
-static void mad_perf_replay_report(void) {
-    static const char *nm[PR_N] = { "draw-total", "begin-render", "arg-slot", "pso-select", "tables", "use-res", "cmd-build", "encode", "list-total" };
-    LARGE_INTEGER f; char line[600]; int n; unsigned i; double us, d;
-    QueryPerformanceFrequency(&f);
-    d = g_pr_draws ? (double)g_pr_draws : 1.0;
-    us = 1e6 * ((double)(mad_qpc() - g_pr_qpc0) / (double)f.QuadPart) / (double)(PR_NOW() - g_pr_tsc0);   /* microseconds per tsc tick */
-    n = snprintf(line, sizeof line, "[perf-replay] %lld draws in %lld lists (%lld cmds): per draw us:", (long long)g_pr_draws, (long long)g_pr_lists, (long long)g_pr_cmds);
-    for (i = 0; i < PR_N; i++) n += snprintf(line + n, sizeof line - n, " %s %.3f", nm[i], g_pr_t[i] * us / d);
-    n += snprintf(line + n, sizeof line - n, " | list-total minus draw-total: %.3f", (g_pr_t[PR_LIST] - g_pr_t[PR_DRAW]) * us / d);
-    d3d12_log("%s\n", line);
-    d3d12_log("[perf-replay] table reuse: constant-buffer tables %lld built / %lld reused, argument tables %lld built / %lld reused\n",
-              (long long)g_pr_x[4], (long long)g_pr_x[5], (long long)g_pr_x[6], (long long)g_pr_x[7]);
-    memset(g_pr_x, 0, sizeof g_pr_x);
-    memset(g_pr_t, 0, sizeof g_pr_t); g_pr_draws = g_pr_lists = g_pr_cmds = 0;
-    g_pr_qpc0 = mad_qpc(); g_pr_tsc0 = PR_NOW();
-}
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
     if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
@@ -2390,7 +2396,15 @@ static void mad_label(obj_handle_t enc, const char *fmt, ...) {
     str = NSString_alloc_init(s, WMTUTF8StringEncoding);
     if (str) { MTLCommandEncoder_setLabel(enc, str); NSObject_release(str); }
 }
+static int exec_begin_render_impl(struct mad_exec *e);
 static int exec_begin_render(struct mad_exec *e) {
+    LONG64 t0; int r;
+    if (g_perf_replay <= 0) return exec_begin_render_impl(e);
+    t0 = PR_NOW(); r = exec_begin_render_impl(e);
+    if (e->pass_draws == 0) g_pr_t[PR_PASSB] += PR_NOW() - t0;   /* only a pass that was really begun */
+    return r;
+}
+static int exec_begin_render_impl(struct mad_exec *e) {
     struct WMTRenderPassInfo rpi;
     UINT i, w = 0, h = 0;
     unsigned k;
@@ -5140,7 +5154,7 @@ static void mad_carry_end(struct mad_queue *q) {
     InterlockedIncrement(&g_pass_end_list);
     exec_end(q->carry);
 }
-static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
+static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
     g_list_seq++;
     struct mad_exec e;
     unsigned i;
@@ -5324,6 +5338,14 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
     }
+}
+
+static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
+    LONG64 t0;
+    if (g_perf_replay <= 0) { mad_exec_list_impl(q, l, cb); return; }
+    t0 = PR_NOW();
+    mad_exec_list_impl(q, l, cb);
+    g_pr_t[PR_LTOTAL] += PR_NOW() - t0;   /* perf-replay: the whole replay of a list, setup and tail included */
 }
 
 /* wine-lab port: EARLIER COMMITS. ml884 batched up to 48 lists per command
@@ -5639,7 +5661,13 @@ static void mad_log_nserror(const char *what, obj_handle_t err) {
     d3d12_log("[madeira-d3d12] ml1049 %s: %s\n", what, text[0] ? text : "(no description)");
 }
 /* ml884: commit the queue's open command buffer and track it for fencing. */
+static void mad_queue_flush_impl(struct mad_queue *q);
 static void mad_queue_flush(struct mad_queue *q) {
+    LONG64 t0;
+    if (g_perf_replay <= 0) { mad_queue_flush_impl(q); return; }
+    t0 = PR_NOW(); mad_queue_flush_impl(q); g_pr_t[PR_FLUSH] += PR_NOW() - t0;
+}
+static void mad_queue_flush_impl(struct mad_queue *q) {
     if (!q) return;
     EnterCriticalSection(&q->submit_lock);   /* ml1021 */
     if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
