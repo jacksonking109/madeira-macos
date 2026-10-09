@@ -2107,6 +2107,31 @@ static long long mad_cfg_int_pe(const char *key, long long dflt) {
     MadeiraCtl(&a);
     return (a.ret && v[0]) ? _strtoi64(v, NULL, 0) : dflt;
 }
+/* wine-lab port: perf-replay. Phase timers around the replay of a draw (madeira.cfg
+ * perf-replay = 1; off by default, the checks below are one predictable branch each).
+ * Logged every 20000 draws as microseconds per draw. Replay of one queue runs on one
+ * thread; the counters are not atomic. */
+enum { PR_DRAW, PR_BEGIN, PR_ARGSLOT, PR_PSO, PR_TABLES, PR_USE, PR_BUILD, PR_ENCODE, PR_LIST, PR_N };
+static int g_perf_replay = -1;
+static LONG64 g_pr_t[PR_N]; static LONG64 g_pr_draws, g_pr_lists, g_pr_cmds;
+static int mad_perf_replay_on(void) {
+    if (g_perf_replay < 0) { g_perf_replay = mad_cfg_int_pe("perf-replay", 0) ? 1 : 0;
+                             d3d12_log("[madeira-d3d12] perf-replay = %d\n", g_perf_replay); }
+    return g_perf_replay;
+}
+#define PR_LAP(var_, idx_) do { if (g_perf_replay > 0) { LONG64 n_ = mad_qpc(); g_pr_t[idx_] += n_ - (var_); (var_) = n_; } } while (0)
+static void mad_perf_replay_report(void) {
+    static const char *nm[PR_N] = { "draw-total", "begin-render", "arg-slot", "pso-select", "tables", "use-res", "cmd-build", "encode", "list-total" };
+    LARGE_INTEGER f; char line[600]; int n; unsigned i; double us, d;
+    QueryPerformanceFrequency(&f);
+    d = g_pr_draws ? (double)g_pr_draws : 1.0;
+    us = 1e6 / (double)f.QuadPart;
+    n = snprintf(line, sizeof line, "[perf-replay] %lld draws in %lld lists (%lld cmds): per draw us:", (long long)g_pr_draws, (long long)g_pr_lists, (long long)g_pr_cmds);
+    for (i = 0; i < PR_N; i++) n += snprintf(line + n, sizeof line - n, " %s %.3f", nm[i], g_pr_t[i] * us / d);
+    n += snprintf(line + n, sizeof line - n, " | list-total minus draw-total: %.3f", (g_pr_t[PR_LIST] - g_pr_t[PR_DRAW]) * us / d);
+    d3d12_log("%s\n", line);
+    memset(g_pr_t, 0, sizeof g_pr_t); g_pr_draws = g_pr_lists = g_pr_cmds = 0;
+}
 static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (default 1) */
     static int on = -1;
     if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
@@ -3925,7 +3950,8 @@ static int mad_use_seen(struct mad_exec *e, obj_handle_t enc, obj_handle_t h, UI
     return 0;
 }
 
-static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
+static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
+    LONG64 pr_t = g_perf_replay > 0 ? mad_qpc() : 0;   /* perf-replay */
     struct wmtcmd_render_setpso c_pso;
     struct wmtcmd_render_draw_indirect c_di;
     struct wmtcmd_render_setblendcolor c_bl;
@@ -3978,6 +4004,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     }
     if (g_census_on) { exec_capture_draw(e, c); exec_desc_check(e, e->rs, e->root, e->pso->vs_name); }   /* ml910/ml913 */
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
+    PR_LAP(pr_t, PR_BEGIN);
     g_dump_tables = 0;
     if (g_capture_on && g_capture_ps[0] && e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots */
         g_capture_ps_shots++;
@@ -4030,6 +4057,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
 tess_go:
     if (!exec_arg_slot(e, &argbuf, &argoff)) { MAD_SKIP(e); return; }
     arg_slot_used = e->l->ring_used - 1;   /* ml1084: the slot exec_arg_slot took, see the draw-params block */
+    PR_LAP(pr_t, PR_ARGSLOT);
 
     memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = tv ? tv->obj[tfmt].rps : e->pso->rps;
     if (e->pso->has_vd && !gsemu && !tv) {
@@ -4042,6 +4070,7 @@ tess_go:
         c_pso.pso = mad_pso_for_strides(e->pso, strides);
         c_pso.pso = mad_pso_for_targets(e->pso, c_pso.pso, e->enc_rt, e->enc_rtp, e->enc_nrt, strides);   /* wine-lab port */
     } else if (!gsemu && !tv) c_pso.pso = mad_pso_for_targets(e->pso, c_pso.pso, e->enc_rt, e->enc_rtp, e->enc_nrt, NULL);   /* wine-lab port */
+    PR_LAP(pr_t, PR_PSO);
     tail = (struct wmtcmd_base *)&c_pso;
 #define MAD_APPEND(node) do { tail->next.ptr = (node); tail = (struct wmtcmd_base *)(node); } while (0)
     if (e->has_vp) {
@@ -4224,6 +4253,7 @@ tess_go:
     }
 #undef MAD_SETBUF_VS
 #undef MAD_SETBUF
+    PR_LAP(pr_t, PR_TABLES);
     /* ml1130: no 8 KB clear per draw; each entry is zeroed as it is used */
     const UINT32 use_stages = (UINT32)((gsemu || tv) ? (WMTRenderStageObject | WMTRenderStageMesh | WMTRenderStageFragment) : (WMTRenderStageVertex | WMTRenderStageFragment));
     mad_use_begin(e, e->renc);
@@ -4266,6 +4296,7 @@ tess_go:
         d3d12_log("[madeira-d3d12] residency list truncated at 256 per draw (%u views); a real residency set is owed\n", dev->nsrv);
 #undef MAD_USE
 #undef MAD_USE_U
+    PR_LAP(pr_t, PR_USE);
     if (e->enc_depth && (e->pso->dsso || dev->dsso)) {
         memset(&c_dss, 0, sizeof c_dss); c_dss.type = WMTRenderCommandSetDSSO;
         c_dss.dsso = e->pso->dsso ? e->pso->dsso : dev->dsso;
@@ -4433,6 +4464,7 @@ tess_go:
          * (before the pipeline), which is where DXMT emits it too. */
         struct mad_vis_batch *v = e->q->vis;
         UINT64 want = (v && v->active && e->enc_vis_buf) ? v->next : ~(UINT64)0;
+        PR_LAP(pr_t, PR_BUILD);
         if (want != e->vis_prev) {
             memset(&c_vis, 0, sizeof c_vis); c_vis.type = WMTRenderCommandSetVisibilityMode;
             if (want == ~(UINT64)0) { c_vis.mode = WMTVisibilityResultModeDisabled; c_vis.offset = 0; }
@@ -4446,6 +4478,7 @@ tess_go:
             MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_pso);
         }
         if (want != ~(UINT64)0) v->dirty = 1;
+        PR_LAP(pr_t, PR_ENCODE);
     }
     mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
 #undef MAD_APPEND
@@ -4473,6 +4506,14 @@ tess_go:
         if (e->rt[0]) { snprintf(lab, sizeof lab, "K%u OUT rt0 %s %ux%u pf%u", kk, e->rt[0]->name, e->rt[0]->width, e->rt[0]->height, (unsigned)e->rt[0]->tex_pf);
                         exec_capture_texels(e, lab, e->rt[0], 0, 0); }
     }
+}
+
+static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
+    LONG64 t0;
+    if (g_perf_replay <= 0) { exec_draw_impl(e, c); return; }
+    t0 = mad_qpc();
+    exec_draw_impl(e, c);
+    g_pr_t[PR_DRAW] += mad_qpc() - t0; g_pr_draws++;
 }
 
 /* Depth-stencil plane copies. Metal copies one plane of a combined
@@ -4942,6 +4983,7 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
     }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    LONG64 pr_list_t0 = mad_perf_replay_on() ? mad_qpc() : 0;   /* perf-replay */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         e.cur = i;   /* ml1137 */
@@ -5034,6 +5076,10 @@ static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t 
         case MC_DISPATCH: exec_dispatch(&e, c); break;
         case MC_RESOLVE: exec_resolve(&e, c); break;
         }
+    }
+    if (g_perf_replay > 0) {   /* perf-replay: the command loop only (ends of passes and clears are outside it) */
+        g_pr_t[PR_LIST] += mad_qpc() - pr_list_t0; g_pr_lists++; g_pr_cmds += l->ncmds;
+        if (g_pr_draws >= 20000) mad_perf_replay_report();
     }
     q->open_draws += e.draws;   /* wine-lab port: batch-draws */
     if (e.renc && !e.npend && e.mode != 6 && mad_pass_carry_on() &&
