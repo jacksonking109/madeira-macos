@@ -6195,12 +6195,14 @@ static HRESULT STDMETHODCALLTYPE device_QI(ID3D12Device *This, REFIID riid, void
      * refuses to run without Device1 AND Device2 ("Missing full support for
      * Direct3D 12", D3D12Adapter.cpp:946) and uses Device2::CreatePipelineState,
      * Device4::CreateCommandList1/CreateCommittedResource1 when present.
-     * Device9/10 (shader cache sessions, enhanced barriers) stay refused so the
-     * log names them if a title asks. */
+     * wine-lab port: Device9 too (TLOU Part I gives up without it); its shader
+     * cache session methods are logged E_NOTIMPL stubs, CreateCommandQueue1 is real.
+     * Device10 (enhanced barriers) stays refused so the log names it if a title asks. */
     if (out && riid && (IsEqualGUID(riid, &IID_ID3D12Device1) || IsEqualGUID(riid, &IID_ID3D12Device2) ||
                         IsEqualGUID(riid, &IID_ID3D12Device3) || IsEqualGUID(riid, &IID_ID3D12Device4) ||
                         IsEqualGUID(riid, &IID_ID3D12Device5) || IsEqualGUID(riid, &IID_ID3D12Device6) ||
-                        IsEqualGUID(riid, &IID_ID3D12Device7) || IsEqualGUID(riid, &IID_ID3D12Device8))) {
+                        IsEqualGUID(riid, &IID_ID3D12Device7) || IsEqualGUID(riid, &IID_ID3D12Device8) ||
+                        IsEqualGUID(riid, &IID_ID3D12Device9))) {
         InterlockedIncrement(&((struct mad_obj *)This)->refs);
         *out = This;
         return S_OK;
@@ -12900,7 +12902,7 @@ static void build_vtables(void) {
     if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
 
     madeira_fill_ID3D12Device10(&g_device_vtbl);
-    /* ml877: ID3D12Device1..8 */
+    /* ml877: ID3D12Device1..9 */
     g_device_vtbl.CreatePipelineState                = device_CreatePipelineState;
     g_device_vtbl.CreateCommandList1                 = device_CreateCommandList1;
     g_device_vtbl.CreateCommittedResource1           = device_CreateCommittedResource1;
