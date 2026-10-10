@@ -5,7 +5,9 @@
 //   dxc -T vs_6_0 -E vs_main  -Vn bl_vs_dxil       -Fh /tmp/bl_vs.h       bindless.hlsl
 //   dxc -T ps_6_6 -E ps_heap  -Vn bl_ps_heap_dxil  -Fh /tmp/bl_ps_heap.h  bindless.hlsl
 //   dxc -T ps_6_0 -E ps_array -Vn bl_ps_array_dxil -Fh /tmp/bl_ps_array.h bindless.hlsl
-//   for f in /tmp/bl_{vs,ps_heap,ps_array}.h; do sed '/^#if 0/,/^#endif/d' $f | tr -d '\r' | sed '/^$/d'; echo; done
+//   dxc -T ps_6_0 -E ps_unbounded -Vn bl_ps_unbounded_dxil -Fh /tmp/bl_ps_unbounded.h bindless.hlsl
+//   dxc -T ps_6_0 -E ps_unbounded_rs -Vn bl_ps_unbounded_rs_dxil -Fh /tmp/bl_ps_unbounded_rs.h bindless.hlsl
+//   for f in /tmp/bl_{vs,ps_heap,ps_array,ps_unbounded,ps_unbounded_rs}.h; do sed '/^#if 0/,/^#endif/d' $f | tr -d '\r' | sed '/^$/d'; echo; done
 // and replace the arrays in bindless_dxil.h with that output (the sed drops dxc's
 // disassembly listing).
 //
@@ -54,4 +56,26 @@ float4 ps_array(V i) : SV_Target
     float4 a = texs[arr_index].SampleLevel(clamp_s, OUTSIDE, 0);
     float4 b = plain.SampleLevel(clamp_s, OUTSIDE, 0);
     return float4(a.rg, b.b, 1.0);
+}
+
+// (c) SM 6.0 unbounded array whose range starts above register 0 (The Last of
+// Us Part I declares "t1 unbounded" and "t10 unbounded"), indexed dynamically.
+// ps_unbounded_rs is the same shader with its root signature embedded (an RTS0
+// part), for a pipeline created with pRootSignature = NULL.
+Texture2D<float4> ub[] : register(t2, space2);
+
+float4 ps_unbounded(V i) : SV_Target
+{
+    return ub[arr_index].SampleLevel(clamp_s, OUTSIDE, 0);
+}
+
+#define UB_RS "RootConstants(num32BitConstants=1, b1), " \
+              "DescriptorTable(SRV(t2, space=2, numDescriptors=unbounded)), " \
+              "StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_POINT, addressU=TEXTURE_ADDRESS_CLAMP, " \
+              "addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)"
+
+[RootSignature(UB_RS)]
+float4 ps_unbounded_rs(V i) : SV_Target
+{
+    return ub[arr_index].SampleLevel(clamp_s, OUTSIDE, 0);
 }

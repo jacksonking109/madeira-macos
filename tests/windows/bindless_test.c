@@ -28,6 +28,12 @@
  *       table, each of the last two after a space-0 decoy at the same register;
  *       and a constant-buffer array (b0-b1 space 3), which must be refused at
  *       pipeline creation
+ *    6  SM 6.0 Texture2D ub[] : register(t2, space2) through an unbounded
+ *       range starting at register 2 (the converter refused such a range
+ *       until the runtime clamped it; The Last of Us Part I), then the same
+ *       shader with its root signature embedded, in a pipeline created with
+ *       pRootSignature = NULL, under a root signature created from the shader
+ *       bytecode
  *
  *  Exit code = number of failed checks.
  */
@@ -759,6 +765,71 @@ static void case_dxbc_cbuffers(void) {
 
 /* --------------------------------------------------------------------- main */
 
+/* ------------------------------------------------------------------- case 6 */
+
+/* Root constants b1; one table holding an unbounded SRV range at t2 space 2;
+ * a CLAMP static sampler at s0 -- spelled out (a), or embedded in the pixel
+ * shader (b). The table starts at slot 8: [8 + i] = texture 1 + i. */
+static void case_unbounded(void) {
+    static const char *const names[2] = { "unbounded", "unbounded, embedded" };
+    ID3D12DescriptorHeap *h = make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16);
+    int pass;
+    printf("\n[6] SM 6.0 Texture2D ub[] : register(t2, space2), unbounded range from register 2\n");
+    CHECK(h != NULL, "unbounded: resource heap created");
+    if (!h) return;
+    for (pass = 0; pass < 6; pass++) put_srv(h, 8 + pass, 1 + pass);
+
+    for (pass = 0; pass < 2; pass++) {
+        const char *name = names[pass];
+        ID3D12RootSignature *rs = NULL;
+        ID3D12PipelineState *pso = NULL;
+        HRESULT hr;
+        if (!pass) {
+            D3D12_DESCRIPTOR_RANGE1 range; ZeroMemory(&range, sizeof range);
+            range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            range.NumDescriptors = UINT_MAX; range.BaseShaderRegister = 2; range.RegisterSpace = 2;
+            range.OffsetInDescriptorsFromTableStart = 0;
+            D3D12_ROOT_PARAMETER1 rp[2]; ZeroMemory(rp, sizeof rp);
+            rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rp[0].Constants.ShaderRegister = 1; rp[0].Constants.Num32BitValues = 1;
+            rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[1].DescriptorTable.NumDescriptorRanges = 1; rp[1].DescriptorTable.pDescriptorRanges = &range;
+            rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+            D3D12_STATIC_SAMPLER_DESC ss;
+            point_sampler(&ss, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, 0, 0);
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC v; ZeroMemory(&v, sizeof v);
+            v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+            v.Desc_1_1.NumParameters = 2; v.Desc_1_1.pParameters = rp;
+            v.Desc_1_1.NumStaticSamplers = 1; v.Desc_1_1.pStaticSamplers = &ss;
+            rs = make_rs(name, &v, NULL);
+            pso = rs ? make_pso(name, rs, bl_vs_dxil, sizeof bl_vs_dxil,
+                                bl_ps_unbounded_dxil, sizeof bl_ps_unbounded_dxil) : NULL;
+        } else {
+            /* D3D12 reads the root signature out of a shader container too. */
+            hr = ID3D12Device_CreateRootSignature(dev, 0, bl_ps_unbounded_rs_dxil, sizeof bl_ps_unbounded_rs_dxil,
+                                                  &IID_ID3D12RootSignature, (void **)&rs);
+            CHECK(SUCCEEDED(hr) && rs, "%s: root signature created from the shader bytecode (%#lx)", name, hr);
+            pso = rs ? make_pso(name, NULL, bl_vs_dxil, sizeof bl_vs_dxil,
+                                bl_ps_unbounded_rs_dxil, sizeof bl_ps_unbounded_rs_dxil) : NULL;
+        }
+        if (pso) {
+            UINT k;
+            for (k = 1; k < 6; k += 3) {
+                BYTE got[4] = {0}, want[4];
+                tex_b(1 + k, want);
+                BOOL ok = draw_and_read(rs, pso, &h, 1, &k, 1, 1,
+                                        gpu_slot(h, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8), got);
+                CHECK(ok && px_near(got, want), "%s: ub[%u]: got (%u,%u,%u,%u), expected (%u,%u,%u,%u)",
+                      name, k, RGBA(got), RGBA(want));
+            }
+            ID3D12PipelineState_Release(pso);
+        }
+        if (rs) ID3D12RootSignature_Release(rs);
+    }
+    ID3D12DescriptorHeap_Release(h);
+}
+
 int main(void) {
     HRESULT hr;
     int k;
@@ -810,6 +881,7 @@ int main(void) {
     if (p_compile) case_dxbc_spaces();
     case_blobs();
     if (p_compile) case_dxbc_cbuffers();
+    case_unbounded();
 
     if (g_heap_blob) ID3D10Blob_Release(g_heap_blob);
     if (g_array12_blob) ID3D10Blob_Release(g_array12_blob);
