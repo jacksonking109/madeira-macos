@@ -6061,14 +6061,18 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
     /* ml1061: Wait() is a GPU-timeline dependency, not a CPU wait. Every D3D queue
      * here feeds ONE Metal queue in commit order, so once the signalling batch has
      * been COMMITTED anything submitted afterwards already runs behind it. Only a
-     * signal that has not been submitted yet still needs the CPU-side wait. */
-    if ((UINT64)f->submitted >= value) return S_OK;
+     * signal that has not been committed yet still needs the CPU-side wait.
+     * wine-lab port: this tested `submitted`, which Signal raises BEFORE it
+     * flushes: a Wait on another thread in that window returned at once, and
+     * the waiting queue's next batch could reach Metal ahead of the batch it
+     * waits for (a copy-queue upload landing after the draw that reads it). */
+    if ((UINT64)f->committed >= value) return S_OK;
     while (waited < 5000) {
         UINT64 v;
         EnterCriticalSection(&f->lock);
         v = f->value;
         LeaveCriticalSection(&f->lock);
-        if (v >= value) return S_OK;
+        if (v >= value || (UINT64)f->committed >= value) return S_OK;
         InterlockedIncrement(&g_perf_qwait_sleeps);   /* ml1109 */
         Sleep(1);
         waited++;
