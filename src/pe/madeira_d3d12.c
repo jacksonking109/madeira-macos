@@ -8698,7 +8698,26 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
     const char *why = "?";
     const unsigned char *p = rs_find_chunk((const unsigned char *)blob, blob_len, &n, &why);
     if (!p) {
-        d3d12_log("[madeira-d3d12] CreateRootSignature: %s -- refusing rather than assuming a layout\n", why);
+        /* wine-lab port: name the blob, so a form this does not read (a shader
+         * container without a root signature, a bare RTS0 payload) can be told
+         * from a corrupt one: its size, first bytes and container parts. */
+        const unsigned char *b = (const unsigned char *)blob;
+        char head[3 * 32 + 1] = "", parts[128] = "";
+        SIZE_T k;
+        int c = 0;
+        for (k = 0; k < blob_len && k < 32; k++) sprintf(head + 3 * k, "%02x ", b[k]);
+        if (blob_len >= 32 && !memcmp(b, "DXBC", 4)) {
+            int bad = 0;
+            UINT32 nchunk = rs_rd(b, blob_len, 28, &bad), i;
+            for (i = 0; !bad && i < nchunk && i < 16 && c < (int)sizeof parts - 8; i++) {
+                UINT32 off = rs_rd(b, blob_len, 32 + 4 * i, &bad);
+                if (bad || (SIZE_T)off + 4 > blob_len) break;
+                c += snprintf(parts + c, sizeof parts - c, " %.4s", (const char *)b + off);
+            }
+        }
+        d3d12_log("[madeira-d3d12] CreateRootSignature: %s -- refusing rather than assuming a layout "
+                  "(%llu bytes: %s%s%s)\n", why, (unsigned long long)blob_len, head,
+                  parts[0] ? "; parts" : "", parts);
         return E_INVALIDARG;
     }
 
