@@ -4266,6 +4266,26 @@ static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
     }
     if (g_census_on) { exec_capture_draw(e, c); exec_desc_check(e, e->rs, e->root, e->pso->vs_name); }   /* ml910/ml913 */
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
+    {   /* wine-lab port: an empty scissor (after clamping to the target, as below)
+         * or a zero-area viewport rasterises nothing in D3D12. Metal cannot be
+         * given either: the scissor was left unset (the previous one, or the
+         * whole target, stayed) and a 0x0 viewport is undefined, so such a draw
+         * covered pixels D3D12 never touches -- and counted them in an
+         * occlusion query. It is elided; its pass has begun (clears done). */
+        UINT tw = e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0]->width : (e->enc_depth ? e->enc_depth->width : 0);
+        UINT th = e->enc_nrt && e->enc_rt[0] ? e->enc_rt[0]->height : (e->enc_depth ? e->enc_depth->height : 0);
+        LONG x0 = e->sc.left < 0 ? 0 : e->sc.left, y0 = e->sc.top < 0 ? 0 : e->sc.top, x1 = e->sc.right, y1 = e->sc.bottom;
+        static LONG said_empty;
+        if (tw && x1 > (LONG)tw) x1 = (LONG)tw;
+        if (th && y1 > (LONG)th) y1 = (LONG)th;
+        if ((e->has_sc && (x1 <= x0 || y1 <= y0)) || (e->has_vp && (e->vp.Width <= 0.0f || e->vp.Height <= 0.0f))) {
+            if (InterlockedIncrement(&said_empty) <= 4)
+                d3d12_log("[madeira-d3d12] draw with an empty scissor (%ld,%ld-%ld,%ld) or viewport (%gx%g) on a %ux%u target ('%s'): nothing to draw, elided\n",
+                          (long)e->sc.left, (long)e->sc.top, (long)e->sc.right, (long)e->sc.bottom,
+                          e->has_vp ? e->vp.Width : 0.0f, e->has_vp ? e->vp.Height : 0.0f, tw, th, e->pso->ps_name);
+            return;
+        }
+    }
     PR_LAP(pr_t, PR_BEGIN);
     g_dump_tables = 0;
     if (g_capture_on && g_capture_ps[0] && e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots */
