@@ -10,9 +10,9 @@ PE side (needs llvm-mingw, DXMT's winemetal import lib, Wine's winecrt0/ntdll fr
     $B/tools/winebuild/winebuild --builtin out/d3d12.dll
 
 Unix side (DXIL via Apple's Metal Shader Converter; shader-model 5.x DXBC via DXMT's airconv, linked in statically
-with LLVM 15; AGS rewriting stays compiled out). Needs dxmt-src on branch wine-lab-local (or d3d12-airconv), which
-adds the airconv APIs this runtime uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1
-constant-buffer operands, built by
+with LLVM 15, which also runs the DXIL 64-bit atomic rewrite, src/unix/madeira_atomic64.cpp; AGS rewriting stays
+compiled out). Needs dxmt-src on branch wine-lab-local (or d3d12-airconv), which adds the airconv APIs this runtime
+uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1 constant-buffer operands, built by
 ~/wine-lab/build-dxmt.sh into dxmt-src/build-full (libairconv.a, libDXBCParserNative.a):
 
     DX=~/wine-lab/dxmt-src; LL=~/wine-lab/deps/llvm15-x86_64
@@ -23,6 +23,8 @@ constant-buffer operands, built by
     clang++ -arch x86_64 -O2 -fPIC -std=c++17 -x objective-c++ -c src/unix/madeira_ir_unix.mm -o out/madeira_ir_unix.o $D $I
     clang++ -arch x86_64 -O2 -fPIC -std=c++20 -Wno-extern-c-compat -Wno-unknown-pragmas \
         -c src/unix/madeira_sm5_ia.cpp -o out/madeira_sm5_ia.o $D $IA
+    clang++ -arch x86_64 -O2 -fPIC -std=c++17 -fno-rtti -c src/unix/madeira_atomic64.cpp -o out/madeira_atomic64.o \
+        -I$LL/include
     # LLVM components: llvm_deps in dxmt-src/src/airconv/meson.build
     LLVM_LIBS=(Passes Target ObjCARCOpts Coroutines ipo Instrumentation Vectorize Linker IRReader AsmParser
         FrontendOpenMP ScalarOpts InstCombine AggressiveInstCombine TransformUtils BitWriter Analysis ProfileData
@@ -34,11 +36,18 @@ constant-buffer operands, built by
     EXP=(-Wl,-exported_symbol,___wine_unix_call_funcs -Wl,-exported_symbol,_madeira_ir_convert
         -Wl,-exported_symbol,_madeira_ir_convert_impl -Wl,-exported_symbol,_madeira_ags_rewrite)
     clang++ -arch x86_64 -dynamiclib -o out/d3d12.so out/d3d12_unix.o out/madeira_ir_unix.o out/madeira_sm5_ia.o \
-        $AIRCONV $EXP -Wl,-install_name,@rpath/d3d12.so -framework Foundation -framework Metal
+        out/madeira_atomic64.o $AIRCONV $EXP -Wl,-install_name,@rpath/d3d12.so -framework Foundation -framework Metal
 
 (zsh: the flag lists are arrays; `${^LLVM_LIBS}` expands one path per component. LLVM's static libraries are full
 paths on purpose: `-L$LL/lib` would also make the linker pick LLVM's own libc++.dylib.) To build without LLVM, add
--DMADEIRA_NO_AIRCONV to D, drop madeira_sm5_ia.o, $AIRCONV and $EXP; DXBC shaders are then refused.
+-DMADEIRA_NO_AIRCONV to D, drop madeira_sm5_ia.o, madeira_atomic64.o, $AIRCONV and $EXP; DXBC shaders are then
+refused, and so are DXIL 64-bit atomics whose old value is read.
+
+64-bit atomics whose old value is read: the converter refuses them (code 7); madeira_atomic64.cpp reads the old value
+with a plain load (and a device memory fence for textures and typed buffers) before the atomic, whose result is then
+unused. Not atomic with the update: an invocation between the load and the atomic is missed. madeira.cfg
+dxil-atomic64-emulation = 0 turns it off. Its output is keyed in the DXIL cache by MAD_A64_VERSION (madeira_ir_unix.mm),
+which a change to madeira_atomic64.cpp must bump (that file is not part of the build stamp).
 
 libmetalirconverter.dylib (MSC 4.0 beta 2, x86_64 slice) goes next to d3d12.so, or set MADEIRA_MSC_DYLIB.
 
