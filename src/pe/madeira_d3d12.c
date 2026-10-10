@@ -11610,8 +11610,12 @@ static obj_handle_t mad_fill_pattern(struct mad_device *d, UINT32 v) {
     return mad_fill_pattern16(d, k);
 }
 /* One texel of a texture UAV clear in the view's format. Uint clears
- * copy each value's low bits into its channel (no conversion); float clears
- * convert. Returns the texel size, 0 for a format this does not pack. */
+ * copy each value's low bits into its channel (no conversion: a Uint clear of
+ * an R16_FLOAT view to 0x3c00 writes 1.0h); float clears convert, to integers
+ * numerically for UINT/SINT views. A typeless format only takes a Uint clear
+ * (its channels' raw bits); it is what a clear falls back to when the view is
+ * unknown and the resource was created typeless. Returns the texel size, 0 for
+ * a format this does not pack. */
 static USHORT mad_f32_to_f16(float f) {
     UINT32 x; UINT32 sign, mant; int exp;
     memcpy(&x, &f, 4);
@@ -11681,10 +11685,21 @@ static UINT mad_pack_clear(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, uns
     case DXGI_FORMAT_R8_SNORM: nch = 1; bits = 8; kind = 2; break;
     case DXGI_FORMAT_R8_UINT: nch = 1; bits = 8; kind = 3; break;
     case DXGI_FORMAT_R8_SINT: nch = 1; bits = 8; kind = 4; break;
-    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: {
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS: nch = 4; bits = 32; kind = 5; break;
+    case DXGI_FORMAT_R32G32_TYPELESS: nch = 2; bits = 32; kind = 5; break;
+    case DXGI_FORMAT_R32_TYPELESS: nch = 1; bits = 32; kind = 5; break;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: nch = 4; bits = 16; kind = 5; break;
+    case DXGI_FORMAT_R16G16_TYPELESS: nch = 2; bits = 16; kind = 5; break;
+    case DXGI_FORMAT_R16_TYPELESS: nch = 1; bits = 16; kind = 5; break;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: nch = 4; bits = 8; kind = 5; break;
+    case DXGI_FORMAT_R8G8_TYPELESS: nch = 2; bits = 8; kind = 5; break;
+    case DXGI_FORMAT_R8_TYPELESS: nch = 1; bits = 8; kind = 5; break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R10G10B10A2_TYPELESS: {
         unsigned k2 = fmt == DXGI_FORMAT_R10G10B10A2_UNORM ? 1 : 3;
-        UINT32 w = mad_clear_chan(v[0], is_float, k2, 10) | (mad_clear_chan(v[1], is_float, k2, 10) << 10) |
-                   (mad_clear_chan(v[2], is_float, k2, 10) << 20) | (mad_clear_chan(v[3], is_float, k2, 2) << 30);
+        UINT32 w;
+        if (fmt == DXGI_FORMAT_R10G10B10A2_TYPELESS && is_float) return 0;
+        w = mad_clear_chan(v[0], is_float, k2, 10) | (mad_clear_chan(v[1], is_float, k2, 10) << 10) |
+            (mad_clear_chan(v[2], is_float, k2, 10) << 20) | (mad_clear_chan(v[3], is_float, k2, 2) << 30);
         memcpy(out, &w, 4); return 4;
     }
     case DXGI_FORMAT_R11G11B10_FLOAT: {
@@ -11698,6 +11713,10 @@ static UINT mad_pack_clear(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, uns
         memcpy(out, &w, 4); return 4;
     }
     default: return 0;
+    }
+    if (kind == 5) {   /* typeless: raw bits */
+        if (is_float) return 0;
+        kind = 3;
     }
     for (i = 0; i < nch; i++) c[i] = mad_clear_chan(v[i], is_float, kind, bits);
     if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM) { UINT32 t = c[0]; c[0] = c[2]; c[2] = t; }
@@ -11721,9 +11740,26 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
          * stale data (Ghost of Tsushima: blocky haze and dark specks). */
         int known = mad_uavtex_get(view_id, &u) && u.res && u.res->texture;
         struct mad_resource *app = res && res->texture ? res : NULL;
+        const struct mad_resource *other = NULL;
         const char *why = NULL;
         if (known && (!res || u.res == res)) ;                    /* the normal case */
-        else if (known && app) { why = "recorded for another resource"; u.res = app; }
+        else if (known && app) {
+            /* wine-lab port: the recorded view's mip, slices and format describe
+             * the other resource. They are kept while they fit the named one
+             * (same texel size, a mip it has); otherwise a single-mip resource
+             * is cleared whole in its own format, as for an unrecorded view.
+             * TLOU Part I: an R16_FLOAT view recorded for a 1776x1104 target,
+             * the named resource an 888x552 texture of another texel size,
+             * whose clear was skipped. */
+            UINT vb = 0, vblk = 0, rb = 0, rblk = 0;
+            why = "recorded for another resource"; other = u.res; u.res = app;
+            mad_format_info(u.fmt, &vb, &vblk);
+            mad_format_info(app->desc.Format, &rb, &rblk);
+            if ((vb != rb || vblk != rblk || u.level >= app->tex_mips) && app->tex_mips <= 1) {
+                why = "recorded for another resource, in another texel size";
+                u.level = 0; u.sl0 = 0; u.nsl = ~0u; u.fmt = app->desc.Format;
+            }
+        }
         else if (app && app->tex_mips <= 1) {
             why = known ? "recorded for a non-texture" : "not recorded";
             memset(&u, 0, sizeof u); u.id = view_id; u.res = app; u.level = 0; u.sl0 = 0; u.nsl = ~0u; u.fmt = app->desc.Format;
@@ -11734,9 +11770,15 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
                           res && res->name ? res->name : "?", res ? res->width : 0, res ? res->height : 0, res ? res->tex_mips : 0);
             return;
         }
-        if (why && said_miss++ < 8)
-            d3d12_log("[madeira-d3d12] %s: view %s; clearing the named resource '%s' %ux%u (mip %u, format %u)\n",
-                      what, why, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, (unsigned)u.fmt);
+        if (why && said_miss++ < 8) {
+            char was[96] = "";
+            if (other)
+                snprintf(was, sizeof was, " ('%s' %ux%u format %u)", other->name ? other->name : "?",
+                         other->width, other->height, (unsigned)other->desc.Format);
+            d3d12_log("[madeira-d3d12] %s: view %s%s; clearing the named resource '%s' %ux%u format %u (mip %u, view format %u)\n",
+                      what, why, was, u.res->name ? u.res->name : "?", u.res->width, u.res->height,
+                      (unsigned)u.res->desc.Format, u.level, (unsigned)u.fmt);
+        }
     }
     bpp = u.res->samples > 1 ? 0 : mad_pack_clear(u.fmt, v, is_float, px);
     if (bpp) mad_format_info(u.res->desc.Format, &rbytes, &rblock);
@@ -11752,8 +11794,9 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
     else per[0] = per[1] = per[2] = per[3] = pat;
     if (!bpp) {
         if (said_fmt++ < 8)
-            d3d12_log("[madeira-d3d12] %s on texture '%s' (view format %u, %u samples, values %#x %#x %#x %#x) is not supported; skipped\n",
-                      what, u.res->name ? u.res->name : "?", (unsigned)u.fmt, u.res->samples, v[0], v[1], v[2], v[3]);
+            d3d12_log("[madeira-d3d12] %s on texture '%s' (view format %u, resource format %u, %u samples, values %#x %#x %#x %#x) is not supported; skipped\n",
+                      what, u.res->name ? u.res->name : "?", (unsigned)u.fmt, (unsigned)u.res->desc.Format, u.res->samples,
+                      v[0], v[1], v[2], v[3]);
         return;
     }
     pattern = mad_fill_pattern16(l->device, per);
