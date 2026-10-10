@@ -2265,7 +2265,11 @@ static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd
               g_list_seq, seq, c->kind == MC_DISPATCH_INDIRECT ? "indirect" : "direct",
               c->kind == MC_DISPATCH ? c->u.dispatch.x : 0, c->kind == MC_DISPATCH ? c->u.dispatch.y : 0, c->kind == MC_DISPATCH ? c->u.dispatch.z : 0,
               (unsigned)rs->nparams);
-    if (c->kind == MC_DISPATCH_INDIRECT && c->u.ind.args) mad_capture_buffer(e, benc, c->u.ind.args, c->u.ind.off, 12, "iargs", 0, seq);
+    if (c->kind == MC_DISPATCH_INDIRECT && c->u.ind.args) {
+        d3d12_log("[capture-cs] indirect arguments: '%s' %llu bytes (gpu 0x%llx) +%llu\n", c->u.ind.args->name ? c->u.ind.args->name : "?",
+                  (unsigned long long)c->u.ind.args->size, (unsigned long long)c->u.ind.args->gpu_address, (unsigned long long)c->u.ind.off);   /* wine-lab port */
+        mad_capture_buffer(e, benc, c->u.ind.args, c->u.ind.off, 12, "iargs", 0, seq);
+    }
     for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
         const struct madeira_ir_root_param *p = &rs->params[i]; UINT64 va = e->croot[i];
         if (p->type == MADEIRA_IR_PARAM_CONSTANTS) {
@@ -7156,8 +7160,16 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     UINT64 byte_off, aligned, elem_off, width, bpr;
     struct WMTTextureInfo ti;
     obj_handle_t tex;
-    static unsigned said_fail, said_ok;
-    if (!r->buffer || !mad_map_texture_format(fmt, 0, &pf, &is_depth) || is_depth) return 0;
+    static unsigned said_fail, said_ok, said_nofmt;
+    if (!r->buffer) return 0;
+    if (!mad_map_texture_format(fmt, 0, &pf, &is_depth) || is_depth) {
+        /* wine-lab port: the view falls back to a raw descriptor; the converter's
+         * typed loads and stores through it reach no texture buffer */
+        if (said_nofmt++ < 8)
+            d3d12_log("[madeira-d3d12] typed buffer view: fmt %u%s has no Metal texture-buffer format; raw descriptor (typed access sees nothing)\n",
+                      (unsigned)fmt, uav ? " (UAV)" : "");
+        return 0;
+    }
     mad_format_info(fmt, &bytes, &block);
     if (!bytes || block != 1) return 0;
     byte_off = first * bytes;
