@@ -614,8 +614,8 @@ static int mad_vsps_fill_enabled(void)
 
 #ifndef MADEIRA_NO_AIRCONV
 /* ml1083: one shader's declaration ranges, in the runtime's record format, with
- * the same refusals mad_airconv_convert has always applied (singletons in
- * register space 0 only). Returns a madeira_ir_status. */
+ * the same refusal mad_airconv_convert applies (singletons only). Returns a
+ * madeira_ir_status. */
 static int mad_air_ranges(sm50_shader_t shader, struct madeira_ir_air_range *out, uint32_t cap,
                           uint32_t *n_out, char *note, size_t note_cap)
 {
@@ -633,11 +633,6 @@ static int mad_air_ranges(sm50_shader_t shader, struct madeira_ir_air_range *out
         if (ranges[i].RangeSize != 1) {
             snprintf(note, note_cap, "%s%u space %u is a range of %u (only singletons are mapped)",
                      c, ranges[i].LowerBound, ranges[i].RegisterSpace, ranges[i].RangeSize);
-            return MADEIRA_IR_UNSUPPORTED_RANGE;
-        }
-        if (ranges[i].RegisterSpace != 0) {
-            snprintf(note, note_cap, "%s%u is in register space %u (only space 0 is mapped)",
-                     c, ranges[i].LowerBound, ranges[i].RegisterSpace);
             return MADEIRA_IR_UNSUPPORTED_RANGE;
         }
         if (out && i < cap) {
@@ -1022,9 +1017,12 @@ static int mad_airconv_convert(struct madeira_ir_convert_args *a,
     /* Refuse what the compiler would silently get wrong. Its resource-lookup
      * callbacks take the dynamic index and discard it ("ignore index in
      * SM 5.0"), so a multi-element or unbounded range collapses to its first
-     * descriptor -- wrong data, no diagnostic. A register space we do not map
-     * would likewise bind whatever sits at the same register in space 0.
-     * Named refusal, never a silent collapse. */
+     * descriptor -- wrong data, no diagnostic. Named refusal, never a silent
+     * collapse.
+     * wine-lab port: register spaces other than 0 are fine. The compiler gives
+     * every declaration its own table slot by range id (SM 5.1 operands name
+     * the range id, not the register), and mad_air_resolve matches each range
+     * to the root signature by space as well as register. */
     for (uint32_t i = 0; i < n; i++) {
         static const char *cls[4] = { "b", "s", "t", "u" };
         uint32_t ty = (uint32_t)ranges[i].Type;
@@ -1033,13 +1031,6 @@ static int mad_airconv_convert(struct madeira_ir_convert_args *a,
             snprintf(a->ret_note, sizeof a->ret_note,
                      "%s%u space %u is a range of %u (only singletons are mapped)",
                      c, ranges[i].LowerBound, ranges[i].RegisterSpace, ranges[i].RangeSize);
-            status = MADEIRA_IR_UNSUPPORTED_RANGE;
-            goto done;
-        }
-        if (ranges[i].RegisterSpace != 0) {
-            snprintf(a->ret_note, sizeof a->ret_note,
-                     "%s%u is in register space %u (only space 0 is mapped)",
-                     c, ranges[i].LowerBound, ranges[i].RegisterSpace);
             status = MADEIRA_IR_UNSUPPORTED_RANGE;
             goto done;
         }

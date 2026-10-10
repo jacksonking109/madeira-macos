@@ -69,7 +69,7 @@ enum madeira_ir_status {
      * shader-model-5 program, and a declaration shape the backend would have
      * to guess at, are different failures and get different codes. */
     MADEIRA_IR_BAD_CONTAINER     = 11, /* not a DXBC container, or self-inconsistent */
-    MADEIRA_IR_UNSUPPORTED_RANGE = 12, /* non-singleton range, or a register space we do not map */
+    MADEIRA_IR_UNSUPPORTED_RANGE = 12, /* non-singleton range */
     MADEIRA_IR_TOO_MANY_RANGES   = 13, /* more declaration ranges than the caller's buffer holds */
 };
 
