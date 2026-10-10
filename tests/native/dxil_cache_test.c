@@ -91,7 +91,7 @@ static void req_fix(struct req *r)
     if (r->a.layout) r->a.layout = (uint64_t)(uintptr_t)&r->layout;
 }
 
-static const struct mad_dxc_env g_env = { 0x1234567890abcdefull, "Sep 25 2026 12:00:00", 1, 1 };
+static const struct mad_dxc_env g_env = { 0x1234567890abcdefull, "Sep 25 2026 12:00:00", 1, 1, 0 };
 
 static void key_of(const struct req *r, const struct mad_dxc_env *env, uint64_t *k, uint64_t *c)
 {
@@ -209,6 +209,7 @@ static void test_key(void)
         e = g_env; e.build_stamp = "Sep 25 2026 12:00:01"; expect_diff(&g_base, &e, "build stamp");
         e = g_env; e.ags_rewrite = 0; expect_diff(&g_base, &e, "AGS rewrite switch");
         e = g_env; e.compat_flags = 0; expect_diff(&g_base, &e, "compatibility flags");
+        e = g_env; e.atomic64 = 1; expect_diff(&g_base, &e, "64-bit atomic rewrite applies");
     }
     {   /* A table pointing outside the ranges must not read out of bounds. */
         struct req *x = malloc(sizeof *x);
