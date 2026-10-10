@@ -1034,6 +1034,7 @@ struct mad_fence {
     LONG refs;
     const IID *iid;
     const char *name;
+    D3D12_FENCE_FLAGS flags;   /* wine-lab port: as created, for ID3D12Fence1::GetCreationFlags */
     CRITICAL_SECTION lock;
     /* A null event means "block this thread until the value is reached", so the
      * fence needs a way to wait that RELEASES the lock -- otherwise the thread
@@ -1064,7 +1065,16 @@ static void fence_set_locked(struct mad_fence *f, UINT64 v) {
 }
 
 static HRESULT STDMETHODCALLTYPE fence_QI(ID3D12Fence *This, REFIID riid, void **out) {
+    /* wine-lab port: every fence is an ID3D12Fence1 (TLOU Part I breaks into the debugger without it) */
+    if (out && riid && IsEqualGUID(riid, &IID_ID3D12Fence1)) {
+        InterlockedIncrement(&((struct mad_obj *)This)->refs);
+        *out = This;
+        return S_OK;
+    }
     return mad_qi((struct mad_obj *)This, riid, out, 1);
+}
+static D3D12_FENCE_FLAGS STDMETHODCALLTYPE fence_GetCreationFlags(ID3D12Fence1 *This) {
+    return ((struct mad_fence *)This)->flags;
 }
 static ULONG STDMETHODCALLTYPE fence_AddRef(ID3D12Fence *This) { return mad_addref((struct mad_obj *)This); }
 static ULONG STDMETHODCALLTYPE fence_Release(ID3D12Fence *This) {
@@ -6188,6 +6198,7 @@ static ID3D12CommandQueueVtbl g_queue_vtbl;
 static ID3D12CommandAllocatorVtbl g_alloc_vtbl;
 static ID3D12GraphicsCommandList7Vtbl g_list_vtbl;
 static ID3D12FenceVtbl g_fence_vtbl;
+static ID3D12Fence1Vtbl g_fence1_vtbl;   /* g_fence_vtbl + GetCreationFlags */
 
 static HRESULT STDMETHODCALLTYPE device_QI(ID3D12Device *This, REFIID riid, void **out) {
     HRESULT hr;
@@ -6681,7 +6692,8 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
     }
     struct mad_fence *f = calloc(1, sizeof *f);
     if (!f) return E_OUTOFMEMORY;
-    f->vtbl = &g_fence_vtbl; f->refs = 1; f->iid = &IID_ID3D12Fence; f->name = "Fence";
+    f->vtbl = (ID3D12FenceVtbl *)&g_fence1_vtbl; f->refs = 1; f->iid = &IID_ID3D12Fence; f->name = "Fence";
+    f->flags = flags;
     f->value = initial;
     InitializeCriticalSection(&f->lock);
     InitializeConditionVariable(&f->cv);
@@ -13116,6 +13128,8 @@ static void build_vtables(void) {
     g_fence_vtbl.GetCompletedValue      = fence_GetCompletedValue;
     g_fence_vtbl.SetEventOnCompletion   = fence_SetEventOnCompletion;
     g_fence_vtbl.Signal                 = fence_Signal;
+    memcpy(&g_fence1_vtbl, &g_fence_vtbl, sizeof g_fence_vtbl);
+    g_fence1_vtbl.GetCreationFlags      = fence_GetCreationFlags;
 }
 
 /* ---- exports ------------------------------------------------------------- */
