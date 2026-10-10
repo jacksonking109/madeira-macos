@@ -9775,6 +9775,9 @@ static const char *mad_ir_status_name(uint32_t st) {
     case MADEIRA_IR_EMPTY_ENTRY:      return "no such entry point (reflection returned an empty name)";
     case MADEIRA_IR_UNSUPPORTED:      return "a root parameter this build does not model";
     case MADEIRA_IR_NO_MEMORY:        return "out of memory";
+    case MADEIRA_IR_BAD_CONTAINER:    return "not a usable DXBC container";
+    case MADEIRA_IR_UNSUPPORTED_RANGE:return "a declaration range this build does not map";
+    case MADEIRA_IR_TOO_MANY_RANGES:  return "more declaration ranges than this build carries";
     default:                          return "unknown";
     }
 }

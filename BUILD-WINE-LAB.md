@@ -11,7 +11,8 @@ PE side (needs llvm-mingw, DXMT's winemetal import lib, Wine's winecrt0/ntdll fr
 
 Unix side (DXIL via Apple's Metal Shader Converter; shader-model 5.x DXBC via DXMT's airconv, linked in statically
 with LLVM 15; AGS rewriting stays compiled out). Needs dxmt-src on branch wine-lab-local (or d3d12-airconv), which
-adds the airconv APIs this runtime uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE), built by
+adds the airconv APIs this runtime uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1
+constant-buffer operands, built by
 ~/wine-lab/build-dxmt.sh into dxmt-src/build-full (libairconv.a, libDXBCParserNative.a):
 
     DX=~/wine-lab/dxmt-src; LL=~/wine-lab/deps/llvm15-x86_64
@@ -51,8 +52,9 @@ airconv: root constants/CBV, SRV table + static sampler, vertex buffer input lay
 plus tier-0 render passes, GetCachedBlob/CachedPSO, the pipeline library, and a bound render target the pipeline does
 not write keeping its contents); d3d12-bindless-x64.exe (tests/windows/bindless_test.c, 0 failures: SM 6.6
 ResourceDescriptorHeap/SamplerDescriptorHeap, an SM 6.0 descriptor array in space 1, SM 5.1 DXBC registers in spaces 1
-and 2, root signature 1.2; precompiled DXIL from bindless.hlsl, regeneration commands at its top). The tests build with
-`$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
+and 2, root signature 1.2, SM 5.1 DXBC constant buffers from root constants, a root CBV and a table in spaces 0-2, and
+the refusal of an SM 5.1 constant-buffer array; precompiled DXIL from bindless.hlsl, regeneration commands at its top).
+The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
 

@@ -19,13 +19,15 @@
  *       beside a texture at t0 space 0 in the same descriptor table; once with
  *       a 1.1 root signature, once with a 1.2 one (D3D12_STATIC_SAMPLER_DESC1)
  *    3  SM 5.1 DXBC through airconv: t0 in spaces 0 and 1 and a static sampler
- *       in space 2, each next to a decoy at the same register in another space.
- *       No constant buffer: airconv does not implement SM 5.1's
- *       three-dimensional constant-buffer operands yet ("TODO: SM5.1" in its
- *       dxbc_instructions.cpp), so a 5.1 shader that reads one cannot be
- *       converted, whatever its space
+ *       in space 2, each next to a decoy at the same register in another space
  *    4  root signature blobs: 1.2 serializes as version 3, and the versioned
  *       deserializer gives back the 1.2 description and the root flags
+ *    5  SM 5.1 DXBC constant buffers through airconv (three-dimensional
+ *       operands): b1 space 0 from root constants with a dynamically indexed
+ *       element, b0 space 1 from a root CBV and b2 space 2 from a descriptor
+ *       table, each of the last two after a space-0 decoy at the same register;
+ *       and a constant-buffer array (b0-b1 space 3), which must be refused at
+ *       pipeline creation
  *
  *  Exit code = number of failed checks.
  */
@@ -458,9 +460,9 @@ static const char hlsl_spaces[] =
     "    return float4(a.r, b.g, 0.5, 1.0);\n"
     "}\n";
 
-static ID3DBlob *compile(const char *src, const char *entry, const char *target) {
+static ID3DBlob *compile(const char *name, const char *src, const char *entry, const char *target) {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = p_compile(src, strlen(src), "spaces", NULL, NULL, entry, target, 0, 0, &code, &err);
+    HRESULT hr = p_compile(src, strlen(src), name, NULL, NULL, entry, target, 0, 0, &code, &err);
     if (err) {
         SIZE_T n = ID3D10Blob_GetBufferSize(err);
         if (n) printf("        %s/%s compiler output:\n%.*s\n", entry, target, (int)n,
@@ -470,8 +472,8 @@ static ID3DBlob *compile(const char *src, const char *entry, const char *target)
     const BYTE *bc = code ? (const BYTE *)ID3D10Blob_GetBufferPointer(code) : NULL;
     SIZE_T bcn = code ? ID3D10Blob_GetBufferSize(code) : 0;
     BOOL dxbc = bc && bcn > 32 && !memcmp(bc, "DXBC", 4);
-    CHECK(SUCCEEDED(hr) && dxbc, "spaces: HLSL %s compiled to %s DXBC (%#lx, %lu bytes)",
-          entry, target, hr, (unsigned long)bcn);
+    CHECK(SUCCEEDED(hr) && dxbc, "%s: HLSL %s compiled to %s DXBC (%#lx, %lu bytes)",
+          name, entry, target, hr, (unsigned long)bcn);
     if (FAILED(hr) || !dxbc) { if (code) ID3D10Blob_Release(code); return NULL; }
     return code;
 }
@@ -482,8 +484,8 @@ static ID3DBlob *compile(const char *src, const char *entry, const char *target)
  * table t0 space 0 = texture 5 before t0 space 1 = texture 6. */
 static void case_dxbc_spaces(void) {
     printf("\n[3] SM 5.1 DXBC: registers in spaces 1 and 2 beside space-0 decoys\n");
-    ID3DBlob *vs = compile(hlsl_spaces, "vs_main", "vs_5_1");
-    ID3DBlob *ps = compile(hlsl_spaces, "ps_main", "ps_5_1");
+    ID3DBlob *vs = compile("spaces", hlsl_spaces, "vs_main", "vs_5_1");
+    ID3DBlob *ps = compile("spaces", hlsl_spaces, "ps_main", "ps_5_1");
 
     D3D12_DESCRIPTOR_RANGE1 ranges[2]; ZeroMemory(ranges, sizeof ranges);
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors = 1;
@@ -588,6 +590,173 @@ static void case_blobs(void) {
     } else CHECK(0, "blobs: case 1 blob deserialized (%#lx)", hr);
 }
 
+/* ------------------------------------------------------------------- case 5 */
+
+/* SM 5.1 constant-buffer operands are three-dimensional: [range id][register]
+ * [element]. The compiler numbers the ranges in declaration order (CB0 = b1,
+ * CB1 = b0 space 1, CB2 = b2 space 2), so two range ids are not their register.
+ * The elements read are not all 0: b_val is element 1, a_vals[a_sel] a
+ * dynamically indexed one. */
+static const char hlsl_cbuffers[] =
+    "cbuffer A : register(b1)         { float4 a_vals[2]; uint a_sel; };\n"
+    "cbuffer B : register(b0, space1) { float4 b_pad; float4 b_val; };\n"
+    "cbuffer C : register(b2, space2) { float4 c_val; };\n"
+    "float4 vs_main(uint id : SV_VertexID) : SV_Position {\n"
+    "    float2 uv = float2((id << 1) & 2, id & 2);\n"
+    "    return float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
+    "}\n"
+    "float4 ps_main(float4 p : SV_Position) : SV_Target {\n"
+    "    float4 a = a_vals[a_sel];\n"
+    "    return float4(a.x, b_val.y, c_val.z, a.w);\n"
+    "}\n";
+
+/* A constant-buffer array: the runtime maps singleton ranges only, so one must
+ * be refused at pipeline creation, not compiled against its first buffer. Wine's
+ * compiler lowers ConstantBuffer<S> arr[2] to ONE buffer of two elements, so the
+ * array is made by widening this shader's declaration (widen_cb_decl). */
+static const char hlsl_cbuffer_array[] =
+    "cbuffer A : register(b0, space3) { float4 v; };\n"
+    "float4 ps_main(float4 p : SV_Position) : SV_Target { return v; }\n";
+
+/* dcl_constantBuffer CBn[lb:lb] in the given space -> CBn[lb:lb+1]. The SM 5.1
+ * declaration is 7 tokens: opcode, operand, range id, lower bound, upper bound,
+ * size, space. */
+static BOOL widen_cb_decl(ID3DBlob *b, UINT space) {
+    UINT32 *t = (UINT32 *)ID3D10Blob_GetBufferPointer(b);
+    SIZE_T n = ID3D10Blob_GetBufferSize(b) / 4, i;
+    for (i = 0; i + 7 <= n; i++)
+        if ((t[i] & 0x7ff) == 0x59 /* DCL_CONSTANT_BUFFER */ && ((t[i] >> 24) & 0x7f) == 7 &&
+            t[i + 6] == space && t[i + 4] == t[i + 3]) {
+            t[i + 4] = t[i + 3] + 1;
+            return TRUE;
+        }
+    return FALSE;
+}
+
+/* b1 space 0 from root constants; b0 space 1 from a root CBV, after a root CBV
+ * decoy at b0 space 0; b2 space 2 from a descriptor table, after a decoy at b2
+ * space 0 in the same table. A lookup that ignores the space finds the decoys. */
+static void case_dxbc_cbuffers(void) {
+    static const float a_vals[2][4] = { { 0.1f, 0.0f, 0.0f, 0.7f }, { 0.3f, 0.0f, 0.0f, 0.9f } };
+    static const float cb_data[4][4] = {
+        { 0.0f, 0.2f, 0.0f, 0.0f },   /* [0] b0 space 0, decoy (element 1) */
+        { 0.0f, 0.6f, 0.0f, 0.0f },   /* [1] b0 space 1, b_val (element 1) */
+        { 0.0f, 0.0f, 0.4f, 0.0f },   /* [2] b2 space 0, decoy */
+        { 0.0f, 0.0f, 0.8f, 0.0f },   /* [3] b2 space 2, c_val */
+    };
+    printf("\n[5] SM 5.1 DXBC constant buffers: root constants, root CBV and table CBV, spaces 0-2\n");
+    ID3DBlob *vs = compile("cbuffers", hlsl_cbuffers, "vs_main", "vs_5_1");
+    ID3DBlob *ps = compile("cbuffers", hlsl_cbuffers, "ps_main", "ps_5_1");
+
+    D3D12_DESCRIPTOR_RANGE1 ranges[2]; ZeroMemory(ranges, sizeof ranges);
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV; ranges[0].NumDescriptors = 1;
+    ranges[0].BaseShaderRegister = 2; ranges[0].RegisterSpace = 0; ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV; ranges[1].NumDescriptors = 1;
+    ranges[1].BaseShaderRegister = 2; ranges[1].RegisterSpace = 2; ranges[1].OffsetInDescriptorsFromTableStart = 1;
+    D3D12_ROOT_PARAMETER1 rp[4]; ZeroMemory(rp, sizeof rp);
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;              /* decoy */
+    rp[0].Descriptor.ShaderRegister = 0; rp[0].Descriptor.RegisterSpace = 0;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.ShaderRegister = 1; rp[1].Constants.RegisterSpace = 0; rp[1].Constants.Num32BitValues = 9;
+    rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rp[2].Descriptor.ShaderRegister = 0; rp[2].Descriptor.RegisterSpace = 1;
+    rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[3].DescriptorTable.NumDescriptorRanges = 2; rp[3].DescriptorTable.pDescriptorRanges = ranges;
+    for (int i = 0; i < 4; i++) rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v; ZeroMemory(&v, sizeof v);
+    v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    v.Desc_1_1.NumParameters = 4; v.Desc_1_1.pParameters = rp;
+    ID3D12RootSignature *rs = make_rs("cbuffers", &v, NULL);
+    ID3D12PipelineState *pso = (rs && vs && ps)
+        ? make_pso("cbuffers", rs, ID3D10Blob_GetBufferPointer(vs), ID3D10Blob_GetBufferSize(vs),
+                   ID3D10Blob_GetBufferPointer(ps), ID3D10Blob_GetBufferSize(ps)) : NULL;
+
+    /* Four 256-byte constant buffers. The b0 pair holds its value at element 1
+     * (b_val) and zeros at element 0, so reading the wrong element shows. */
+    ID3D12Resource *cbuf = make_buffer(D3D12_HEAP_TYPE_UPLOAD, 4 * 256, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ID3D12DescriptorHeap *h = make_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4);
+    CHECK(cbuf && h, "cbuffers: constant buffer and resource heap created");
+    if (pso && cbuf && h) {
+        BYTE *m = NULL;
+        UINT64 va = ID3D12Resource_GetGPUVirtualAddress(cbuf);
+        int k;
+        ID3D12Resource_Map(cbuf, 0, NULL, (void **)&m);
+        if (m) {
+            memset(m, 0, 4 * 256);
+            for (k = 0; k < 4; k++) memcpy(m + 256 * k + (k < 2 ? 16 : 0), cb_data[k], 16);
+            ID3D12Resource_Unmap(cbuf, 0, NULL);
+        }
+        for (k = 0; k < 2; k++) {
+            D3D12_CONSTANT_BUFFER_VIEW_DESC cv;
+            cv.BufferLocation = va + 256 * (2 + k); cv.SizeInBytes = 256;
+            ID3D12Device_CreateConstantBufferView(dev, &cv, cpu_slot(h, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2 + k));
+        }
+        for (UINT sel = 0; sel < 2; sel++) {
+            UINT consts[9];
+            BYTE got[4] = {0}, want[4];
+            memcpy(consts, a_vals, sizeof a_vals);
+            consts[8] = sel;
+            want[0] = (BYTE)(a_vals[sel][0] * 255.0f + 0.5f); want[1] = (BYTE)(0.6f * 255.0f + 0.5f);
+            want[2] = (BYTE)(0.8f * 255.0f + 0.5f);           want[3] = (BYTE)(a_vals[sel][3] * 255.0f + 0.5f);
+            begin_pass();
+            ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
+            ID3D12GraphicsCommandList_SetPipelineState(list, pso);
+            ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &h);
+            ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 0, va);
+            ID3D12GraphicsCommandList_SetGraphicsRoot32BitConstants(list, 1, 9, consts, 0);
+            ID3D12GraphicsCommandList_SetGraphicsRootConstantBufferView(list, 2, va + 256);
+            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 3,
+                    gpu_slot(h, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2));
+            ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+            BOOL ok = finish_and_read(got);
+            CHECK(ok && px_near(got, want),
+                  "cbuffers: a_vals[%u] (b1, root constants), b_val (b0 space 1, root CBV), "
+                  "c_val (b2 space 2, table): got (%u,%u,%u,%u), expected (%u,%u,%u,%u)",
+                  sel, RGBA(got), RGBA(want));
+        }
+    }
+
+    /* A constant-buffer array is refused with a named reason, never collapsed. */
+    ID3DBlob *pa = compile("cbuffer array", hlsl_cbuffer_array, "ps_main", "ps_5_1");
+    if (pa) CHECK(widen_cb_decl(pa, 3), "cbuffer array: declaration widened to b0-b1 space 3");
+    if (pa && vs) {
+        D3D12_DESCRIPTOR_RANGE1 ar; ZeroMemory(&ar, sizeof ar);
+        ar.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV; ar.NumDescriptors = 2;
+        ar.BaseShaderRegister = 0; ar.RegisterSpace = 3; ar.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_ROOT_PARAMETER1 ap; ZeroMemory(&ap, sizeof ap);
+        ap.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        ap.DescriptorTable.NumDescriptorRanges = 1; ap.DescriptorTable.pDescriptorRanges = &ar;
+        ap.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_VERSIONED_ROOT_SIGNATURE_DESC av; ZeroMemory(&av, sizeof av);
+        av.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+        av.Desc_1_1.NumParameters = 1; av.Desc_1_1.pParameters = &ap;
+        ID3D12RootSignature *ars = make_rs("cbuffer array", &av, NULL);
+        if (ars) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC pd; ZeroMemory(&pd, sizeof pd);
+            ID3D12PipelineState *apso = NULL;
+            pd.pRootSignature = ars;
+            pd.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(vs); pd.VS.BytecodeLength = ID3D10Blob_GetBufferSize(vs);
+            pd.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(pa); pd.PS.BytecodeLength = ID3D10Blob_GetBufferSize(pa);
+            pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            pd.SampleDesc.Count = 1; pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            test_pso_defaults(&pd, FALSE);
+            HRESULT hr = ID3D12Device_CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&apso);
+            CHECK(FAILED(hr) && !apso, "cbuffer array: b0-b1 space 3 refused at pipeline creation (%#lx)", hr);
+            if (apso) ID3D12PipelineState_Release(apso);
+            ID3D12RootSignature_Release(ars);
+        }
+    }
+
+    if (pa) ID3D10Blob_Release(pa);
+    if (h) ID3D12DescriptorHeap_Release(h);
+    if (cbuf) ID3D12Resource_Release(cbuf);
+    if (pso) ID3D12PipelineState_Release(pso);
+    if (rs) ID3D12RootSignature_Release(rs);
+    if (vs) ID3D10Blob_Release(vs);
+    if (ps) ID3D10Blob_Release(ps);
+}
+
 /* --------------------------------------------------------------------- main */
 
 int main(void) {
@@ -640,6 +809,7 @@ int main(void) {
     case_array(TRUE);
     if (p_compile) case_dxbc_spaces();
     case_blobs();
+    if (p_compile) case_dxbc_cbuffers();
 
     if (g_heap_blob) ID3D10Blob_Release(g_heap_blob);
     if (g_array12_blob) ID3D10Blob_Release(g_array12_blob);
