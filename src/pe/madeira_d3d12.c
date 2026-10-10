@@ -8371,10 +8371,18 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(ID3D12Device *Th
  * struct mad_memheap above mad_create_resource). Other heap types keep the
  * description only; their placed resources allocate on their own. */
 static ID3D12HeapVtbl g_memheap_vtbl;
+static ID3D12Heap1Vtbl g_memheap1_vtbl;   /* g_memheap_vtbl + GetProtectedResourceSession */
+static HRESULT STDMETHODCALLTYPE memheap_GetProtectedResourceSession(ID3D12Heap1 *This, REFIID riid, void **out) {
+    (void)This; (void)riid;
+    if (out) *out = NULL;
+    return DXGI_ERROR_NOT_FOUND;   /* no protected session: heaps here are never created with one */
+}
 static HRESULT STDMETHODCALLTYPE memheap_QI(ID3D12Heap *This, REFIID riid, void **out) {
     struct mad_obj *o = (struct mad_obj *)This;
     if (!out) return E_POINTER;
     if (IsEqualGUID(riid, &IID_ID3D12Pageable)) { InterlockedIncrement(&o->refs); *out = This; return S_OK; }
+    /* wine-lab port: every heap is an ID3D12Heap1 (TLOU Part I treats a refusal as a failed allocation) */
+    if (IsEqualGUID(riid, &IID_ID3D12Heap1)) { InterlockedIncrement(&o->refs); *out = This; return S_OK; }
     return mad_qi(o, riid, out, 1);
 }
 static ULONG STDMETHODCALLTYPE memheap_AddRef(ID3D12Heap *This) { return mad_addref((struct mad_obj *)This); }
@@ -8429,7 +8437,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
     *out = NULL;
     h = calloc(1, sizeof *h);
     if (!h) return E_OUTOFMEMORY;
-    h->vtbl = &g_memheap_vtbl; h->refs = 1; h->iid = &IID_ID3D12Heap; h->name = "Heap";
+    h->vtbl = (ID3D12HeapVtbl *)&g_memheap1_vtbl; h->refs = 1; h->iid = &IID_ID3D12Heap; h->name = "Heap";
     h->device = (struct mad_device *)This;
     h->desc = *desc;
     {   /* ml1145 */
@@ -12962,6 +12970,8 @@ static void build_vtables(void) {
     g_memheap_vtbl.SetName                 = memheap_SetName;
     g_memheap_vtbl.GetDevice               = memheap_GetDevice;
     g_memheap_vtbl.GetDesc                 = memheap_GetDesc;
+    memcpy(&g_memheap1_vtbl, &g_memheap_vtbl, sizeof g_memheap_vtbl);
+    g_memheap1_vtbl.GetProtectedResourceSession = memheap_GetProtectedResourceSession;
     g_device_vtbl.CreateConstantBufferView = (void *)device_CreateConstantBufferView;
     g_device_vtbl.CreateUnorderedAccessView = (void *)device_CreateUnorderedAccessView;
     g_device_vtbl.CopyDescriptors = (void *)device_CopyDescriptors;
