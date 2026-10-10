@@ -145,6 +145,11 @@ static volatile LONG g_pass_begun, g_pass_end_rts, g_pass_end_clear, g_pass_end_
                      g_pass_end_attachless, g_pass_clear_only, g_pass_reused, g_pass_carried;
 static volatile LONG64 g_pass_attach_bytes;
 static int g_census_on;   /* ml899: one frame at presents 1500,1700,...,2800 */
+/* wine-lab port: the ml893/ml899 debug windows (every draw of lists 12000-12399, census frames at presents
+ * 1500-2800) log each draw and cost a visible hitch; madeira.cfg draw-dump = 1 turns them back on. Read at the
+ * first Present, so they stay off until then. */
+static int g_draw_dump = -1;
+#define MAD_DUMP_WINDOW() (g_draw_dump > 0 && g_list_seq >= 12000 && g_list_seq < 12400)
 /* ml1098: MANUAL FRAME CAPTURE. The UI asks (MadeiraCtl op 0); the next frame
  * has every render pass that drew something followed by a blit of each of its
  * attachments into a shared buffer, and at the following Present the buffers
@@ -4608,7 +4613,7 @@ tess_go:
         if (!(e->pso->vb_mask & (1u << i)) || !e->vb[i].res) continue;
         /* ml878: stride differences are handled by mad_pso_for_strides above */
     }
-    if ((g_list_seq <= 3 || (g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893: ~3 frames mid-run */
+    if ((g_list_seq <= 3 || MAD_DUMP_WINDOW() || g_census_on) && g_dump_draws < 40000) {   /* ml893: ~3 frames mid-run */
         char line[1200]; int n; unsigned k;
         g_dump_draws++;
         n = snprintf(line, sizeof(line), "[draw-dump] list#%u enc#%u vs='%s' ps='%s' topo=%u%s rt=%u", g_list_seq, e->renc_seq,
@@ -5151,7 +5156,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         if (g_census_on) exec_desc_check(e, e->crs, e->croot, e->cpso->vs_name);   /* ml913 */
     }
 
-    if (((g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && g_dump_draws < 40000) {   /* ml893 census + ml898 in-game window */
+    if ((MAD_DUMP_WINDOW() || g_census_on) && g_dump_draws < 40000) {   /* ml893 census + ml898 in-game window */
         g_dump_draws++;
         d3d12_log("[dispatch-dump] list#%u '%s' %s %ux%ux%u\n", g_list_seq, e->cpso->vs_name,
                   c->kind == MC_DISPATCH_INDIRECT ? "indirect" : "", c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z);
@@ -5432,7 +5437,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
     }
     {
         static unsigned said;
-        if ((said < 12 || (g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on) && (e.draws || e.skipped)) {
+        if ((said < 12 || MAD_DUMP_WINDOW() || g_census_on) && (e.draws || e.skipped)) {
             said++;
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
@@ -13649,9 +13654,10 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     /* ml1056: no release -- the drawable was never ours (see swap_Present). */
     s->presents++;
     mad_perf_present();   /* ml1108 */
-    g_census_on = (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899 */
+    if (g_draw_dump < 0) g_draw_dump = mad_cfg_int_pe("draw-dump", 0) ? 1 : 0;
+    g_census_on = g_draw_dump > 0 && (s->presents >= 1500 && s->presents < 3000 && (s->presents % 200) == 0);   /* ml899 */
     if (g_capture_on) g_census_on = 1;   /* ml1098 */
-    if ((g_list_seq >= 12000 && g_list_seq < 12400) || g_census_on)
+    if (MAD_DUMP_WINDOW() || g_census_on)
         d3d12_log("[draw-dump] ===== Present #%llu (list#%u) =====\n", (unsigned long long)s->presents, g_list_seq);
     if (s->presents <= 3 || (s->presents % 600) == 0)
         d3d12_log("[madeira-d3d12] Present #%llu (buffer %u)\n", (unsigned long long)s->presents, idx);
