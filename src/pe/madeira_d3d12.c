@@ -320,6 +320,7 @@ static LONG g_res_added, g_res_removed, g_tess_psos, g_tess_draws, g_tess_built,
 static LONG g_dtess_drawn, g_dtess_bad_cps;   /* DXIL tessellation through the converter's emulation */
 static LONG g_gs_built, g_gs_drawn;   /* ml1147 */
 static LONG g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts;   /* ml1088 */
+static LONG g_vis_gpu_copied, g_vis_gpu_visible;   /* wine-lab port: resolves into GPU-only buffers (exec_query_resolve_gpu) */
 static LONG g_srv_clamped; static float g_srv_clamp_max;   /* ml1089 */
 static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
@@ -568,8 +569,10 @@ static void mad_skip_report(void) {
     d3d12_log("[madeira-d3d12] ml1049 command buffers: %ld retired, %ld ENDED IN ERROR; null CBVs bound to zeros %ld; "
               "visibility fallbacks %ld\n", g_cb_retired, g_cb_errors, g_null_cbv_bound, g_vis_fallback);
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
+              "resolved into GPU-only buffers: %ld copied, %ld answered visible; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
-              g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts, g_srv_clamped, (double)g_srv_clamp_max);
+              g_vis_begun, g_vis_resolved, g_vis_nonzero, g_vis_restarts, g_vis_gpu_copied, g_vis_gpu_visible,
+              g_srv_clamped, (double)g_srv_clamp_max);
     d3d12_log("[madeira-d3d12] ml1091 encoder fence chain: %ld waits, %ld updates; %ld ResourceBarrier calls recorded (%ld closed a render pass); ml1094 zero-instance draws elided %ld; ml1101 stencil SRVs %ld\n",
               g_fence_waits, g_fence_updates, g_barriers, g_barrier_renc_closed, g_zero_inst, g_stencil_srv);
     mad_acct_report();
@@ -1610,7 +1613,7 @@ static void mad_mip_dims(const struct mad_resource *r, UINT level, UINT *w, UINT
  * daylight: their brightness is the occlusion fraction the game reads back. */
 #define MAD_VIS_SLOTS (MAD_ARG_RING_BYTES / 8u)
 struct mad_vis_query { struct mad_queryheap *heap; UINT index; UINT64 b, e; UINT64 end_seq; int applied; };
-struct mad_vis_resolve { struct mad_queryheap *heap; UINT type, start, count; struct mad_resource *dst; UINT64 off; UINT64 seq; };
+struct mad_vis_resolve { struct mad_queryheap *heap; UINT type, start, count; struct mad_resource *dst; UINT64 off; UINT64 seq; int gpu; };
 struct mad_vis_batch {
     obj_handle_t cb;
     struct mad_ringchunk *chunks; unsigned nchunks, ccap;
@@ -7652,6 +7655,59 @@ static void exec_query_end(struct mad_exec *e, const struct mad_cmd *c) {
         }
     }
 }
+/* wine-lab port: ResolveQueryData into a buffer the CPU cannot write (a DEFAULT
+ * heap buffer), for a shader to read. The CPU delivery above never reached such a
+ * buffer: The Last of Us Part I resolves its occlusion queries into one and runs
+ * CS_ProcessOcclusionQueries over it, which zeroes the indirect draw arguments of
+ * every object whose result is 0 -- so every occlusion-tested object was culled.
+ * The results are copied on the GPU, in program order (the blit encoder ends the
+ * render pass, whose visibility results are then written, and waits on the
+ * encoder fence). A query whose draws all counted into ONE visibility slot of
+ * this batch (Begin and End inside one render pass: the usual bounding-box test)
+ * copies that slot; one that counted nothing resolves 0; any other (spanning
+ * passes, ended in an earlier command buffer, never begun) resolves 1, visible,
+ * the conservative answer for culling. Binary occlusion copies the sample count
+ * (nonzero = visible) rather than 1. Returns 1 when the copies were encoded. */
+static obj_handle_t mad_fill_pattern16(struct mad_device *d, const UINT32 v[4]);
+static int exec_query_resolve_gpu(struct mad_exec *e, const struct mad_cmd *c, struct mad_vis_batch *v) {
+    static const UINT32 one[4] = { 1, 0, 1, 0 }, zero[4] = { 0, 0, 0, 0 };
+    struct mad_resource *dst = c->u.query.dst;
+    obj_handle_t pone, pzero;
+    UINT j, k, n = c->u.query.count;
+    if (!dst->buffer || c->u.query.off + (UINT64)n * 8 > dst->size) return 0;
+    pone = mad_fill_pattern16(e->q->device, one); pzero = mad_fill_pattern16(e->q->device, zero);
+    if (!pone || !pzero || !exec_begin_blit(e)) return 0;
+    e->wr_all = 1;
+    for (j = 0; j < n; ) {
+        struct wmtcmd_blit_copy_from_buffer_to_buffer cp;
+        const struct mad_vis_query *rec = NULL;
+        obj_handle_t src; UINT64 soff; UINT run = 1;
+        for (k = v->nq; k > 0; k--)
+            if (v->q[k - 1].heap == c->u.query.heap && v->q[k - 1].index == c->u.query.index + j) { rec = &v->q[k - 1]; break; }
+        if (rec && rec->e != ~(UINT64)0 && rec->e == rec->b + 1 && (src = mad_vis_chunk(e, v, rec->b, NULL))) {
+            soff = (rec->b % MAD_VIS_SLOTS) * 8;
+            InterlockedIncrement(&g_vis_gpu_copied);
+        } else if (rec && rec->e != ~(UINT64)0 && rec->e == rec->b) {
+            src = pzero; soff = 0;
+            InterlockedIncrement(&g_vis_gpu_copied);
+        } else {   /* answered visible; a run of these is one copy */
+            src = pone; soff = 0;
+            for (run = 1; j + run < n && run < MAD_FILLPAT_BYTES / 8; run++) {
+                for (k = v->nq; k > 0; k--)
+                    if (v->q[k - 1].heap == c->u.query.heap && v->q[k - 1].index == c->u.query.index + j + run) break;
+                if (k) break;
+            }
+            InterlockedExchangeAdd(&g_vis_gpu_visible, (LONG)run);
+        }
+        memset(&cp, 0, sizeof cp);
+        cp.type = WMTBlitCommandCopyFromBufferToBuffer;
+        cp.src = src; cp.src_offset = soff;
+        cp.dst = dst->buffer; cp.dst_offset = c->u.query.off + (UINT64)j * 8; cp.copy_length = (UINT64)run * 8;
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&cp);
+        j += run;
+    }
+    return 1;
+}
 static void exec_query_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_vis_batch *v = mad_vis_get(e);
     struct mad_vis_resolve *r;
@@ -7660,8 +7716,10 @@ static void exec_query_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     r->heap = c->u.query.heap; r->type = c->u.query.type; r->start = c->u.query.index; r->count = c->u.query.count;
     r->dst = c->u.query.dst; r->off = c->u.query.off;
     r->seq = ++v->evseq;   /* ml1092 */
+    r->gpu = 0;
     qheap_AddRef((ID3D12QueryHeap *)r->heap);
     ID3D12Resource_AddRef((ID3D12Resource *)r->dst);
+    if (!r->dst->cpu) r->gpu = exec_query_resolve_gpu(e, c, v);   /* wine-lab port */
 }
 /* At flush: the open batch's slots go to the device's completion queue. */
 static void mad_vis_flush(struct mad_queue *q, obj_handle_t cb) {
@@ -7707,7 +7765,7 @@ static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v) {
             }
             LeaveCriticalSection(&r->heap->lock);
             InterlockedExchangeAdd(&g_vis_resolved, (LONG)r->count);
-        } else if (said_nocpu++ < 4)
+        } else if (!r->gpu && said_nocpu++ < 4)   /* wine-lab port: a GPU-only one was copied on the GPU */
             d3d12_log("[madeira-d3d12] ml1088 ResolveQueryData into a buffer the CPU cannot write (%s, %u queries from %u); not delivered\n",
                       r->dst->cpu ? "range" : "GPU-only", r->count, r->start);
         qheap_Release((ID3D12QueryHeap *)r->heap);

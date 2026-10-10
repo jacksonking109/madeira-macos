@@ -73,7 +73,11 @@ RWTexture2D, raw, structured and typed buffers, exact per pixel; other texture s
 compare-exchange with the old value used is refused; precompiled DXIL from atomic64.hlsl); d3d12-uavclear-x64.exe
 (tests/windows/uavclear_test.c, 0 failures: texture UAV clears read back per texel, Uint clears of R16_FLOAT,
 R16_TYPELESS-as-R16_FLOAT and R32_FLOAT views write the raw bits, Float clears of R16_UINT and R32_SINT views convert,
-and a descriptor holding another resource's view clears the named resource in its own format).
+and a descriptor holding another resource's view clears the named resource in its own format);
+d3d12-occlusion-x64.exe (tests/windows/occlusion_test.c, 0 failures, 15 checks: occlusion queries resolved into a
+DEFAULT-heap buffer are written on the GPU (a query inside one render pass gets its sample count, one spanning passes
+reads visible), a draw with an empty scissor counts no samples, and the readback-buffer path still gives exact counts;
+precompiled DXIL from occlusion.hlsl).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
