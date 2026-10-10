@@ -350,6 +350,7 @@ static volatile LONG64 g_cat_bytes[MAD_CAT_N], g_cat_peak[MAD_CAT_N];
 static volatile LONG g_cat_count[MAD_CAT_N];
 static volatile LONG64 g_upload_swap_bytes; static volatile LONG g_upload_swap_n;   /* ml1154 */
 static int mad_upload_swap_on(void);
+static void mad_rbdbg_report(void);   /* wine-lab port: debug-readback */
 static volatile LONG64 g_lib_bytes; static volatile LONG g_lib_count;   /* ml1060: metallib bytes handed to newLibrary */
 static void mad_acct(struct mad_resource *r, unsigned cat, UINT64 bytes, int sign);
 static void mad_acct_report(void);
@@ -607,6 +608,7 @@ static void mad_acct_report(void) {
     }
     d3d12_log("[madeira-d3d12] ml1057 live GPU backing (estimated) total=%lldMB:%s\n", (long long)(tot >> 20), line);
     d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffers on file-backed storage: %ld, %lld MB\n", g_upload_swap_n, (long long)(g_upload_swap_bytes >> 20));
+    mad_rbdbg_report();   /* wine-lab port */
     if (g_hp_dev) d3d12_log("[madeira-d3d12] ml1072 texture heaps: %u (%lld MB reserved, %lld MB live in them), %ld textures placed, %ld fallbacks, %u blocks awaiting GPU\n",
                             g_hp_dev->ntheaps, (long long)(g_hp_dev->hp_total_bytes >> 20), (long long)(g_hp_dev->hp_live_bytes >> 20),
                             g_hp_dev->hp_textures, g_hp_dev->hp_fallbacks, g_hp_dev->nhret);
@@ -677,6 +679,7 @@ struct mad_resource {
     struct mad_xview { UINT type, lvl0, nlvl, sl0, nsl, pf, swz; obj_handle_t tex; UINT64 id; } *xview;
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
+    LONG rbdbg_said;         /* wine-lab port: debug-readback, what this buffer has been logged for */
 };
 /* srv_res / uav_res membership, O(1) through the resource's slot (the linear
  * scan it replaces ran over ~15,000 textures on every view creation). */
@@ -2410,6 +2413,186 @@ static int mad_upload_swap_on(void) {   /* ml1154: madeira.cfg upload-swap (defa
     if (on < 0) { on = mad_cfg_int_pe("upload-swap", 1) ? 1 : 0;
                   d3d12_log("[madeira-d3d12] ml1154 upload-swap = %d (%s)\n", on, on ? "CPU-visible buffers >= 8 MB live on file-backed storage, off the jetsam footprint" : "Metal-owned storage"); }
     return on;
+}
+/* wine-lab port: madeira.cfg debug-readback = 1. WHO READS A READBACK BUFFER
+ * BEFORE THE GPU HAS WRITTEN IT. TLOU Part I's "Invalid result data for ray 0"
+ * (MeshRayCaster::HandleResultsInGameFrame) is either a read that came too
+ * early or a kernel that computed a wrong hit; this tells the two apart in one
+ * run. Every READBACK buffer gets our own storage (as ml1154 gives the large
+ * ones), and every GPU copy into one makes the 4 KB pages it writes
+ * PAGE_NOACCESS until the CPU next touches them. A vectored handler then asks
+ * the command buffer that carries the copy: completed -> an ordinary read after
+ * the fence, counted; NOT completed -> the CPU is reading memory the GPU has yet
+ * to write, logged once per buffer with the command buffer's status (0/1: its
+ * batch was not even committed; 2/3: committed, GPU not done) and the reading
+ * instruction. Either way the pages open and the access continues: this never
+ * waits and never changes the data. A touch of a watched page outside the
+ * copy's range (other data on the same page) is counted apart. The GPU writes
+ * through its own mapping; the protection traps only the CPU. Our own CPU
+ * writes into readback buffers (query results) open the pages first. */
+#define MAD_RBDBG_MAX 512
+struct mad_rbdbg_rec { struct mad_resource *r; UINT64 off, len, plo, phi; obj_handle_t cb; struct mad_queue *q; UINT64 batch; LONGLONG t; };
+static volatile LONG g_rbdbg = -1;
+static CRITICAL_SECTION g_rbdbg_lock;
+static struct mad_rbdbg_rec g_rbdbg_rec[MAD_RBDBG_MAX]; static unsigned g_rbdbg_n;
+static LONG g_rbdbg_writes, g_rbdbg_ontime, g_rbdbg_early, g_rbdbg_early_open, g_rbdbg_shared, g_rbdbg_internal, g_rbdbg_evicted, g_rbdbg_traced;
+static UINT64 mad_gpu_completed(struct mad_device *d);
+static LONG CALLBACK mad_rbdbg_veh(EXCEPTION_POINTERS *ep);
+static int mad_rbdbg_on(void) {
+    static volatile LONG init;
+    if (g_rbdbg >= 0) return g_rbdbg;
+    if (!InterlockedCompareExchange(&init, 1, 0)) {
+        LONG on = mad_cfg_int_pe("debug-readback", 0) ? 1 : 0;
+        if (on) { InitializeCriticalSection(&g_rbdbg_lock); if (!AddVectoredExceptionHandler(1, mad_rbdbg_veh)) on = 0; }
+        d3d12_log("[madeira-d3d12] debug-readback = %ld (%s)\n", (long)on, on ? "READBACK buffers on our storage; a CPU access before the GPU copy into it "
+                  "completes is logged" : "off");
+        InterlockedExchange(&g_rbdbg, on);
+    }
+    while (g_rbdbg < 0) Sleep(0);
+    return g_rbdbg;
+}
+static UINT64 mad_rbdbg_store_len(const struct mad_resource *r) { return (r->size + 0xffff) & ~(UINT64)0xffff; }   /* as ml1154 allocates it */
+/* g_rbdbg_lock held. Opens the watch's pages and forgets it; the caller closes
+ * again whatever other watches on the same buffer still cover. */
+static void mad_rbdbg_drop_locked(unsigned i) {
+    struct mad_rbdbg_rec *w = &g_rbdbg_rec[i]; DWORD old;
+    VirtualProtect((BYTE *)w->r->own_mem + w->plo, (SIZE_T)(w->phi - w->plo), PAGE_READWRITE, &old);
+    NSObject_release(w->cb);
+    g_rbdbg_rec[i] = g_rbdbg_rec[--g_rbdbg_n];
+}
+static void mad_rbdbg_close_locked(struct mad_resource *r) {
+    unsigned i; DWORD old;
+    for (i = 0; i < g_rbdbg_n; i++)
+        if (g_rbdbg_rec[i].r == r)
+            VirtualProtect((BYTE *)r->own_mem + g_rbdbg_rec[i].plo, (SIZE_T)(g_rbdbg_rec[i].phi - g_rbdbg_rec[i].plo), PAGE_NOACCESS, &old);
+}
+/* A GPU write of [off, off + len) of READBACK buffer r, encoded into e->cb. */
+static void mad_rbdbg_watch(struct mad_exec *e, struct mad_resource *r, UINT64 off, UINT64 len) {
+    struct mad_rbdbg_rec *w; unsigned i; UINT64 slen; LARGE_INTEGER t;
+    if (g_rbdbg <= 0 || !r || r->heap != D3D12_HEAP_TYPE_READBACK || !r->own_mem || !len || !e->cb) return;
+    slen = mad_rbdbg_store_len(r);
+    if (off >= slen) return;
+    if (off + len > slen) len = slen - off;
+    QueryPerformanceCounter(&t);
+    EnterCriticalSection(&g_rbdbg_lock);
+    g_rbdbg_writes++;
+    for (i = 0; i < g_rbdbg_n; i++)   /* a newer copy over the same range replaces the watch */
+        if (g_rbdbg_rec[i].r == r && g_rbdbg_rec[i].off == off && g_rbdbg_rec[i].len == len) { mad_rbdbg_drop_locked(i); break; }
+    if (g_rbdbg_n == MAD_RBDBG_MAX) {
+        struct mad_resource *o = g_rbdbg_rec[0].r;
+        mad_rbdbg_drop_locked(0); mad_rbdbg_close_locked(o); g_rbdbg_evicted++;
+    }
+    w = &g_rbdbg_rec[g_rbdbg_n++];
+    w->r = r; w->off = off; w->len = len;
+    w->plo = off & ~(UINT64)0xfff; w->phi = (off + len + 0xfff) & ~(UINT64)0xfff;
+    w->cb = e->cb; NSObject_retain(e->cb);
+    w->q = e->q; w->batch = e->q->batches + 1;   /* the batch being encoded, see mad_queue_flush_impl */
+    w->t = t.QuadPart;
+    mad_rbdbg_close_locked(r);
+    LeaveCriticalSection(&g_rbdbg_lock);
+}
+/* Our own CPU write into [off, off + len) of r (query results): open it first. */
+static void mad_rbdbg_internal(struct mad_resource *r, UINT64 off, UINT64 len) {
+    unsigned i; int hit = 0;
+    if (g_rbdbg <= 0 || !r || !r->own_mem) return;
+    EnterCriticalSection(&g_rbdbg_lock);
+    for (i = 0; i < g_rbdbg_n; )
+        if (g_rbdbg_rec[i].r == r && g_rbdbg_rec[i].plo < off + len && off < g_rbdbg_rec[i].phi) { mad_rbdbg_drop_locked(i); hit = 1; }
+        else i++;
+    if (hit) { mad_rbdbg_close_locked(r); g_rbdbg_internal++; }
+    LeaveCriticalSection(&g_rbdbg_lock);
+}
+/* r is being destroyed. */
+static void mad_rbdbg_forget(struct mad_resource *r) {
+    unsigned i;
+    if (g_rbdbg <= 0 || !r->own_mem) return;
+    EnterCriticalSection(&g_rbdbg_lock);
+    for (i = 0; i < g_rbdbg_n; ) if (g_rbdbg_rec[i].r == r) mad_rbdbg_drop_locked(i); else i++;
+    LeaveCriticalSection(&g_rbdbg_lock);
+}
+static LONG CALLBACK mad_rbdbg_veh(EXCEPTION_POINTERS *ep) {
+    static ULONG_PTR exe_lo, exe_hi;
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    const BYTE *a; struct mad_resource *r = NULL; unsigned i;
+    int early = -1, shared = -1, write; ULONG_PTR pc = (ULONG_PTR)er->ExceptionAddress;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    a = (const BYTE *)er->ExceptionInformation[1]; write = er->ExceptionInformation[0] == 1;
+    EnterCriticalSection(&g_rbdbg_lock);
+    for (i = 0; i < g_rbdbg_n && !r; i++) {
+        const BYTE *b = (const BYTE *)g_rbdbg_rec[i].r->own_mem;
+        if (a >= b + g_rbdbg_rec[i].plo && a < b + g_rbdbg_rec[i].phi) r = g_rbdbg_rec[i].r;
+    }
+    if (!r) {
+        LeaveCriticalSection(&g_rbdbg_lock);
+        /* another thread opened the page between the fault and this lock: retry the read or write */
+        if (er->ExceptionInformation[0] <= 1 && VirtualQuery(a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE)
+            return EXCEPTION_CONTINUE_EXECUTION;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    {
+        UINT64 off = (UINT64)(a - (const BYTE *)r->own_mem);
+        int ontime = 0;
+        for (i = 0; i < g_rbdbg_n; i++) {
+            struct mad_rbdbg_rec *w = &g_rbdbg_rec[i];
+            if (w->r != r || off < w->plo || off >= w->phi) continue;
+            if (MTLCommandBuffer_status(w->cb) >= WMTCommandBufferStatusCompleted) { ontime = 1; continue; }
+            if (off >= w->off && off < w->off + w->len) { if (early < 0) early = (int)i; }
+            else if (shared < 0) shared = (int)i;
+        }
+        if (early >= 0) {
+            struct mad_rbdbg_rec *w = &g_rbdbg_rec[early];
+            unsigned st = (unsigned)MTLCommandBuffer_status(w->cb);
+            struct mad_queue *q = w->q;
+            UINT64 bser = (q->batches >= w->batch && q->batches - w->batch < 63) ? q->batch_serial[w->batch & 63] : 0;
+            LARGE_INTEGER t, f; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f);
+            g_rbdbg_early++; if (st < WMTCommandBufferStatusCommitted) g_rbdbg_early_open++;
+            if (!exe_lo) {
+                HMODULE m = GetModuleHandleW(NULL); IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)m;
+                IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
+                exe_lo = (ULONG_PTR)m; exe_hi = exe_lo + nt->OptionalHeader.SizeOfImage;
+            }
+            if (!(InterlockedOr(&r->rbdbg_said, 1) & 1))
+                d3d12_log("[madeira-d3d12] debug-readback: EARLY %s of READBACK buffer '%s' (%llu bytes) at +%llu, thread %04lx, "
+                          "instruction %s+0x%llx: its GPU copy [+%llu, %llu bytes), encoded %.2f ms ago into batch %llu of a %s queue, "
+                          "is NOT complete (command buffer status %u: %s); batch serial %llu, GPU at serial %llu\n",
+                          write ? "write" : "read", r->name ? r->name : "?", (unsigned long long)r->size, (unsigned long long)off,
+                          GetCurrentThreadId(), pc >= exe_lo && pc < exe_hi ? "exe" : "abs",
+                          (unsigned long long)(pc >= exe_lo && pc < exe_hi ? pc - exe_lo : pc),
+                          (unsigned long long)w->off, (unsigned long long)w->len,
+                          (double)(t.QuadPart - w->t) * 1000.0 / (double)f.QuadPart, (unsigned long long)w->batch,
+                          q->type == D3D12_COMMAND_LIST_TYPE_COPY ? "copy" : q->type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? "compute" : "direct",
+                          st, st < WMTCommandBufferStatusCommitted ? "its batch is NOT COMMITTED yet" : "committed, the GPU has not finished it",
+                          (unsigned long long)bser, (unsigned long long)mad_gpu_completed(q->device));
+        } else if (shared >= 0) {
+            g_rbdbg_shared++;
+            if (!(InterlockedOr(&r->rbdbg_said, 2) & 2))
+                d3d12_log("[madeira-d3d12] debug-readback: %s of READBACK buffer '%s' at +%llu shares a page with a GPU copy in flight "
+                          "[+%llu, %llu bytes) but is outside it; that copy goes unchecked\n", write ? "write" : "read",
+                          r->name ? r->name : "?", (unsigned long long)off,
+                          (unsigned long long)g_rbdbg_rec[shared].off, (unsigned long long)g_rbdbg_rec[shared].len);
+        } else if (ontime) {
+            g_rbdbg_ontime++;
+            if (!(InterlockedOr(&r->rbdbg_said, 4) & 4) && g_rbdbg_traced++ < 24)
+                d3d12_log("[madeira-d3d12] debug-readback: first CPU %s of READBACK buffer '%s' (%llu bytes) at +%llu after its copy "
+                          "completed (fine)\n", write ? "write" : "read", r->name ? r->name : "?", (unsigned long long)r->size,
+                          (unsigned long long)off);
+        }
+        /* open every watch on this page; the others on the buffer stay closed */
+        for (i = 0; i < g_rbdbg_n; )
+            if (g_rbdbg_rec[i].r == r && off >= g_rbdbg_rec[i].plo && off < g_rbdbg_rec[i].phi) mad_rbdbg_drop_locked(i);
+            else i++;
+        mad_rbdbg_close_locked(r);
+    }
+    LeaveCriticalSection(&g_rbdbg_lock);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static void mad_rbdbg_report(void) {
+    if (g_rbdbg <= 0) return;
+    d3d12_log("[madeira-d3d12] debug-readback: %ld GPU copies into READBACK buffers watched; first CPU touch: %ld after the copy "
+              "completed, %ld EARLY (copy not complete; %ld of them before its batch was committed), %ld on a page shared with a "
+              "copy in flight (unchecked); %ld opened for our own query results, %ld watches evicted\n",
+              g_rbdbg_writes, g_rbdbg_ontime, g_rbdbg_early, g_rbdbg_early_open, g_rbdbg_shared, g_rbdbg_internal, g_rbdbg_evicted);
 }
 static int mad_pso_lazy_on(void) {   /* madeira.cfg pso-lazy (default 1): pipelines built at their first draw/dispatch */
     static int on = -1;
@@ -5047,6 +5230,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.dst = c->u.bb.dst->buffer; k.dst_offset = c->u.bb.doff;
         k.copy_length = c->u.bb.len;
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        mad_rbdbg_watch(e, c->u.bb.dst, c->u.bb.doff, c->u.bb.len);   /* wine-lab port */
         return;
     }
     case MC_COPY_B2T: {
@@ -5074,6 +5258,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.dst = c->u.bt.buf->buffer; k.offset = c->u.bt.off;
         k.bytes_per_row = c->u.bt.row; k.bytes_per_image = c->u.bt.row * c->u.bt.rows;
         madeira_blit_t2b(e->benc, &k, mad_aspect_opt(c->u.bt.tex, c->u.bt.plane));   /* wine-lab port: options via d3d12.so */
+        mad_rbdbg_watch(e, c->u.bt.buf, c->u.bt.off, (UINT64)c->u.bt.row * c->u.bt.rows * (c->u.bt.d ? c->u.bt.d : 1));   /* wine-lab port */
         return;
     }
     case MC_COPY_T2T: {
@@ -7741,8 +7926,10 @@ static void STDMETHODCALLTYPE list_ResolveQueryData(ID3D12GraphicsCommandList *T
     /* Written immediately rather than at execution: a constant is the same
      * value whenever it lands, and the destination is a readback buffer the
      * CPU owns. */
-    if (r->cpu && offset + (UINT64)count * each <= r->size)
+    if (r->cpu && offset + (UINT64)count * each <= r->size) {
+        mad_rbdbg_internal(r, offset, count * each);   /* wine-lab port */
         memset((char *)r->cpu + offset, 0, (size_t)(count * each));
+    }
 }
 
 /* ml1088: the batch-side machinery. */
@@ -7898,6 +8085,7 @@ static void mad_vis_complete(struct mad_device *d, struct mad_vis_batch *v) {
             if (!v->q[j].applied && v->q[j].end_seq < r->seq) MAD_VIS_APPLY(&v->q[j]);
         if (r->dst->cpu && r->off + (UINT64)r->count * 8 <= r->dst->size && r->start + r->count <= r->heap->desc.Count) {
             UINT64 *out = (UINT64 *)((char *)r->dst->cpu + r->off);
+            mad_rbdbg_internal(r->dst, r->off, (UINT64)r->count * 8);   /* wine-lab port */
             EnterCriticalSection(&r->heap->lock);
             for (j = 0; j < r->count; j++) {
                 UINT64 val = r->heap->results[r->start + j];
@@ -8180,6 +8368,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
         if (r->placed_heap) ID3D12Heap_Release((ID3D12Heap *)r->placed_heap);   /* ml1145 */
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
+            mad_rbdbg_forget(r);   /* wine-lab port */
             InterlockedExchangeAdd64(&g_upload_swap_bytes, -(LONG64)((r->size + 0xffff) & ~(UINT64)0xffff)); InterlockedDecrement(&g_upload_swap_n);
             if (md) {
                 EnterCriticalSection(&md->heap_lock);
@@ -8519,7 +8708,8 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
          * 0.4-0.9 GB of UPLOAD buffers live (ph-valley08-13), and its load-time
          * peak is what kills the Lumen runs. Metal-allocated shared storage is
          * charged in full. madeira.cfg upload-swap = 0 turns it off. */
-        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT && info.length >= (8u << 20) && mad_upload_swap_on()) {
+        if (!r->buffer && heap_type != D3D12_HEAP_TYPE_DEFAULT &&
+            ((heap_type == D3D12_HEAP_TYPE_READBACK && mad_rbdbg_on()) || (info.length >= (8u << 20) && mad_upload_swap_on()))) {   /* wine-lab port: debug-readback */
             SIZE_T len = (SIZE_T)((info.length + 0xffff) & ~(UINT64)0xffff);
             void *mem = VirtualAlloc(NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
             if (mem) {
@@ -8528,7 +8718,7 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
                 r->buffer = MTLDevice_newBuffer(d->mtl_device, &info);
                 if (r->buffer) { r->own_mem = mem; InterlockedExchangeAdd64(&g_upload_swap_bytes, (LONG64)len); InterlockedIncrement(&g_upload_swap_n); }
                 else { VirtualFree(mem, 0, MEM_RELEASE); info.length = want; info.memory.ptr = NULL; info.gpu_address = 0; }
-                {
+                if (want >= (8u << 20)) {
                     static unsigned said;
                     if (said++ < 8)
                         d3d12_log("[madeira-d3d12] ml1154 CPU-visible buffer %llu MB (heap type %u) on our storage %p: %s; %ld so far, %lld MB\n",
@@ -10437,6 +10627,25 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
               "entry '%s' (taken from the bytecode)\n", tag, (unsigned)dxil_len,
               (unsigned)a.ret_len, name);
     snprintf(g_last_entry, sizeof g_last_entry, "%s", name);
+    {   /* wine-lab port: madeira.cfg dump-dxil = <entry names, comma list, or *>: the DXIL of those shaders, once per
+         * entry and size, to C:\madeira-cs\<stage>_<entry>_<bytes>.dxil (dxc -dumpbin disassembles it). The
+         * cache-hit path converts too, so a shader is caught on every run; MADEIRA_D3D12_CS_DUMP's first 400 are not. */
+        static char list[512]; static volatile LONG loaded;
+        if (!loaded) {
+            mad_cfg_str_pe("dump-dxil", list, sizeof list);
+            if (list[0]) d3d12_log("[madeira-d3d12] dump-dxil = '%s' (to C:\\madeira-cs)\n", list);
+            InterlockedExchange(&loaded, 1);
+        }
+        if (list[0] && mad_name_listed(list, name)) {
+            char fn[160], path[200];
+            snprintf(fn, sizeof fn, "%s_%s_%u.dxil", tag, name, (unsigned)dxil_len);
+            snprintf(path, sizeof path, "C:\\madeira-cs\\%s", fn);
+            if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+                mad_dump_blob(fn, dxil, dxil_len);
+                d3d12_log("[madeira-d3d12] dump-dxil: %s\n", path);
+            }
+        }
+    }
     if (o && o->name_out && o->name_cap) snprintf(o->name_out, o->name_cap, "%s", name);   /* ml927b */
     if (!strcmp(name, "WriteToSliceMainVS") || !strcmp(name, "WriteToSliceMainGS")) {   /* ml926: bytes for offline disassembly */
         static unsigned said; if (said++ < 2) {

@@ -88,6 +88,12 @@ D3D12_OPTIONS9 claims them, which it no longer does by default; precompiled DXIL
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
+Readback diagnostics: `debug-readback = 1` puts every READBACK buffer on our own storage and makes the pages each GPU
+copy into one writes PAGE_NOACCESS until the CPU next touches them; a touch before that copy's command buffer has
+completed is logged once per buffer ("debug-readback: EARLY read ..." with the command buffer's status and the reading
+instruction's exe offset), on-time touches are counted in the 5 s report. It never waits and never changes data.
+`dump-dxil = <entry names, comma list, or *>` writes those shaders' DXIL to C:\madeira-cs\<stage>_<entry>_<bytes>.dxil
+of the running prefix, once per entry and size (disassemble with `wine ~/wine-lab/deps/dxc/bin/x64/dxc.exe -dumpbin`).
 `d3d12-atomic64-groupshared = 1` claims D3D12_OPTIONS9 AtomicInt64OnGroupShared again (Apple's compiler cannot build
 such a kernel here).
 
