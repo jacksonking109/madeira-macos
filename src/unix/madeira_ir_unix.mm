@@ -81,7 +81,8 @@
     X(IRShaderReflectionCopyHullInfo) \
     X(IRShaderReflectionReleaseHullInfo) \
     X(IRShaderReflectionCopyDomainInfo) \
-    X(IRShaderReflectionReleaseDomainInfo)
+    X(IRShaderReflectionReleaseDomainInfo) \
+    X(IRErrorGetPayload)
 
 struct IRFns {
     void *handle;
@@ -219,6 +220,43 @@ static IRDescriptorRangeType map_range(uint32_t t) {
     case MADEIRA_IR_RANGE_CBV:     return IRDescriptorRangeTypeCBV;
     case MADEIRA_IR_RANGE_SAMPLER: return IRDescriptorRangeTypeSampler;
     default:                       return IRDescriptorRangeTypeSRV;
+    }
+}
+
+/* wine-lab port: a shader refused for a resource its root signature does not
+ * cover names that resource (the converter's payload is its message) and the
+ * signature it was checked against, as handed to the converter. */
+static void mad_ir_log_unreferenced(const IRError *err, const IRRootParameter1 *p, uint32_t np,
+                                    const char *name) {
+    static int said;
+    static const char *const rt[4] = { "t", "u", "b", "s" };   /* IRDescriptorRangeType order */
+    const char *msg = g_ir.IRErrorGetPayload ? (const char *)g_ir.IRErrorGetPayload(err) : NULL;
+    if (said++ >= 8) return;
+    dprintf(2, "[madeira-ir] %s: %.200s; root signature (%u parameters):\n",
+            name, msg ? msg : "converter gave no message", np);
+    for (uint32_t i = 0; i < np; i++) {
+        char line[512];
+        int c = snprintf(line, sizeof line, "[madeira-ir]   param %u vis %u: ", i, (unsigned)p[i].ShaderVisibility);
+        switch (p[i].ParameterType) {
+        case IRRootParameterTypeDescriptorTable:
+            c += snprintf(line + c, sizeof line - c, "table");
+            for (uint32_t k = 0; k < p[i].DescriptorTable.NumDescriptorRanges && c < (int)sizeof line - 64; k++) {
+                const IRDescriptorRange1 *r = &p[i].DescriptorTable.pDescriptorRanges[k];
+                c += snprintf(line + c, sizeof line - c, " %s%u space %u x%d @%d",
+                              (unsigned)r->RangeType < 4 ? rt[r->RangeType] : "?", r->BaseShaderRegister,
+                              r->RegisterSpace, (int)r->NumDescriptors, (int)r->OffsetInDescriptorsFromTableStart);
+            }
+            break;
+        case IRRootParameterType32BitConstants:
+            snprintf(line + c, sizeof line - c, "constants b%u space %u x%u", p[i].Constants.ShaderRegister,
+                     p[i].Constants.RegisterSpace, p[i].Constants.Num32BitValues);
+            break;
+        default:
+            snprintf(line + c, sizeof line - c, "root descriptor type %u, register %u space %u",
+                     (unsigned)p[i].ParameterType, p[i].Descriptor.ShaderRegister, p[i].Descriptor.RegisterSpace);
+            break;
+        }
+        dprintf(2, "%s\n", line);
     }
 }
 
@@ -1772,6 +1810,11 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     if (!output) {
         a->ret_error_code = a64_refused ? (uint32_t)IRErrorCodeUnsupportedInstruction : err ? g_ir.IRErrorGetCode(err) : 0;
         status = MADEIRA_IR_COMPILE_FAILED;
+        if (a->ret_error_code == (uint32_t)IRErrorCodeResourceNotReferencedByRootSignature && err) {
+            char nm[MADEIRA_IR_ENTRY_MAX];
+            mad_air_entry_name((const unsigned char *)(uintptr_t)a->dxil, (size_t)a->dxil_len, nm, sizeof nm);
+            mad_ir_log_unreferenced(err, irp, (uint32_t)np, nm);
+        }
         /* ml863: keep the bytecode the converter refused, so the failure can
          * be reproduced on a Mac with the same converter and the real
          * diagnostics, instead of a code number on a phone. */
