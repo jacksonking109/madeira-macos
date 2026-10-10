@@ -105,8 +105,8 @@ int main(int argc, char **argv) {
     D3D12_INPUT_ELEMENT_DESC il[3];
     HRESULT hr; UINT inc_srv, inc_smp;
     D3D12_GPU_DESCRIPTOR_HANDLE sg, mg; D3D12_CPU_DESCRIPTOR_HANDLE sc_, mc_;
-    LARGE_INTEGER q0, q1, qf;
-    double tot = 0; int bad = 0;
+    LARGE_INTEGER q0, q1, q2, qf;
+    double tot = 0, tot_frame = 0; int bad = 0;
 
     if (!comp || !create || !ser) { printf("bench: missing d3dcompiler/d3d12\n"); return 2; }
     hr = create(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev);
@@ -275,9 +275,14 @@ int main(int argc, char **argv) {
         QueryPerformanceCounter(&q1);
         if (f >= 10) tot += (double)(q1.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
         wait_idle();
+        QueryPerformanceCounter(&q2);
+        if (f >= 10) tot_frame += (double)(q2.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
     }
     printf("bench: %d draws in %d lists x %d frames: ExecuteCommandLists %.3f ms/frame = %.3f us/draw (caller thread, frames 10..)\n",
            ndraws, nl, nframes, 1000.0 * tot / (nframes - 10), 1e6 * tot / ((double)(nframes - 10) * ndraws));
+    /* what an application that waits for each frame's fence sees: submission to GPU completion
+     * (with async-submit the replay leaves the caller's thread, so only this number compares) */
+    printf("bench: frame latency (ExecuteCommandLists to fence completion) %.3f ms/frame\n", 1000.0 * tot_frame / (nframes - 10));
     {   /* image hash of the last frame: must not change when the replay is optimised */
         BYTE *p = NULL; unsigned long long h = 1469598103934665603ull; int nz = 0;
         ID3D12Resource_Map(pix, 0, NULL, (void **)&p);
