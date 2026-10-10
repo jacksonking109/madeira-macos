@@ -79,10 +79,17 @@ their own range, raw views Values[0] per dword; 17 checks);
 d3d12-occlusion-x64.exe (tests/windows/occlusion_test.c, 0 failures, 15 checks: occlusion queries resolved into a
 DEFAULT-heap buffer are written on the GPU (a query inside one render pass gets its sample count, one spanning passes
 reads visible), a draw with an empty scissor counts no samples, and the readback-buffer path still gives exact counts;
-precompiled DXIL from occlusion.hlsl).
+precompiled DXIL from occlusion.hlsl);
+d3d12-readback-x64.exe (tests/windows/readback_test.c, 0 failures, 15 checks: a dispatch + copy into a READBACK buffer is
+read exactly the moment its fence passes, 150 iterations each of one list, lists batched together, the copy on a copy
+queue behind Wait, a compute queue, and frames in flight in a 16 MB readback buffer; 64-bit InterlockedMin without the
+old value is exact on raw, structured and 2 MB typed R32G32_UINT buffers; groupshared 64-bit atomics only while
+D3D12_OPTIONS9 claims them, which it no longer does by default; precompiled DXIL from readback.hlsl).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
+`d3d12-atomic64-groupshared = 1` claims D3D12_OPTIONS9 AtomicInt64OnGroupShared again (Apple's compiler cannot build
+such a kernel here).
 
 Geometry/tessellation emulation (DXIL GS, DXIL HS+DS): d3d12.so builds the converter's object/mesh pipeline
 (src/unix/d3d12_unix.m, new_geometry_emulation_pipeline_state). Host test, real converter VS/PS with stand-in

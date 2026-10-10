@@ -6513,10 +6513,18 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport_impl(ID3D12Device *T
          * engine with Nanite-style rasterisation refuses shader model 6
          * without this answer (UE 5.4 asked for exactly this, ml869). */
         D3D12_FEATURE_DATA_D3D12_OPTIONS9 *o = data;
+        static int gs = -1;
         if (size < sizeof *o) return E_INVALIDARG;
         memset(o, 0, sizeof *o);
         o->AtomicInt64OnTypedResourceSupported = TRUE;
-        o->AtomicInt64OnGroupSharedSupported = TRUE;
+        /* wine-lab port: NOT on groupshared. Metal has no 64-bit threadgroup
+         * atomics; the converter accepts a groupshared 64-bit InterlockedMin, but
+         * Apple's compiler service dies building the pipeline (M3 Pro, macOS 26:
+         * XPC_ERROR_CONNECTION_INTERRUPTED, every time), so every dispatch of it
+         * was skipped. tests/windows/readback_test.c case 6 holds the claim to
+         * exact results. madeira.cfg d3d12-atomic64-groupshared = 1 claims it. */
+        if (gs < 0) gs = mad_cfg_int_pe("d3d12-atomic64-groupshared", 0) ? 1 : 0;
+        o->AtomicInt64OnGroupSharedSupported = gs ? TRUE : FALSE;
         return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
