@@ -5482,10 +5482,15 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
      * by exec_end before a list returns, so nothing in the pool is still in use
      * when it drains. Same thread pushes and pops. */
     obj_handle_t ml1049_pool = NSAutoreleasePool_alloc_init();
+    /* Lazy pipelines this batch binds, built in parallel. wine-lab port: before
+     * submit_lock, not under it -- it touches only the pipelines (each build
+     * under its own rlock) and its own pool (under its serial lock), and a
+     * batch that compiles holds it for milliseconds, which a Present or Signal
+     * on another thread had to wait out. */
+    mad_prebuild_lists(count, lists);
     if (ml1021_q) EnterCriticalSection(&ml1021_q->submit_lock);
 
     struct mad_queue *q = (struct mad_queue *)This;
-    mad_prebuild_lists(count, lists);   /* lazy pipelines this batch binds, built in parallel */
     for (UINT i = 0; i < count; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
         if (l && !l->closed) {
