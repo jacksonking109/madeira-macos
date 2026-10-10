@@ -316,7 +316,7 @@ struct mad_device {
     unsigned ntheaps, theaps_cap;
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
     struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
-    struct { UINT32 value[4]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 16-byte period) */
+    struct { UINT32 value[12]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 48-byte period: whole 4-, 8-, 12- and 16-byte elements) */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
@@ -4977,6 +4977,7 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
 }
 
 #define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
+#define MAD_FILLPAT_RUN (MAD_FILLPAT_BYTES / 48u * 48u)   /* wine-lab port: the longest copy from it that ends on a whole period */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
@@ -4990,12 +4991,12 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         if (!c->u.fill.res->buffer) { MAD_SKIP(e); return; }
         if (c->u.fill.pattern) {   /* ml1151: a value whose bytes differ, copied from its pattern buffer */
             struct wmtcmd_blit_copy_from_buffer_to_buffer cp; UINT64 o;
-            for (o = 0; o < c->u.fill.len; o += MAD_FILLPAT_BYTES) {
+            for (o = 0; o < c->u.fill.len; o += MAD_FILLPAT_RUN) {   /* each copy restarts the pattern: whole periods only */
                 memset(&cp, 0, sizeof cp);
                 cp.type = WMTBlitCommandCopyFromBufferToBuffer;
                 cp.src = c->u.fill.pattern; cp.src_offset = 0;
                 cp.dst = c->u.fill.res->buffer; cp.dst_offset = c->u.fill.off + o;
-                cp.copy_length = c->u.fill.len - o < MAD_FILLPAT_BYTES ? c->u.fill.len - o : MAD_FILLPAT_BYTES;
+                cp.copy_length = c->u.fill.len - o < MAD_FILLPAT_RUN ? c->u.fill.len - o : MAD_FILLPAT_RUN;
                 MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&cp);
             }
             return;
@@ -7424,6 +7425,52 @@ static UINT64 mad_uavctr_get(UINT64 va) {
     ReleaseSRWLockShared(&g_uavctr_lock);
     return r;
 }
+/* wine-lab port: typed BUFFER UAV clears. D3D12 clears a raw or structured
+ * view with Values[0] in every dword, but a typed view element by element in
+ * its format: an R32G32B32_UINT view of indirect dispatch arguments cleared to
+ * (0, 1, 1) holds (0, 1, 1) records. The descriptor keeps only an address and
+ * a size (and, for a format Metal has as a texture buffer, a view id), so the
+ * format of each typed buffer UAV is remembered by the CPU descriptor's
+ * address -- where ClearUnorderedAccessView* names it. The Last of Us Part I:
+ * every tiled-lighting record came out (n, 0, 0), all 44 CS_DeferredLighting
+ * dispatches ran no thread group, and the lit HDR target kept stale memory
+ * (blurry, over-exposed, the "top-left rectangle"). */
+struct mad_uavfmt { UINT64 addr, va; UINT32 len; DXGI_FORMAT fmt; };   /* va + len: the view it was recorded for */
+#define MAD_UAVFMT_CAP 8192u
+static struct mad_uavfmt g_uavfmt[MAD_UAVFMT_CAP];
+static SRWLOCK g_uavfmt_lock = SRWLOCK_INIT;
+static volatile LONG g_uavfmt_used;
+static unsigned mad_uavfmt_home(UINT64 addr) { return (unsigned)((addr * 0x9E3779B97F4A7C15ull) >> 51); }
+/* fmt DXGI_FORMAT_UNKNOWN forgets the address (the slot now holds another view). */
+static void mad_uavfmt_put(const struct mad_descriptor *desc, DXGI_FORMAT fmt) {
+    UINT64 addr = (UINT64)(ULONG_PTR)desc;
+    unsigned h = mad_uavfmt_home(addr), k;
+    struct mad_uavfmt *u;
+    if (!addr || (fmt == DXGI_FORMAT_UNKNOWN && !g_uavfmt_used)) return;
+    AcquireSRWLockExclusive(&g_uavfmt_lock);
+    for (k = 0; k < 8; k++) { u = &g_uavfmt[(h + k) & (MAD_UAVFMT_CAP - 1)]; if (!u->addr || u->addr == addr) break; }
+    if (k == 8) k = 0;   /* full neighbourhood: replace the home slot */
+    u = &g_uavfmt[(h + k) & (MAD_UAVFMT_CAP - 1)];
+    if (u->addr == addr || fmt != DXGI_FORMAT_UNKNOWN) { u->addr = addr; u->va = desc->gpu_va; u->len = (UINT32)desc->metadata; u->fmt = fmt; }
+    if (fmt != DXGI_FORMAT_UNKNOWN) g_uavfmt_used = 1;
+    ReleaseSRWLockExclusive(&g_uavfmt_lock);
+}
+/* A descriptor copied over the slot since (CopyDescriptors) names another
+ * range: its recorded format no longer applies. */
+static DXGI_FORMAT mad_uavfmt_get(const struct mad_descriptor *desc) {
+    UINT64 addr = (UINT64)(ULONG_PTR)desc;
+    unsigned h = mad_uavfmt_home(addr), k; DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN;
+    if (!addr || !g_uavfmt_used) return f;
+    AcquireSRWLockShared(&g_uavfmt_lock);
+    for (k = 0; k < 8; k++) {
+        const struct mad_uavfmt *u = &g_uavfmt[(h + k) & (MAD_UAVFMT_CAP - 1)];
+        if (u->addr == addr) { if (u->va == desc->gpu_va && u->len == (UINT32)desc->metadata) f = u->fmt; break; }
+        if (!u->addr) break;
+    }
+    ReleaseSRWLockShared(&g_uavfmt_lock);
+    return f;
+}
+
 static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *This,
         ID3D12Resource *res, ID3D12Resource *counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC *desc,
         D3D12_CPU_DESCRIPTOR_HANDLE h) {
@@ -7436,17 +7483,22 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
         d3d12_log("[madeira-d3d12] CreateUnorderedAccessView: counter resources are bound\n");
     if (r->buffer) {
         UINT64 stride = 4, first = 0, num = r->size / 4;
+        DXGI_FORMAT typed = DXGI_FORMAT_UNKNOWN;
         if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
             UINT bytes, block;
             first = desc->Buffer.FirstElement; num = desc->Buffer.NumElements;
             if (desc->Buffer.StructureByteStride) stride = desc->Buffer.StructureByteStride;
             else if (desc->Format != DXGI_FORMAT_UNKNOWN) {
                 mad_format_info(desc->Format, &bytes, &block); stride = bytes;
-                if (!(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW) &&
-                    mad_typed_buffer_view((struct mad_device *)This, r, desc->Format, first, num, 1, e)) return;   /* ml905 */
+                if (!(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) typed = desc->Format;
             }
         }
+        if (typed != DXGI_FORMAT_UNKNOWN && mad_typed_buffer_view((struct mad_device *)This, r, typed, first, num, 1, e)) {   /* ml905 */
+            mad_uavfmt_put(e, typed);   /* wine-lab port: for ClearUnorderedAccessView* */
+            return;
+        }
         mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
+        mad_uavfmt_put(e, typed);   /* a format Metal has no texture buffer for (R32G32B32) keeps its raw descriptor */
         {   /* remember this view's counter (or forget a stale one) */
             struct mad_resource *cr = (struct mad_resource *)counter;
             UINT64 cva = 0;
@@ -11726,27 +11778,34 @@ static void STDMETHODCALLTYPE list_SetComputeRoot32BitConstant(ID3D12GraphicsCom
  * buffer holding it repeated, kept per device for the few distinct values a
  * title uses. D3D12 clears raw and structured views with Values[0] per dword,
  * which is also exact for the R32 typed views these clears target. */
-/* The buffer repeats a 16-byte period, so it also holds whole 8- and 16-byte
- * texels for texture clears (an RGBA32 clear to (-1, 1e8, 0, 0)). */
-static obj_handle_t mad_fill_pattern16(struct mad_device *d, const UINT32 v[4]) {
+/* The buffer repeats a 48-byte period, so it also holds whole 8-, 12- and
+ * 16-byte elements: texels of texture clears (an RGBA32 clear to (-1, 1e8, 0,
+ * 0)) and typed buffer elements (an R32G32B32_UINT clear to (0, 1, 1)). */
+static obj_handle_t mad_fill_pattern48(struct mad_device *d, const UINT32 v[12]) {
     obj_handle_t buf = 0; unsigned i;
     AcquireSRWLockExclusive(&d->fillpat_lock);
-    for (i = 0; i < d->nfillpat; i++) if (!memcmp(d->fillpat[i].value, v, 16)) { buf = d->fillpat[i].buf; break; }
+    for (i = 0; i < d->nfillpat; i++) if (!memcmp(d->fillpat[i].value, v, 48)) { buf = d->fillpat[i].buf; break; }
     if (!buf && d->nfillpat < (sizeof d->fillpat / sizeof d->fillpat[0])) {
         struct WMTBufferInfo bi;
         memset(&bi, 0, sizeof bi); bi.length = MAD_FILLPAT_BYTES; bi.options = WMTResourceStorageModeShared;
         buf = MTLDevice_newBuffer(d->mtl_device, &bi);
         if (buf && bi.memory.ptr) {
             UINT32 *w = (UINT32 *)bi.memory.ptr; UINT64 k;
-            for (k = 0; k < MAD_FILLPAT_BYTES / 4; k++) w[k] = v[k & 3];
+            for (k = 0; k < MAD_FILLPAT_BYTES / 4; k++) w[k] = v[k % 12];
             mad_resident(d, buf);
-            memcpy(d->fillpat[d->nfillpat].value, v, 16); d->fillpat[d->nfillpat].buf = buf; d->nfillpat++;
-            d3d12_log("[madeira-d3d12] ml1151 UAV clear value %#x %#x %#x %#x: exact pattern buffer %u of %u\n",
-                      v[0], v[1], v[2], v[3], d->nfillpat, (unsigned)(sizeof d->fillpat / sizeof d->fillpat[0]));
+            memcpy(d->fillpat[d->nfillpat].value, v, 48); d->fillpat[d->nfillpat].buf = buf; d->nfillpat++;
+            d3d12_log("[madeira-d3d12] ml1151 UAV clear value %#x %#x %#x %#x%s: exact pattern buffer %u of %u\n",
+                      v[0], v[1], v[2], v[3], memcmp(v, v + 4, 32) ? " (12-byte period)" : "",
+                      d->nfillpat, (unsigned)(sizeof d->fillpat / sizeof d->fillpat[0]));
         } else if (buf) { NSObject_release(buf); buf = 0; }
     }
     ReleaseSRWLockExclusive(&d->fillpat_lock);
     return buf;
+}
+static obj_handle_t mad_fill_pattern16(struct mad_device *d, const UINT32 v[4]) {
+    UINT32 k[12]; unsigned i;
+    for (i = 0; i < 12; i++) k[i] = v[i & 3];
+    return mad_fill_pattern48(d, k);
 }
 static obj_handle_t mad_fill_pattern(struct mad_device *d, UINT32 v) {
     UINT32 k[4] = { v, v, v, v };
@@ -11795,6 +11854,9 @@ static UINT mad_pack_clear(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, uns
     case DXGI_FORMAT_R32G32B32A32_FLOAT: nch = 4; bits = 32; kind = 0; break;
     case DXGI_FORMAT_R32G32B32A32_UINT: nch = 4; bits = 32; kind = 3; break;
     case DXGI_FORMAT_R32G32B32A32_SINT: nch = 4; bits = 32; kind = 4; break;
+    case DXGI_FORMAT_R32G32B32_FLOAT: nch = 3; bits = 32; kind = 0; break;   /* buffer views only: Metal has no 96-bit texel */
+    case DXGI_FORMAT_R32G32B32_UINT: nch = 3; bits = 32; kind = 3; break;
+    case DXGI_FORMAT_R32G32B32_SINT: nch = 3; bits = 32; kind = 4; break;
     case DXGI_FORMAT_R32G32_FLOAT: nch = 2; bits = 32; kind = 0; break;
     case DXGI_FORMAT_R32G32_UINT: nch = 2; bits = 32; kind = 3; break;
     case DXGI_FORMAT_R32G32_SINT: nch = 2; bits = 32; kind = 4; break;
@@ -11829,6 +11891,7 @@ static UINT mad_pack_clear(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, uns
     case DXGI_FORMAT_R8_UINT: nch = 1; bits = 8; kind = 3; break;
     case DXGI_FORMAT_R8_SINT: nch = 1; bits = 8; kind = 4; break;
     case DXGI_FORMAT_R32G32B32A32_TYPELESS: nch = 4; bits = 32; kind = 5; break;
+    case DXGI_FORMAT_R32G32B32_TYPELESS: nch = 3; bits = 32; kind = 5; break;
     case DXGI_FORMAT_R32G32_TYPELESS: nch = 2; bits = 32; kind = 5; break;
     case DXGI_FORMAT_R32_TYPELESS: nch = 1; bits = 32; kind = 5; break;
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: nch = 4; bits = 16; kind = 5; break;
@@ -11953,12 +12016,38 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
                   what, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, u.sl0,
                   u.nsl == ~0u ? -1 : (int)u.nsl, (unsigned)u.fmt, pat, bpp);
 }
+/* wine-lab port: a typed buffer view is cleared element by element in its
+ * format (mad_pack_clear), through a pattern holding whole elements; 0 when
+ * the format is not one this packs (the caller keeps the Values[0] fill). */
+static int mad_record_typed_buffer_clear(struct mad_list *l, struct mad_cmd *c, DXGI_FORMAT fmt, const UINT32 v[4], int is_float, const char *what) {
+    static unsigned said, said_fmt;
+    unsigned char px[16], pat[48]; UINT32 w[12]; UINT bpp; unsigned i;
+    bpp = v ? mad_pack_clear(fmt, v, is_float, px) : 0;
+    if (!bpp || c->u.fill.len % bpp) {
+        if (said_fmt++ < 8)
+            d3d12_log("[madeira-d3d12] %s on a typed buffer view of format %u (%llu bytes): not packed; Values[0] fills every dword\n",
+                      what, (unsigned)fmt, (unsigned long long)c->u.fill.len);
+        return 0;
+    }
+    for (i = 0; i < 48; i++) pat[i] = px[i % bpp];   /* 48 is a whole number of 1-, 2-, 4-, 8-, 12- and 16-byte elements */
+    memcpy(w, pat, 48);
+    for (i = 1; i < 48 && pat[i] == pat[0]; i++) ;
+    c->u.fill.byte = pat[0];
+    c->u.fill.pattern = i == 48 ? 0 : mad_fill_pattern48(l->device, w);
+    if (i < 48 && !c->u.fill.pattern) return 0;
+    if (said++ < 16)
+        d3d12_log("[madeira-d3d12] %s on a typed buffer view, format %u (%u-byte elements), values %#x %#x %#x %#x: "
+                  "resource '%s' range +%llu len %llu\n", what, (unsigned)fmt, bpp, v[0], v[1], v[2], v[3],
+                  c->u.fill.res->name ? c->u.fill.res->name : "?", (unsigned long long)c->u.fill.off, (unsigned long long)c->u.fill.len);
+    return 1;
+}
 static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res, const UINT32 v[4], int is_float, const char *what) {
     struct mad_list *l = (struct mad_list *)This;
     struct mad_descriptor *e = (struct mad_descriptor *)cpu.ptr;
     struct mad_resource *r; UINT64 off = 0; UINT64 len;
     struct mad_cmd *c;
-    static unsigned said_tex, said_approx;
+    DXGI_FORMAT typed;
+    static unsigned said_tex, said_unused, said_approx;
     if (!e || !l) return;
     if (!e->gpu_va) {   /* a texture view */
         if (e->texture_view_id) mad_record_uav_tex_clear(l, e->texture_view_id, (struct mad_resource *)res, v, is_float, what);
@@ -11975,13 +12064,13 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
     len = e->metadata & 0xffffffffu;
     if (!len || off + len > r->size) len = r->size > off ? r->size - off : 0;
     if (!len) return;
+    typed = mad_uavfmt_get(e);   /* wine-lab port */
     c = mad_list_push(l, MC_FILL_BB);
     if (!c) return;
     c->u.fill.res = r; c->u.fill.off = off; c->u.fill.len = len;
-    {
+    if (typed != DXGI_FORMAT_UNKNOWN && mad_record_typed_buffer_clear(l, c, typed, v, is_float, what)) return;
+    {   /* raw and structured views (and typed ones not packed): Values[0] in every dword */
         UINT32 x = v ? v[0] : 0; UINT8 b = (UINT8)(x & 0xff);
-        int exact = v && v[0] == v[1] && v[1] == v[2] && v[2] == v[3] &&
-                    ((x >> 8) & 0xff) == b && ((x >> 16) & 0xff) == b && ((x >> 24) & 0xff) == b;
         c->u.fill.byte = b; c->u.fill.pattern = 0;
         if (!(((x >> 8) & 0xff) == b && ((x >> 16) & 0xff) == b && ((x >> 24) & 0xff) == b))
         {
@@ -11991,9 +12080,16 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
                 d3d12_log("[madeira-d3d12] ml1151 %s value %#x exact: resource '%s' %llu bytes, range +%llu len %llu (gpu 0x%llx)\n",
                           what, x, r->name ? r->name : "?", (unsigned long long)r->size, (unsigned long long)off,
                           (unsigned long long)len, (unsigned long long)r->gpu_address);
+            else if (!c->u.fill.pattern && said_approx++ < 4)
+                d3d12_log("[madeira-d3d12] %s with value %#x is approximated by byte %#x (no pattern buffer)\n", what, x, b);
         }
-        if (!exact && !c->u.fill.pattern && said_approx++ < 4)
-            d3d12_log("[madeira-d3d12] %s with value %#x is approximated by byte %#x (no pattern buffer)\n", what, x, b);
+        /* wine-lab port: Values[1..3] differing from Values[0] mean nothing for a
+         * raw or structured view; for a typed one whose format was not recorded
+         * (a descriptor copied from elsewhere) they were lost. Say which. */
+        if (v && (v[1] != x || v[2] != x || v[3] != x) && said_unused++ < 8)
+            d3d12_log("[madeira-d3d12] %s on a %s buffer view: Values[0] %#x fills every dword, values %#x %#x %#x unused "
+                      "(resource '%s' range +%llu len %llu)\n", what, typed != DXGI_FORMAT_UNKNOWN ? "typed (not packed)" : "raw, structured or unrecorded",
+                      x, v[1], v[2], v[3], r->name ? r->name : "?", (unsigned long long)off, (unsigned long long)len);
     }
 }
 static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewUint(ID3D12GraphicsCommandList *This,

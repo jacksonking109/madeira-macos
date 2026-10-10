@@ -73,7 +73,9 @@ RWTexture2D, raw, structured and typed buffers, exact per pixel; other texture s
 compare-exchange with the old value used is refused; precompiled DXIL from atomic64.hlsl); d3d12-uavclear-x64.exe
 (tests/windows/uavclear_test.c, 0 failures: texture UAV clears read back per texel, Uint clears of R16_FLOAT,
 R16_TYPELESS-as-R16_FLOAT and R32_FLOAT views write the raw bits, Float clears of R16_UINT and R32_SINT views convert,
-and a descriptor holding another resource's view clears the named resource in its own format);
+a descriptor holding another resource's view clears the named resource in its own format, and buffer UAV clears: typed
+views (R32G32B32_UINT dispatch arguments, RGBA32, RG16, RG32 by a Float clear) element by element in their format over
+their own range, raw views Values[0] per dword; 17 checks);
 d3d12-occlusion-x64.exe (tests/windows/occlusion_test.c, 0 failures, 15 checks: occlusion queries resolved into a
 DEFAULT-heap buffer are written on the GPU (a query inside one render pass gets its sample count, one spanning passes
 reads visible), a draw with an empty scissor counts no samples, and the readback-buffer path still gives exact counts;

@@ -1,4 +1,4 @@
-/*  Texture UAV clears across formats, for the wine-lab D3D12 port.
+/*  Texture and buffer UAV clears across formats, for the wine-lab D3D12 port.
  *
  *  ClearUnorderedAccessViewUint writes each value's low bits into its channel
  *  whatever the view's format, so a Uint clear of an R16_FLOAT view to 0x3c00
@@ -19,6 +19,17 @@
  *       size (an R16_FLOAT view of texture 1), the call names an R32_TYPELESS
  *       texture: the named texture is cleared whole with the value's raw bits.
  *       Not valid D3D12; The Last of Us Part I's skipped clears had this shape.
+ *    6  BUFFER views. A typed view is cleared element by element in its format,
+ *       only over its FirstElement/NumElements; a raw view takes Values[0] in
+ *       every dword. Each case first fills the 256-byte buffer with 0xAAAAAAAA
+ *       through a raw view, clears through a view written to the same
+ *       descriptor slot each time, and checks every dword:
+ *       R32G32B32_UINT elements 2..6 to (0, 1, 1) -- indirect dispatch records;
+ *       The Last of Us Part I's tiled-lighting arguments came out (n, 0, 0) and
+ *       none of its CS_DeferredLighting dispatches ran a thread group --
+ *       R32G32B32A32_UINT 1..4 to (5, 6, 7, 8), R16G16_UINT 0..7 to (1, 2),
+ *       R32G32_FLOAT 3..6 to (1.5, -2.0) by a Float clear, R32_UINT to 4 with
+ *       Values[1..3] = 1, and a raw view to Values[0] = 9.
  *
  *  Exit code = number of failed checks.
  */
@@ -43,6 +54,7 @@ typedef HRESULT (WINAPI *pfn_create_device)(IUnknown *, D3D_FEATURE_LEVEL, REFII
 typedef const char *(*pfn_marker)(void);
 
 enum { W = 64, H = 16, PITCH = 256 };   /* 64 texels of up to 4 bytes: one 256-byte row */
+enum { BUF_BYTES = 256, BUF_DWORDS = BUF_BYTES / 4 };   /* case 6 */
 static const UINT64 RB_SIZE = (UINT64)PITCH * H;
 
 static ID3D12Device       *dev;
@@ -191,10 +203,79 @@ static void clear_case(const char *name, ID3D12Resource *view_res, DXGI_FORMAT v
     if (bad > 0) printf("        first differing texel: %#x\n", first);
 }
 
+/* ------------------------------------------------------------ buffer cases */
+
+static ID3D12Resource *make_uav_buffer(UINT64 size) {
+    D3D12_HEAP_PROPERTIES hp; ZeroMemory(&hp, sizeof hp); hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d; ZeroMemory(&d, sizeof d);
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = size; d.Height = 1;
+    d.DepthOrArraySize = 1; d.MipLevels = 1; d.Format = DXGI_FORMAT_UNKNOWN;
+    d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource *r = NULL;
+    ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL,
+                                         &IID_ID3D12Resource, (void **)&r);
+    return r;
+}
+
+/* A buffer UAV (raw when `raw`, else typed in `fmt`) in slot `slot` of both heaps. */
+static void put_buf_uav(ID3D12Resource *buf, DXGI_FORMAT fmt, BOOL raw, UINT first, UINT num, UINT slot,
+                        D3D12_CPU_DESCRIPTOR_HANDLE *cpu, D3D12_GPU_DESCRIPTOR_HANDLE *gpu) {
+    UINT inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE c, gc;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u; ZeroMemory(&u, sizeof u);
+    u.Format = raw ? DXGI_FORMAT_R32_TYPELESS : fmt; u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    u.Buffer.FirstElement = first; u.Buffer.NumElements = num;
+    u.Buffer.Flags = raw ? D3D12_BUFFER_UAV_FLAG_RAW : D3D12_BUFFER_UAV_FLAG_NONE;
+    cpuh->lpVtbl->GetCPUDescriptorHandleForHeapStart(cpuh, &c); c.ptr += (SIZE_T)slot * inc;
+    gpuh->lpVtbl->GetCPUDescriptorHandleForHeapStart(gpuh, &gc); gc.ptr += (SIZE_T)slot * inc;
+    gpuh->lpVtbl->GetGPUDescriptorHandleForHeapStart(gpuh, gpu); gpu->ptr += (UINT64)slot * inc;
+    ID3D12Device_CreateUnorderedAccessView(dev, buf, NULL, &u, c);
+    ID3D12Device_CreateUnorderedAccessView(dev, buf, NULL, &u, gc);
+    *cpu = c;
+}
+
+/* Fills `buf` with 0xAAAAAAAA through a raw view (slot 8), clears it through
+ * the view described (slot 9), reads it back and compares every dword with
+ * `want`. */
+static void buffer_case(const char *name, ID3D12Resource *buf, DXGI_FORMAT fmt, BOOL raw, UINT first, UINT num,
+                        BOOL is_float, const void *values, const UINT32 *want) {
+    static const UINT fill[4] = { 0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu };
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    D3D12_RESOURCE_BARRIER b;
+    UINT32 *p = NULL;
+    int bad = 0, firstbad = -1, i;
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &gpuh);
+    put_buf_uav(buf, DXGI_FORMAT_R32_TYPELESS, TRUE, 0, BUF_DWORDS, 8, &cpu, &gpu);
+    ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, gpu, cpu, buf, fill, 0, NULL);
+    ZeroMemory(&b, sizeof b); b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; b.UAV.pResource = buf;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+    put_buf_uav(buf, fmt, raw, first, num, 9, &cpu, &gpu);
+    if (is_float) ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(list, gpu, cpu, buf, values, 0, NULL);
+    else ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, gpu, cpu, buf, values, 0, NULL);
+    barrier(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, buf, 0, BUF_BYTES);
+    barrier(buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!submit_and_wait()) { CHECK(FALSE, "%s: nothing read back", name); return; }
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&p);
+    if (!p) { CHECK(FALSE, "%s: readback Map failed", name); return; }
+    for (i = 0; i < BUF_DWORDS; i++) if (p[i] != want[i]) { if (firstbad < 0) firstbad = i; bad++; }
+    CHECK(bad == 0, "%s: %d of %d dwords differ", name, bad, BUF_DWORDS);
+    if (bad) printf("        first differing dword %d: %#x, expected %#x\n", firstbad, p[firstbad], want[firstbad]);
+    ID3D12Resource_Unmap(rb, 0, NULL);
+}
+
+/* The expected buffer: 0xAAAAAAAA outside dwords [d0, d0 + n), `per` repeating inside. */
+static void expect(UINT32 *want, UINT d0, UINT n, const UINT32 *per, UINT nper) {
+    UINT i;
+    for (i = 0; i < BUF_DWORDS; i++) want[i] = 0xAAAAAAAAu;
+    for (i = 0; i < n; i++) want[d0 + i] = per[i % nper];
+}
+
 int main(void) {
     HRESULT hr;
-    ID3D12Resource *t_h16 = NULL, *t_h16tl = NULL, *t_f32 = NULL, *t_u16 = NULL, *t_s32 = NULL, *t_r32tl = NULL;
-    printf("wine-lab d3d12: texture UAV clears across formats\n\n");
+    ID3D12Resource *t_h16 = NULL, *t_h16tl = NULL, *t_f32 = NULL, *t_u16 = NULL, *t_s32 = NULL, *t_r32tl = NULL, *b_args = NULL;
+    printf("wine-lab d3d12: texture and buffer UAV clears across formats\n\n");
 
     HMODULE d12 = LoadLibraryA("d3d12.dll");
     pfn_create_device create = d12 ? (pfn_create_device)GetProcAddress(d12, "D3D12CreateDevice") : NULL;
@@ -221,7 +302,7 @@ int main(void) {
     rb = make_readback(RB_SIZE);
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd; ZeroMemory(&hd, sizeof hd);
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 8;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 16;
         ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&cpuh);
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&gpuh);
@@ -266,8 +347,32 @@ int main(void) {
         clear_case("R16_FLOAT view of texture 1, R32_TYPELESS texture named", t_h16, DXGI_FORMAT_R16_FLOAT, t_r32tl,
                    DXGI_FORMAT_R32_TYPELESS, 4, FALSE, v, 0x12345678, 5);
     }
+    printf("\n[6] Buffer UAV clears: typed views element by element, raw views Values[0]\n");
+    b_args = make_uav_buffer(BUF_BYTES);
+    CHECK(b_args != NULL, "256-byte UAV buffer created");
+    if (b_args) {
+        static const UINT args[4] = { 0, 1, 1, 7 }, rgba[4] = { 5, 6, 7, 8 }, rg16[4] = { 1, 2, 3, 4 };
+        static const UINT r32[4] = { 4, 1, 1, 1 }, rawv[4] = { 9, 1, 2, 3 };
+        static const FLOAT rgf[4] = { 1.5f, -2.0f, 3.0f, 4.0f };
+        static const UINT32 p_args[3] = { 0, 1, 1 }, p_rgba[4] = { 5, 6, 7, 8 }, p_rg16[1] = { 0x00020001u };
+        static const UINT32 p_rgf[2] = { 0x3fc00000u, 0xc0000000u }, p_r32[1] = { 4 }, p_raw[1] = { 9 };
+        UINT32 want[BUF_DWORDS];
+        expect(want, 6, 15, p_args, 3);
+        buffer_case("R32G32B32_UINT elements 2..6, Uint (0, 1, 1)", b_args, DXGI_FORMAT_R32G32B32_UINT, FALSE, 2, 5, FALSE, args, want);
+        expect(want, 4, 16, p_rgba, 4);
+        buffer_case("R32G32B32A32_UINT elements 1..4, Uint (5, 6, 7, 8)", b_args, DXGI_FORMAT_R32G32B32A32_UINT, FALSE, 1, 4, FALSE, rgba, want);
+        expect(want, 0, 8, p_rg16, 1);
+        buffer_case("R16G16_UINT elements 0..7, Uint (1, 2)", b_args, DXGI_FORMAT_R16G16_UINT, FALSE, 0, 8, FALSE, rg16, want);
+        expect(want, 6, 8, p_rgf, 2);
+        buffer_case("R32G32_FLOAT elements 3..6, Float (1.5, -2.0)", b_args, DXGI_FORMAT_R32G32_FLOAT, FALSE, 3, 4, TRUE, rgf, want);
+        expect(want, 0, BUF_DWORDS, p_r32, 1);
+        buffer_case("R32_UINT whole buffer, Uint (4, 1, 1, 1)", b_args, DXGI_FORMAT_R32_UINT, FALSE, 0, BUF_DWORDS, FALSE, r32, want);
+        expect(want, 0, BUF_DWORDS, p_raw, 1);
+        buffer_case("raw view whole buffer, Uint (9, 1, 2, 3)", b_args, DXGI_FORMAT_R32_TYPELESS, TRUE, 0, BUF_DWORDS, FALSE, rawv, want);
+    }
 
 done:
+    if (b_args) ID3D12Resource_Release(b_args);
     if (t_r32tl) ID3D12Resource_Release(t_r32tl);
     if (t_s32) ID3D12Resource_Release(t_s32);
     if (t_u16) ID3D12Resource_Release(t_u16);
