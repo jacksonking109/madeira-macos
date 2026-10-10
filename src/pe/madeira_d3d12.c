@@ -724,7 +724,6 @@ struct mad_rootsig {
      * the table it points at (nsamplers sampler descriptors, built once). */
     obj_handle_t stab; UINT64 stab_gpu;
     const struct mad_descriptor *stab_cpu;   /* the same table, for the DXBC backend's copies (mad_air_resolve) */
-    UINT64 serial;   /* wine-lab port: unique per signature, keys the pipelines' mad_air_plan (an address is reused) */
 };
 struct mad_pso {
     ID3D12PipelineStateVtbl *vtbl; LONG refs; const IID *iid; const char *name;
@@ -787,7 +786,6 @@ struct mad_pso {
     UINT air_slot_mask;                             /* ml1011: the mask its vertex fetch was built for */
     UINT ps_cb_bind, ps_arg_bind, ps_arg_qwords, ps_nair;
     struct madeira_ir_air_range *ps_air;
-    struct mad_air_plan *volatile air_plan[2];      /* wine-lab port: air / ps_air matched against a signature (mad_air_plan_get) */
     struct mad_tess *tess;                          /* ml1083: hull/domain as an object/mesh pipeline, NULL if not built */
     struct mad_tess *tess_strip;                    /* ml1147b: a DXBC geometry pipeline's STRIP-topology variant */
 };
@@ -3282,23 +3280,19 @@ static UINT mad_air_param_type(UINT air_type) {
  *
  * Exactly one of *desc (a descriptor read out of the bound heap) or *direct_va
  * (a root descriptor's address, which has no descriptor at all) is produced.
- * Anything unresolvable reports why instead of binding zeros quietly.
- *
- * wine-lab port: in two halves. mad_air_match finds WHICH root-signature entry
- * covers the range -- a function of the signature, the range and the stage
- * alone, all immutable -- and mad_air_resolve_ent reads what that entry holds
- * now. A pipeline keeps its stages' matches (mad_air_plan_get), so a table
- * rebuilt for every draw no longer walks the signature once per range. */
-enum { MAD_AP_NONE, MAD_AP_TABLE, MAD_AP_CONSTS, MAD_AP_ROOT, MAD_AP_STATIC };
-struct mad_air_pent { UINT8 kind, param; UINT16 pad; UINT32 idx; };   /* idx: table descriptor index / static sampler */
-static void mad_air_match(const struct mad_rootsig *rs, const struct madeira_ir_air_range *rg,
-                          unsigned vis_mask,   /* ml1049: bit per madeira_ir_visibility this stage may see */
-                          struct mad_air_pent *pe) {
+ * Anything unresolvable reports why instead of binding zeros quietly. */
+static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
+                           const UINT32 (*consts)[64], const struct madeira_ir_air_range *rg,
+                           unsigned vis_mask,   /* ml1049: bit per madeira_ir_visibility this stage may see */
+                           struct mad_descriptor *desc, UINT64 *direct_va, const char **why) {
     UINT want_range = mad_air_range_type(rg->type);
     UINT want_param = mad_air_param_type(rg->type);
     unsigned i, j;
 
-    memset(pe, 0, sizeof *pe);
+    *direct_va = 0;
+    memset(desc, 0, sizeof *desc);
+    if (!rs) { *why = "no root signature bound"; return 0; }
+
     for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
         const struct madeira_ir_root_param *pp = &rs->params[i];
 
@@ -3321,7 +3315,10 @@ static void mad_air_match(const struct mad_rootsig *rs, const struct madeira_ir_
             for (j = 0; j < pp->num_ranges; j++) {
                 unsigned ri = pp->first_range + j;
                 const struct madeira_ir_root_range *rr;
-                UINT range_off;
+                UINT64 table_gpu, slot_gpu;
+                struct mad_heap *h;
+                UINT64 byte_off;
+                UINT idx, range_off;
                 if (ri >= rs->nranges) break;   /* ml1009: ranges are blob-sized now */
                 rr = &rs->ranges[ri];
                 range_off = (rr->table_offset == 0xffffffffu) ? running : rr->table_offset;
@@ -3331,23 +3328,50 @@ static void mad_air_match(const struct mad_rootsig *rs, const struct madeira_ir_
                 if (rg->lower_bound < rr->base_register) continue;
                 if (rr->num_descriptors != ~0u &&
                     rg->lower_bound >= rr->base_register + rr->num_descriptors) continue;
-                pe->kind = MAD_AP_TABLE; pe->param = (UINT8)i; pe->idx = range_off + (rg->lower_bound - rr->base_register);
-                return;
+
+                idx = range_off + (rg->lower_bound - rr->base_register);
+                table_gpu = root[i];
+                e->dep_acc |= 1u << i;
+                if (!table_gpu) { *why = "descriptor table root argument never set"; return 0; }
+                h = (rg->type == MADEIRA_IR_AIR_SAMPLER) ? e->smp : e->srv;
+                if (!h || !h->cpu || !h->gpu_address) { *why = "the matching descriptor heap is not bound"; return 0; }
+                slot_gpu = table_gpu + (UINT64)idx * sizeof(struct mad_descriptor);
+                if (slot_gpu < h->gpu_address) { *why = "descriptor address below the bound heap"; return 0; }
+                byte_off = slot_gpu - h->gpu_address;
+                if (byte_off % sizeof(struct mad_descriptor)) { *why = "descriptor address is not slot-aligned"; return 0; }
+                if (byte_off / sizeof(struct mad_descriptor) >= h->count) { *why = "descriptor address past the end of the heap"; return 0; }
+                *desc = h->cpu[byte_off / sizeof(struct mad_descriptor)];
+                return 1;
             }
             continue;
         }
 
         if (pp->type == MADEIRA_IR_PARAM_CONSTANTS) {
+            /* Root constants consumed as a constant buffer. The backend wants a
+             * POINTER, so the words need GPU-visible storage; copy them into a
+             * ring slot whose lifetime already matches the dispatch. */
+            UINT n;
+            obj_handle_t cb; UINT64 coff, cgpu; void *ccpu;
             if (rg->type != MADEIRA_IR_AIR_CBV) continue;
             if (pp->shader_register != rg->lower_bound || pp->register_space != rg->space) continue;
-            pe->kind = MAD_AP_CONSTS; pe->param = (UINT8)i;
-            return;
+            e->dep_acc |= 0x80000000u;
+            n = pp->num_constants > 64 ? 64 : pp->num_constants;
+            if (!exec_ring_take_z(e, 256, 256, &cb, &coff, &ccpu, &cgpu)) { *why = "no ring slot for root constants"; return 0; }   /* ml1130 */
+            memcpy(ccpu, consts[i], (size_t)n * 4);
+            *direct_va = cgpu + coff;
+            return 1;
         }
 
         if (pp->type == want_param) {
             if (pp->shader_register != rg->lower_bound || pp->register_space != rg->space) continue;
-            pe->kind = MAD_AP_ROOT; pe->param = (UINT8)i;
-            return;
+            e->dep_acc |= 1u << i;
+            if (!root[i]) { *why = "root descriptor never set"; return 0; }
+            /* A root SRV/UAV carries an address and no length, and the backend
+             * needs a byte length for buffer bindings. Refuse rather than
+             * invent a bound. */
+            if (rg->type != MADEIRA_IR_AIR_CBV) { *why = "root SRV/UAV has no length for this binding"; return 0; }
+            *direct_va = root[i];
+            return 1;
         }
     }
 
@@ -3361,99 +3385,16 @@ static void mad_air_match(const struct mad_rootsig *rs, const struct madeira_ir_
             if (rs->samplers[i].shader_register == rg->lower_bound &&
                 rs->samplers[i].register_space == rg->space &&
                 (rs->samplers[i].visibility >= 32 || ((1u << rs->samplers[i].visibility) & vis_mask))) {
-                pe->kind = MAD_AP_STATIC; pe->idx = i;
-                return;
+                if (rs->stab_cpu && rs->stab_cpu[i].gpu_va) {
+                    *desc = rs->stab_cpu[i];
+                    return 1;
+                }
+                *why = "static sampler (its Metal sampler state could not be created)";
+                return 0;
             }
-    }
-}
-static int mad_air_resolve_ent(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
-                               const UINT32 (*consts)[64], const struct madeira_ir_air_range *rg, const struct mad_air_pent *pe,
-                               struct mad_descriptor *desc, UINT64 *direct_va, const char **why) {
-    const unsigned i = pe->param;
-
-    *direct_va = 0;
-    memset(desc, 0, sizeof *desc);
-    switch (pe->kind) {
-    case MAD_AP_TABLE: {
-        UINT64 table_gpu = root[i], slot_gpu, byte_off;
-        struct mad_heap *h;
-        e->dep_acc |= 1u << i;
-        if (!table_gpu) { *why = "descriptor table root argument never set"; return 0; }
-        h = (rg->type == MADEIRA_IR_AIR_SAMPLER) ? e->smp : e->srv;
-        if (!h || !h->cpu || !h->gpu_address) { *why = "the matching descriptor heap is not bound"; return 0; }
-        slot_gpu = table_gpu + (UINT64)pe->idx * sizeof(struct mad_descriptor);
-        if (slot_gpu < h->gpu_address) { *why = "descriptor address below the bound heap"; return 0; }
-        byte_off = slot_gpu - h->gpu_address;
-        if (byte_off % sizeof(struct mad_descriptor)) { *why = "descriptor address is not slot-aligned"; return 0; }
-        if (byte_off / sizeof(struct mad_descriptor) >= h->count) { *why = "descriptor address past the end of the heap"; return 0; }
-        *desc = h->cpu[byte_off / sizeof(struct mad_descriptor)];
-        return 1;
-    }
-    case MAD_AP_CONSTS: {
-        /* Root constants consumed as a constant buffer. The backend wants a
-         * POINTER, so the words need GPU-visible storage; copy them into a
-         * ring slot whose lifetime already matches the dispatch. */
-        UINT n;
-        obj_handle_t cb; UINT64 coff, cgpu; void *ccpu;
-        e->dep_acc |= 0x80000000u;
-        n = rs->params[i].num_constants > 64 ? 64 : rs->params[i].num_constants;
-        if (!exec_ring_take_z(e, 256, 256, &cb, &coff, &ccpu, &cgpu)) { *why = "no ring slot for root constants"; return 0; }   /* ml1130 */
-        memcpy(ccpu, consts[i], (size_t)n * 4);
-        *direct_va = cgpu + coff;
-        return 1;
-    }
-    case MAD_AP_ROOT:
-        e->dep_acc |= 1u << i;
-        if (!root[i]) { *why = "root descriptor never set"; return 0; }
-        /* A root SRV/UAV carries an address and no length, and the backend
-         * needs a byte length for buffer bindings. Refuse rather than
-         * invent a bound. */
-        if (rg->type != MADEIRA_IR_AIR_CBV) { *why = "root SRV/UAV has no length for this binding"; return 0; }
-        *direct_va = root[i];
-        return 1;
-    case MAD_AP_STATIC:
-        if (rs->stab_cpu && rs->stab_cpu[pe->idx].gpu_va) {
-            *desc = rs->stab_cpu[pe->idx];
-            return 1;
-        }
-        *why = "static sampler (its Metal sampler state could not be created)";
-        return 0;
     }
     *why = "no root-signature entry covers this register";
     return 0;
-}
-static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, const UINT64 *root,
-                           const UINT32 (*consts)[64], const struct madeira_ir_air_range *rg,
-                           unsigned vis_mask,   /* ml1049: bit per madeira_ir_visibility this stage may see */
-                           struct mad_descriptor *desc, UINT64 *direct_va, const char **why) {
-    struct mad_air_pent pe;
-    if (!rs) { *direct_va = 0; memset(desc, 0, sizeof *desc); *why = "no root signature bound"; return 0; }
-    mad_air_match(rs, rg, vis_mask, &pe);
-    return mad_air_resolve_ent(e, rs, root, consts, rg, &pe, desc, direct_va, why);
-}
-/* wine-lab port: a pipeline stage's matches against the signature it is drawn
- * with, built at its first table and kept until pso_Release. Keyed by the
- * signature's serial, not its address (a freed signature's address comes back).
- * Published once with a compare-and-swap and never changed after, so readers on
- * any replay thread need no lock: they see either no plan or a complete one.
- * A stage drawn with a different signature than the one kept takes the
- * unplanned path. */
-struct mad_air_plan { UINT64 rs_serial; const struct madeira_ir_air_range *airv; unsigned vis_mask, nair; struct mad_air_pent ent[]; };
-static const struct mad_air_pent *mad_air_plan_get(struct mad_air_plan *volatile *slot, const struct mad_rootsig *rs,
-                                                    const struct madeira_ir_air_range *airv, unsigned nair, unsigned vis_mask) {
-    struct mad_air_plan *pl, *n;
-    unsigned k;
-    if (!rs || !airv || !nair) return NULL;
-    pl = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
-    if (!pl) {
-        n = malloc(sizeof *n + (size_t)nair * sizeof n->ent[0]);
-        if (!n) return NULL;
-        n->rs_serial = rs->serial; n->airv = airv; n->vis_mask = vis_mask; n->nair = nair;
-        for (k = 0; k < nair; k++) mad_air_match(rs, &airv[k], vis_mask, &n->ent[k]);
-        pl = InterlockedCompareExchangePointer((void *volatile *)slot, n, NULL);
-        if (pl) free(n); else pl = n;
-    }
-    return (pl->rs_serial == rs->serial && pl->airv == airv && pl->nair == nair && pl->vis_mask == vis_mask) ? pl->ent : NULL;
 }
 
 /* ml1011: the DXBC backend's vertex-buffer table, bound at Metal index 16.
@@ -3520,7 +3461,6 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
                                    const UINT32 (*consts)[64], const struct mad_pso *pso,
                                    UINT cb_bind, UINT arg_bind, UINT arg_qwords, UINT nair,
                                    const struct madeira_ir_air_range *airv, unsigned vis_mask,   /* ml1083: one stage, described explicitly */
-                                   const struct mad_air_pent *plan,   /* wine-lab port: airv matched against rs, or NULL */
                                    obj_handle_t *cb_buf, UINT64 *cb_off,
                                    obj_handle_t *arg_buf, UINT64 *arg_off) {
     struct mad_device *d = e->q->device;
@@ -3577,8 +3517,7 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
         if (rg->cb_table ? cb_hit : arg_hit) continue;   /* wine-lab port: that table is already built */
         if (!tab) { why = "the table this range belongs to was not reported"; goto bad; }
         e->dep_acc = 0;
-        if (!(plan ? mad_air_resolve_ent(e, rs, root, consts, rg, &plan[k], &de, &direct, &why)
-                   : mad_air_resolve(e, rs, root, consts, rg, vis_mask, &de, &direct, &why))) {
+        if (!mad_air_resolve(e, rs, root, consts, rg, vis_mask, &de, &direct, &why)) {
             /* If the stage filter is what lost it, the signature's visibility
              * was parsed wrong or the engine relies on lax behaviour: bind as
              * before and COUNT it, rather than trade one skipped draw for another. */
@@ -3676,14 +3615,12 @@ static int mad_air_build_tables(struct mad_exec *e, const struct mad_rootsig *rs
     const unsigned vis_mask = pso->is_compute ? ~0u
         : fragment_stage ? ((1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_PIXEL))
                          : ((1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_VERTEX) | (1u << MADEIRA_IR_VIS_GEOMETRY));
-    const UINT nair = fragment_stage ? pso->ps_nair : pso->nair;
-    const struct madeira_ir_air_range *airv = fragment_stage ? pso->ps_air : pso->air;
     return mad_air_build_tables_ex(e, rs, root, consts, pso,
                                    fragment_stage ? pso->ps_cb_bind    : pso->cb_bind,
                                    fragment_stage ? pso->ps_arg_bind   : pso->arg_bind,
                                    fragment_stage ? pso->ps_arg_qwords : pso->arg_qwords,
-                                   nair, airv, vis_mask,
-                                   mad_air_plan_get(&((struct mad_pso *)pso)->air_plan[fragment_stage ? 1 : 0], rs, airv, nair, vis_mask),
+                                   fragment_stage ? pso->ps_nair       : pso->nair,
+                                   fragment_stage ? pso->ps_air : pso->air, vis_mask,
                                    cb_buf, cb_off, arg_buf, arg_off);
 }
 /* ml1083: one tessellation stage's tables. */
@@ -3691,7 +3628,7 @@ static int mad_air_build_tess_tables(struct mad_exec *e, const struct mad_tess_s
                                      obj_handle_t *cb_buf, UINT64 *cb_off, obj_handle_t *arg_buf, UINT64 *arg_off) {
     return mad_air_build_tables_ex(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, e->pso,
                                    st->cb_bind, st->arg_bind, st->arg_qwords, st->nair, st->air,
-                                   (1u << MADEIRA_IR_VIS_ALL) | (1u << vis), NULL, cb_buf, cb_off, arg_buf, arg_off);
+                                   (1u << MADEIRA_IR_VIS_ALL) | (1u << vis), cb_buf, cb_off, arg_buf, arg_off);
 }
 
 /* ml1011: DXGI_FORMAT -> WMTAttributeFormat for vertex-buffer elements.
@@ -8638,7 +8575,6 @@ static ULONG STDMETHODCALLTYPE pso_Release(ID3D12PipelineState *T) {
         if (p->cps) NSObject_release(p->cps);
         free(p->air);   /* ml1010 */
         free(p->ps_air);   /* ml1011 */
-        free(p->air_plan[0]); free(p->air_plan[1]);   /* wine-lab port */
         mad_tess_free(p->tess);         /* ml1083 */
         mad_tess_free(p->tess_strip);   /* ml1147b */
         free(p);
@@ -8787,7 +8723,6 @@ static HRESULT STDMETHODCALLTYPE device_CreateRootSignature(ID3D12Device *This, 
     struct mad_rootsig *r = calloc(1, sizeof *r + (size_t)total_ranges * sizeof *r->ranges);
     if (!r) return E_OUTOFMEMORY;
     r->vtbl = &g_rootsig_vtbl; r->refs = 1; r->iid = &IID_ID3D12RootSignature; r->name = "RootSignature";
-    { static volatile LONG64 serial; r->serial = (UINT64)InterlockedIncrement64(&serial); }   /* wine-lab port */
     r->ranges = total_ranges ? (struct madeira_ir_root_range *)((char *)r + sizeof *r) : NULL;
     r->nparams = nparam;
     r->flags = rs_flags;
