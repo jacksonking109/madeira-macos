@@ -6278,7 +6278,10 @@ static HRESULT STDMETHODCALLTYPE device_CheckFeatureSupport_impl(ID3D12Device *T
         D3D12_FEATURE_DATA_D3D12_OPTIONS *o = data;
         if (size < sizeof *o) return E_INVALIDARG;
         memset(o, 0, sizeof *o);
-        o->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_2;
+        /* wine-lab port: madeira.cfg d3d12-binding-tier = 3 claims tier 3 (SM 6.6 heap indexing goes
+         * through the converter's descriptor heaps; TLOU Part I refuses the device below tier 3). */
+        {   static int tier; if (!tier) tier = mad_cfg_int_pe("d3d12-binding-tier", 2) >= 3 ? 3 : 2;
+            o->ResourceBindingTier = tier == 3 ? D3D12_RESOURCE_BINDING_TIER_3 : D3D12_RESOURCE_BINDING_TIER_2; }
         o->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_2;   /* heaps here are descriptions; any mix is fine */
         o->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation = TRUE;
         /* ml1970: FORMAT_SUPPORT below already reports UAV_TYPED_LOAD for every
