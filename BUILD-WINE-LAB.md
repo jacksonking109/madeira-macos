@@ -54,7 +54,9 @@ libmetalirconverter.dylib (MSC 4.0 beta 2, x86_64 slice) goes next to d3d12.so, 
 
 Install: d3d12.dll -> wine11/lib/wine/x86_64-windows/ (replaces Wine's vkd3d d3d12, which needs Vulkan this build
 lacks; Wine picks builtins by export name, so a copy in system32 alone is not used), d3d12.so -> wine11/lib/wine/x86_64-unix/,
-then re-sign it ad hoc: `codesign --force -s - ~/wine-lab/wine11/lib/wine/x86_64-unix/d3d12.so`.
+then re-sign it ad hoc: `codesign --force -s - ~/wine-lab/wine11/lib/wine/x86_64-unix/d3d12.so`. While a game may be
+running, copy each file to a temporary name in the same directory (sign the .so there) and rename it over the
+installed one, so the running process keeps its mapped copy intact.
 
 Tests (from out/, after `. ~/wine-lab/env11.sh`): d3d12-m2-x64.exe (expect 2 known failures: the stale fence-cycles
 check, and "unclaimed feature level 12_1" since madeira.cfg claims 12_1); d3d12-dxbc-x64.exe (SM 5.0 DXBC through
@@ -63,10 +65,15 @@ plus tier-0 render passes, GetCachedBlob/CachedPSO, the pipeline library, and a 
 not write keeping its contents); d3d12-bindless-x64.exe (tests/windows/bindless_test.c, 0 failures: SM 6.6
 ResourceDescriptorHeap/SamplerDescriptorHeap, an SM 6.0 descriptor array in space 1, SM 5.1 DXBC registers in spaces 1
 and 2, root signature 1.2, SM 5.1 DXBC constant buffers from root constants, a root CBV and a table in spaces 0-2, and
-the refusal of an SM 5.1 constant-buffer array; precompiled DXIL from bindless.hlsl, regeneration commands at its top);
+the refusal of an SM 5.1 constant-buffer array, an unbounded SRV range starting above register 0, and a pipeline
+with pRootSignature = NULL using the root signature embedded in its shader; 59 checks; precompiled DXIL from
+bindless.hlsl, regeneration commands at its top);
 d3d12-atomic64-x64.exe (tests/windows/atomic64_test.c, 0 failures: 64-bit InterlockedMax with the old value used on a
 RWTexture2D, raw, structured and typed buffers, exact per pixel; other texture shapes convert; a texture
-compare-exchange with the old value used is refused; precompiled DXIL from atomic64.hlsl).
+compare-exchange with the old value used is refused; precompiled DXIL from atomic64.hlsl); d3d12-uavclear-x64.exe
+(tests/windows/uavclear_test.c, 0 failures: texture UAV clears read back per texel, Uint clears of R16_FLOAT,
+R16_TYPELESS-as-R16_FLOAT and R32_FLOAT views write the raw bits, Float clears of R16_UINT and R32_SINT views convert,
+and a descriptor holding another resource's view clears the named resource in its own format).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
