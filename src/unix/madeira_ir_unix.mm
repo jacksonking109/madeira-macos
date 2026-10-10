@@ -223,6 +223,32 @@ static IRDescriptorRangeType map_range(uint32_t t) {
     }
 }
 
+/* wine-lab port: MSC 4.0b2 adds BaseShaderRegister + NumDescriptors in 32 bits,
+ * so an unbounded range (NumDescriptors = UINT_MAX) that starts above register
+ * 0 wraps, covers nothing, and a shader reading it is refused with code 4
+ * (ResourceNotReferencedByRootSignature, "Resource SRV in space 0 register 1 in
+ * shader IR is not referenced by the root signature"): TLOU Part I's compute
+ * shaders with "t1 unbounded" and "t10 unbounded". Such a range gets the
+ * registers that exist above its base instead; the count does not shape the
+ * generated code (same metallib for any count that covers the shader). A later
+ * APPEND range keeps the offset the unclamped count gave it. */
+static void mad_ir_clamp_unbounded(IRDescriptorRange1 *r, uint32_t n) {
+    uint32_t running = 0;
+    int clamped = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t off = r[k].OffsetInDescriptorsFromTableStart;
+        if (off == IRDescriptorRangeOffsetAppend) {
+            off = running;
+            if (clamped) r[k].OffsetInDescriptorsFromTableStart = off;
+        }
+        running = off + r[k].NumDescriptors;
+        if (r[k].NumDescriptors == UINT32_MAX && r[k].BaseShaderRegister) {
+            r[k].NumDescriptors = UINT32_MAX - r[k].BaseShaderRegister;
+            clamped = 1;
+        }
+    }
+}
+
 /* wine-lab port: a shader refused for a resource its root signature does not
  * cover names that resource (the converter's payload is its message) and the
  * signature it was checked against, as handed to the converter. */
@@ -1677,6 +1703,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
             irp[i].ParameterType = IRRootParameterTypeDescriptorTable;
             irp[i].DescriptorTable.NumDescriptorRanges = ps[i].num_ranges;
             irp[i].DescriptorTable.pDescriptorRanges = irr + ps[i].first_range;
+            mad_ir_clamp_unbounded(irr + ps[i].first_range, ps[i].num_ranges);
             break;
         default:
             status = MADEIRA_IR_UNSUPPORTED; goto done;
