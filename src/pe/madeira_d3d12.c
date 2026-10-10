@@ -257,6 +257,8 @@ struct mad_device {
      * every typed-buffer binding failed and its draw or dispatch was skipped. */
     CRITICAL_SECTION view_lock;
     struct mad_viewrec { UINT64 id; UINT32 a, b; } *vmap; unsigned vmap_cap, vmap_used, vmap_live;
+    volatile LONG64 vmap_ver;   /* wine-lab port: odd while a writer changes vmap; lets mad_vmap_get read it lock-free */
+    void *vmap_old[24]; unsigned nvmap_old;   /* outgrown blocks a lock-free reader may still be searching; freed with the device */
     /* ml1061: GPU timeline. Every committed batch signals `gpu_event` with its
      * serial, so "has the GPU finished X" is a read of one value instead of a
      * blocking wait. Fences are delivered by a worker thread; argument-ring
@@ -387,6 +389,33 @@ static int mad_grow(void **arr, unsigned *cap, unsigned need, size_t elem) {
  * a/b: typed buffer = element count / first element; texture view = slices / 0. */
 #define MAD_VREC_TOMB (~(UINT64)0)
 static unsigned mad_vmap_slot(UINT64 id, unsigned cap) { return (unsigned)((id * 0x9E3779B97F4A7C15ull) >> 40) & (cap - 1); }
+/* wine-lab port: LOCK-FREE VIEW-MAP READS, the ml1132 scheme applied to the view
+ * map. The replay looks a view up for every texture an argument table binds
+ * (mad_air_plain_view, mad_air_array_len), and view_lock is also what view
+ * creation holds across its Metal calls (newTextureView, newTexture on a
+ * buffer), so a streaming thread making views could stall the replay the
+ * game is waiting for -- and every replay thread would serialise on it.
+ *
+ * Writers still hold view_lock and bracket each change with vmap_ver (odd while
+ * it changes). A reader searches without the lock and keeps a hit only if the
+ * count was even and did not move; anything else -- a miss, a moved or odd
+ * count -- takes the unchanged locked path, so every answer is one the locked
+ * search gives. Why a hit is also the RIGHT answer: a view id reaches a table
+ * only through a descriptor, and the entry (and its twin's) is written inside
+ * the CreateShaderResourceView / CreateUnorderedAccessView call that writes the
+ * descriptor (a base texture's at CreateResource); the application orders that
+ * call before the ExecuteCommandLists whose replay reads it, which is the same
+ * ordering the locked search relied on.
+ * The block is replaced only when it grows (doubling: 24 outgrown blocks is past
+ * any possible count) and is kept until the device dies; a rebuild that only
+ * drops tombstones writes the same block back while the count is odd. Readers
+ * load the capacity before the block, and the writer stores the block before the
+ * capacity, so a capacity never indexes past the block read after it. */
+static void mad_vmap_begin(struct mad_device *d) {
+    __atomic_fetch_add(&d->vmap_ver, 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+static void mad_vmap_end(struct mad_device *d) { __atomic_fetch_add(&d->vmap_ver, 1, __ATOMIC_RELEASE); }
 static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT32 b) {
     unsigned i;
     if (!id || id == MAD_VREC_TOMB) return;
@@ -402,25 +431,54 @@ static void mad_vmap_put_locked(struct mad_device *d, UINT64 id, UINT32 a, UINT3
             while (n[i].id) i = (i + 1) & (ncap - 1);
             n[i] = d->vmap[k];
         }
-        free(d->vmap); d->vmap = n; d->vmap_cap = ncap; d->vmap_used = d->vmap_live;
+        mad_vmap_begin(d);
+        if (ncap == d->vmap_cap) { memcpy(d->vmap, n, (size_t)ncap * sizeof *n); free(n); }   /* tombstones dropped, same block */
+        else {
+            if (d->vmap && d->nvmap_old < sizeof d->vmap_old / sizeof d->vmap_old[0]) d->vmap_old[d->nvmap_old++] = d->vmap;   /* else kept forever */
+            __atomic_store_n(&d->vmap, n, __ATOMIC_RELEASE);
+            __atomic_store_n(&d->vmap_cap, ncap, __ATOMIC_RELEASE);
+        }
+        d->vmap_used = d->vmap_live;
+        mad_vmap_end(d);
     }
     i = mad_vmap_slot(id, d->vmap_cap);
     while (d->vmap[i].id && d->vmap[i].id != id) i = (i + 1) & (d->vmap_cap - 1);
+    mad_vmap_begin(d);
     if (!d->vmap[i].id) { d->vmap_used++; d->vmap_live++; }
     d->vmap[i].id = id; d->vmap[i].a = a; d->vmap[i].b = b;
+    mad_vmap_end(d);
 }
 static void mad_vmap_del_locked(struct mad_device *d, UINT64 id) {
     unsigned i;
     if (!d->vmap_cap || !id || id == MAD_VREC_TOMB) return;
     i = mad_vmap_slot(id, d->vmap_cap);
     while (d->vmap[i].id) {
-        if (d->vmap[i].id == id) { d->vmap[i].id = MAD_VREC_TOMB; d->vmap_live--; return; }
+        if (d->vmap[i].id == id) { mad_vmap_begin(d); d->vmap[i].id = MAD_VREC_TOMB; d->vmap_live--; mad_vmap_end(d); return; }
         i = (i + 1) & (d->vmap_cap - 1);
     }
 }
 static int mad_vmap_get(struct mad_device *d, UINT64 id, UINT32 *a, UINT32 *b) {
     int hit = 0; unsigned i;
+    LONG64 v1;
     if (!id || id == MAD_VREC_TOMB) return 0;
+    v1 = __atomic_load_n(&d->vmap_ver, __ATOMIC_ACQUIRE);
+    if (!(v1 & 1)) {   /* wine-lab port: lock-free first, see above */
+        unsigned cap = __atomic_load_n(&d->vmap_cap, __ATOMIC_ACQUIRE), n;
+        const struct mad_viewrec *vm = __atomic_load_n(&d->vmap, __ATOMIC_ACQUIRE);
+        UINT32 ra = 0, rb = 0;
+        if (cap && vm) {
+            i = mad_vmap_slot(id, cap);
+            for (n = 0; n < cap; n++) {   /* bounded: a torn read must not spin */
+                UINT64 k = __atomic_load_n(&vm[i].id, __ATOMIC_RELAXED);
+                if (!k) break;
+                if (k == id) { ra = __atomic_load_n(&vm[i].a, __ATOMIC_RELAXED); rb = __atomic_load_n(&vm[i].b, __ATOMIC_RELAXED); hit = 1; break; }
+                i = (i + 1) & (cap - 1);
+            }
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* the reads above complete before the re-check */
+        if (hit && __atomic_load_n(&d->vmap_ver, __ATOMIC_RELAXED) == v1) { *a = ra; *b = rb; return 1; }
+        hit = 0;
+    }
     EnterCriticalSection(&d->view_lock);
     if (d->vmap_cap) {
         i = mad_vmap_slot(id, d->vmap_cap);
@@ -6513,6 +6571,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
         if (d->mtl_device) NSObject_release(d->mtl_device);
         DeleteCriticalSection(&d->live_lock);
         DeleteCriticalSection(&d->view_lock); free(d->vmap);
+        while (d->nvmap_old) free(d->vmap_old[--d->nvmap_old]);   /* wine-lab port */
         d3d12_log("[madeira-d3d12] destroyed %s\n", d->name);
         free(d);
     }
