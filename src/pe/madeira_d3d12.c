@@ -10805,7 +10805,7 @@ static HRESULT mad_check_cached_pso(const D3D12_CACHED_PIPELINE_STATE *c) {
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 }
 
-static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device *This,
+static HRESULT mad_create_graphics_pso(ID3D12Device *This,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     struct mad_device *d = (struct mad_device *)This;
     struct mad_rootsig *rs;
@@ -11293,7 +11293,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device
 }
 
 
-static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device *This,
+static HRESULT mad_create_compute_pso(ID3D12Device *This,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     struct mad_device *d = (struct mad_device *)This;
     struct mad_pso *p;
@@ -11405,6 +11405,59 @@ static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device 
     }
     hr = pso_QI((ID3D12PipelineState *)p, riid, out);
     pso_Release((ID3D12PipelineState *)p);
+    return hr;
+}
+
+/* wine-lab port: a pipeline whose pRootSignature is NULL uses the root
+ * signature embedded in its shaders (an RTS0 part: HLSL [RootSignature(...)]
+ * or dxc -rootsig-define); D3D12 requires the stages that carry one to agree,
+ * so the first found is taken. Converting against no root signature at all
+ * refused every shader that reads a resource (code 4). Returns a new
+ * reference, or NULL when no stage embeds one. */
+static struct mad_rootsig *mad_embedded_rootsig(ID3D12Device *This, const D3D12_SHADER_BYTECODE *const *bc,
+                                                unsigned n, const char *what) {
+    static unsigned said;
+    unsigned i;
+    for (i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        const char *why = NULL;
+        void *rs = NULL;
+        if (!bc[i] || !bc[i]->pShaderBytecode ||
+            !rs_find_chunk(bc[i]->pShaderBytecode, bc[i]->BytecodeLength, &len, &why)) continue;
+        if (FAILED(device_CreateRootSignature(This, 0, bc[i]->pShaderBytecode, bc[i]->BytecodeLength,
+                                              &IID_ID3D12RootSignature, &rs))) continue;
+        if (said++ < 8)
+            d3d12_log("[madeira-d3d12] %s pipeline without a root signature: using the one embedded in its shader\n", what);
+        return (struct mad_rootsig *)rs;
+    }
+    return NULL;
+}
+static HRESULT STDMETHODCALLTYPE device_CreateGraphicsPipelineState(ID3D12Device *This,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
+    const D3D12_SHADER_BYTECODE *bc[5];
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC g;
+    struct mad_rootsig *rs;
+    HRESULT hr;
+    if (!desc || desc->pRootSignature) return mad_create_graphics_pso(This, desc, riid, out);
+    bc[0] = &desc->VS; bc[1] = &desc->PS; bc[2] = &desc->GS; bc[3] = &desc->HS; bc[4] = &desc->DS;
+    if (!(rs = mad_embedded_rootsig(This, bc, 5, "graphics"))) return mad_create_graphics_pso(This, desc, riid, out);
+    g = *desc; g.pRootSignature = (ID3D12RootSignature *)rs;
+    hr = mad_create_graphics_pso(This, &g, riid, out);
+    rootsig_Release((ID3D12RootSignature *)rs);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE device_CreateComputePipelineState(ID3D12Device *This,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
+    const D3D12_SHADER_BYTECODE *bc[1];
+    D3D12_COMPUTE_PIPELINE_STATE_DESC c;
+    struct mad_rootsig *rs;
+    HRESULT hr;
+    if (!desc || desc->pRootSignature) return mad_create_compute_pso(This, desc, riid, out);
+    bc[0] = &desc->CS;
+    if (!(rs = mad_embedded_rootsig(This, bc, 1, "compute"))) return mad_create_compute_pso(This, desc, riid, out);
+    c = *desc; c.pRootSignature = (ID3D12RootSignature *)rs;
+    hr = mad_create_compute_pso(This, &c, riid, out);
+    rootsig_Release((ID3D12RootSignature *)rs);
     return hr;
 }
 
