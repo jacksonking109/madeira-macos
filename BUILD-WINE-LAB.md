@@ -47,7 +47,8 @@ refused, and so are DXIL 64-bit atomics whose old value is read.
 with a plain load (and a device memory fence for textures and typed buffers) before the atomic, whose result is then
 unused. Not atomic with the update: an invocation between the load and the atomic is missed. madeira.cfg
 dxil-atomic64-emulation = 0 turns it off. Its output is keyed in the DXIL cache by MAD_A64_VERSION (madeira_ir_unix.mm),
-which a change to madeira_atomic64.cpp must bump (that file is not part of the build stamp).
+which a change to madeira_atomic64.cpp must bump (that file is not part of the build stamp). Host test, the three saved
+TLOU Part I shaders included: see the header of tests/native/atomic64_rewrite_test.cpp.
 
 libmetalirconverter.dylib (MSC 4.0 beta 2, x86_64 slice) goes next to d3d12.so, or set MADEIRA_MSC_DYLIB.
 
@@ -62,7 +63,10 @@ plus tier-0 render passes, GetCachedBlob/CachedPSO, the pipeline library, and a 
 not write keeping its contents); d3d12-bindless-x64.exe (tests/windows/bindless_test.c, 0 failures: SM 6.6
 ResourceDescriptorHeap/SamplerDescriptorHeap, an SM 6.0 descriptor array in space 1, SM 5.1 DXBC registers in spaces 1
 and 2, root signature 1.2, SM 5.1 DXBC constant buffers from root constants, a root CBV and a table in spaces 0-2, and
-the refusal of an SM 5.1 constant-buffer array; precompiled DXIL from bindless.hlsl, regeneration commands at its top).
+the refusal of an SM 5.1 constant-buffer array; precompiled DXIL from bindless.hlsl, regeneration commands at its top);
+d3d12-atomic64-x64.exe (tests/windows/atomic64_test.c, 0 failures: 64-bit InterlockedMax with the old value used on a
+RWTexture2D, raw, structured and typed buffers, exact per pixel; other texture shapes convert; a texture
+compare-exchange with the old value used is refused; precompiled DXIL from atomic64.hlsl).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
