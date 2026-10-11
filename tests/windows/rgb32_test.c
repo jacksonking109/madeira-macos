@@ -24,6 +24,10 @@
  *    6  a copy in one list and the read in the next, with no barrier at all
  *       (implicit promotion from COMMON)
  *    7  a view over an UPLOAD buffer the CPU rewrites between submissions
+ *    8  an UPLOAD ring of 3 per-frame slots rewritten by the CPU every frame
+ *       with 3 frames in flight (no wait between submissions), read through
+ *       one view per slot AND one view over the whole ring at the slot's
+ *       offset (a shadow shared by all frames in flight)
  *
  *  Exit code = number of failed checks. Every dispatch is finite.
  */
@@ -50,9 +54,10 @@ typedef HRESULT (WINAPI *pfn_serialize_v)(const D3D12_VERSIONED_ROOT_SIGNATURE_D
 typedef const char *(*pfn_marker)(void);
 
 enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FIRST = 100, NLATE = 300 };
+enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_COUNT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_COUNT = S_SLOT0 + NSLOT };
 #define OUT_REGION ((UINT64)NF * 16)   /* one dispatch's output */
 #define ONE_F 0x3f800000u
 
@@ -65,7 +70,8 @@ static ID3D12Fence        *fence;
 static UINT64              fence_v;
 static ID3D12DescriptorHeap *heap;
 static UINT                inc;
-static ID3D12Resource     *stage, *fbuf, *ubuf, *ibuf, *nbuf, *pbuf, *outbuf, *rb;
+static ID3D12Resource     *stage, *fbuf, *ubuf, *ibuf, *nbuf, *pbuf, *ring, *outbuf, *rb;
+#define NREGIONS (2 * NSLOT)
 static ID3D12RootSignature *rs;
 static ID3D12PipelineState *pso;
 
@@ -127,7 +133,7 @@ static ID3D12RootSignature *make_rs(void) {
     D3D12_DESCRIPTOR_RANGE1 r[3]; D3D12_ROOT_PARAMETER1 p[5];
     UINT k;
     ZeroMemory(r, sizeof r); ZeroMemory(p, sizeof p);
-    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 3;
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 4;
     for (k = 0; k < 3; k++) {
         r[k].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[k].NumDescriptors = UINT_MAX;
         r[k].BaseShaderRegister = 0; r[k].RegisterSpace = k;
@@ -163,20 +169,21 @@ static void make_view(UINT slot, ID3D12Resource *r, DXGI_FORMAT f, UINT first, U
 }
 
 /* Records one dispatch reading `n` elements of heap slot `sel` into output region `region`. */
-static void read_view(UINT kind, UINT sel, UINT n, UINT region) {
-    const UINT c[3] = { n, sel, kind };
+static void read_view_at(UINT kind, UINT sel, UINT base, UINT n, UINT region) {
+    const UINT c[4] = { n, sel, kind, base };
     D3D12_GPU_DESCRIPTOR_HANDLE g;
     heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(heap, &g);
     ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
     ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
     ID3D12GraphicsCommandList_SetPipelineState(list, pso);
-    ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 3, c, 0);
+    ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 4, c, 0);
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, g);
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 2, g);
     ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 3, g);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 4, ID3D12Resource_GetGPUVirtualAddress(outbuf) + region * OUT_REGION);
     ID3D12GraphicsCommandList_Dispatch(list, (n + 63) / 64, 1, 1);
 }
+static void read_view(UINT kind, UINT sel, UINT n, UINT region) { read_view_at(kind, sel, 0, n, region); }
 
 /* Copies `nregions` output regions to the readback buffer, submits and waits. */
 static BOOL finish(UINT nregions) {
@@ -232,6 +239,85 @@ static void fill_upload(float seed) {
     ID3D12Resource_Map(pbuf, 0, NULL, (void **)&p);
     for (i = 0; i < NP; i++) for (c = 0; c < 3; c++) p[3 * i + c] = fval(i, c, seed);
     ID3D12Resource_Unmap(pbuf, 0, NULL);
+}
+
+/* Case 8. Frame f writes slot f % NSLOT of the ring (seed f), records NREAD
+ * reads of it through the slot's own view and through the whole-ring view at
+ * the slot's offset, and is submitted without waiting; frame f + NSLOT waits
+ * for frame f's fence before checking its output and reusing its slot. */
+static float frame_seed(UINT f) { return 10.0f + 3.25f * (float)f; }
+static void frames_in_flight(void) {
+    ID3D12CommandAllocator *fa[NSLOT] = { 0 }; ID3D12GraphicsCommandList *fl[NSLOT] = { 0 };
+    ID3D12GraphicsCommandList *saved = list;
+    UINT64 done_at[NSLOT] = { 0 };
+    UINT f, k, bad_slot = 0, bad_ring = 0, checked = 0;
+    float *rp = NULL;
+    printf("\n[8] UPLOAD ring, %u slots rewritten every frame, %u frames, %u in flight\n", NSLOT, NFRAMES, NSLOT);
+    for (k = 0; k < NSLOT; k++) {
+        ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&fa[k]);
+        if (fa[k]) ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, fa[k], NULL,
+                                                  &IID_ID3D12GraphicsCommandList, (void **)&fl[k]);
+        if (fl[k]) ID3D12GraphicsCommandList_Close(fl[k]);
+    }
+    ID3D12Resource_Map(ring, 0, NULL, (void **)&rp);
+    if (!rp || !fl[0] || !fl[1] || !fl[2]) { CHECK(0, "case 8 set up"); goto out; }
+    for (f = 0; f < NFRAMES + NSLOT; f++) {
+        UINT slot = f % NSLOT, i, c, r;
+        if (f >= NSLOT) {   /* frame f - NSLOT is done: check it, then reuse its slot */
+            UINT pf = f - NSLOT; const UINT *o = NULL;
+            if (ID3D12Fence_GetCompletedValue(fence) < done_at[slot]) {
+                HANDLE ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+                ID3D12Fence_SetEventOnCompletion(fence, done_at[slot], ev);
+                if (WaitForSingleObject(ev, 30000) != WAIT_OBJECT_0) { CloseHandle(ev); CHECK(0, "frame %u fence", pf); goto out; }
+                CloseHandle(ev);
+            }
+            ID3D12Resource_Map(rb, 0, NULL, (void **)&o);
+            if (!o) { CHECK(0, "readback mapped"); goto out; }
+            for (r = 0; r < 2; r++) {
+                const UINT *q = o + (SIZE_T)(2 * slot + r) * (OUT_REGION / 4);
+                UINT bad = 0;
+                for (i = 0; i < NR; i++) {
+                    UINT v[4];
+                    for (c = 0; c < 3; c++) { float x = fval(i, c, frame_seed(pf)); memcpy(&v[c], &x, 4); }
+                    v[3] = ONE_F;
+                    if (memcmp(&q[4 * i], v, 16)) {
+                        if (!bad++ && !(r ? bad_ring : bad_slot))
+                            printf("        frame %u %s view, element %u: got (%#x %#x %#x %#x), expected (%#x %#x %#x %#x)\n",
+                                   pf, r ? "whole-ring" : "slot", i, q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3], v[0], v[1], v[2], v[3]);
+                    }
+                }
+                if (bad) { if (r) bad_ring++; else bad_slot++; }
+            }
+            ID3D12Resource_Unmap(rb, 0, NULL);
+            checked++;
+        }
+        if (f >= NFRAMES) continue;
+        for (i = 0; i < NR; i++) for (c = 0; c < 3; c++) rp[3 * ((SIZE_T)slot * NR + i) + c] = fval(i, c, frame_seed(f));
+        list = fl[slot];
+        ID3D12CommandAllocator_Reset(fa[slot]);
+        ID3D12GraphicsCommandList_Reset(list, fa[slot], NULL);
+        for (r = 0; r < NREAD; r++) {   /* the last read of each lands in the output */
+            read_view_at(K_FLOAT, S_SLOT0 + slot, 0, NR, 2 * slot);
+            read_view_at(K_FLOAT, S_RING, slot * NR, NR, 2 * slot + 1);
+        }
+        barrier(outbuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 2 * slot * OUT_REGION, outbuf, 2 * slot * OUT_REGION, 2 * OUT_REGION);
+        barrier(outbuf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12GraphicsCommandList_Close(list);
+        {
+            ID3D12CommandList *l1[1] = { (ID3D12CommandList *)list };
+            ID3D12CommandQueue_ExecuteCommandLists(queue, 1, l1);
+            ID3D12CommandQueue_Signal(queue, fence, ++fence_v);
+            done_at[slot] = fence_v;
+        }
+    }
+    CHECK(checked == NFRAMES, "all %u frames completed and checked", NFRAMES);
+    CHECK(!bad_slot, "per-slot views: every frame read its own data, w = 1 (%u frames wrong)", bad_slot);
+    CHECK(!bad_ring, "whole-ring view at the slot's offset: every frame read its own data, w = 1 (%u frames wrong)", bad_ring);
+out:
+    if (rp) ID3D12Resource_Unmap(ring, 0, NULL);
+    list = saved;
+    for (k = 0; k < NSLOT; k++) { if (fl[k]) ID3D12GraphicsCommandList_Release(fl[k]); if (fa[k]) ID3D12CommandAllocator_Release(fa[k]); }
 }
 
 static void cases(void) {
@@ -297,6 +383,8 @@ static void cases(void) {
     fill_upload(99.5f);
     read_view(K_FLOAT, S_P, NP, 0);
     if (finish(1)) verify("upload view, rewritten", 0, NP, &P2); else CHECK(0, "case 7b submitted");
+
+    frames_in_flight();
 }
 
 int main(void) {
@@ -339,11 +427,12 @@ int main(void) {
     ibuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, (UINT64)NI * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
     nbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, (UINT64)NN * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
     pbuf = make_buffer(D3D12_HEAP_TYPE_UPLOAD, (UINT64)NP * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
-    outbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, 3 * OUT_REGION, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    ring = make_buffer(D3D12_HEAP_TYPE_UPLOAD, (UINT64)NSLOT * NR * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    outbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, NREGIONS * OUT_REGION, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    rb = make_buffer(D3D12_HEAP_TYPE_READBACK, 3 * OUT_REGION, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    CHECK(stage && fbuf && ubuf && ibuf && nbuf && pbuf && outbuf && rb, "source, staging, output and readback buffers created");
-    if (!stage || !fbuf || !ubuf || !ibuf || !nbuf || !pbuf || !outbuf || !rb) goto done;
+    rb = make_buffer(D3D12_HEAP_TYPE_READBACK, NREGIONS * OUT_REGION, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+    CHECK(stage && fbuf && ubuf && ibuf && nbuf && pbuf && ring && outbuf && rb, "source, staging, output and readback buffers created");
+    if (!stage || !fbuf || !ubuf || !ibuf || !nbuf || !pbuf || !ring || !outbuf || !rb) goto done;
     rs = make_rs();
     if (!rs) goto done;
     {
@@ -363,6 +452,8 @@ int main(void) {
     make_view(S_I, ibuf, DXGI_FORMAT_R32G32B32_SINT, 0, NI);
     make_view(S_P, pbuf, DXGI_FORMAT_R32G32B32_FLOAT, 0, NP);
     make_view(S_N, nbuf, DXGI_FORMAT_R32G32B32_FLOAT, 0, NN);
+    make_view(S_RING, ring, DXGI_FORMAT_R32G32B32_FLOAT, 0, NSLOT * NR);
+    { UINT k; for (k = 0; k < NSLOT; k++) make_view(S_SLOT0 + k, ring, DXGI_FORMAT_R32G32B32_FLOAT, k * NR, NR); }
 
     cases();
 
@@ -371,6 +462,7 @@ done:
     if (rs) ID3D12RootSignature_Release(rs);
     if (rb) ID3D12Resource_Release(rb);
     if (outbuf) ID3D12Resource_Release(outbuf);
+    if (ring) ID3D12Resource_Release(ring);
     if (pbuf) ID3D12Resource_Release(pbuf);
     if (nbuf) ID3D12Resource_Release(nbuf);
     if (ibuf) ID3D12Resource_Release(ibuf);

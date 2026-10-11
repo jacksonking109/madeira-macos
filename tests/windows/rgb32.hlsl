@@ -8,10 +8,10 @@
 //
 // Reads element t of one typed buffer view, as TLOU1's mesh ray caster reads its
 // vertex positions: Buffer<float4> (or uint4 / int4) from an unbounded
-// descriptor array, over an R32G32B32 view. D3D returns (x, y, z, 1). The four
-// raw dwords go to the output.
+// descriptor array, over an R32G32B32 view, from element `base` on. D3D
+// returns (x, y, z, 1). The four raw dwords go to the output.
 
-cbuffer Sel : register(b0) { uint n; uint sel; uint kind; };
+cbuffer Sel : register(b0) { uint n; uint sel; uint kind; uint base; };
 Buffer<float4> fa[] : register(t0, space0);
 Buffer<uint4>  ua[] : register(t0, space1);
 Buffer<int4>   ia[] : register(t0, space2);
@@ -22,8 +22,8 @@ void cs_main(uint t : SV_DispatchThreadID)
 {
     if (t >= n) return;
     uint4 v;
-    if (kind == 0)      v = asuint(fa[sel][t]);
-    else if (kind == 1) v = ua[sel][t];
-    else                v = asuint(ia[sel][t]);
+    if (kind == 0)      v = asuint(fa[sel][base + t]);
+    else if (kind == 1) v = ua[sel][base + t];
+    else                v = asuint(ia[sel][base + t]);
     o[t] = v;
 }
