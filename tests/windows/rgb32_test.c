@@ -39,6 +39,15 @@
  *       once and the small views twice; the next frame refreshes it again
  *       (frames are ExecuteCommandLists calls here: the test never presents).
  *       With madeira.cfg rgb32-big-exact = 1 the big view is refreshed twice.
+ *   11  a genuine R32_FLOAT view of the same buffer, read through the same
+ *       Buffer<float4> read site as the RGB32 views, returns (x, 0, 0, 1);
+ *       GetDimensions gives NumElements for both kinds
+ *   12  the same through SM 6.6 ResourceDescriptorHeap indexing
+ *
+ *  With madeira.cfg rgb32-shader = 1 (the default) RGB32 views are read in the
+ *  shader from their own memory (src/unix/madeira_air_rewrite.cpp): cases 9 and
+ *  10 then check that no shadow exists and nothing is copied, and the run ends
+ *  with zero shadows. With rgb32-shader = 0 they check the shadow refreshes.
  *
  *  Exit code = number of failed checks. Every dispatch is finite.
  */
@@ -68,11 +77,11 @@ enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FI
 enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_COUNT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_COUNT };
 enum { NG = 1 << 20, NCOPY = 40, CPYN = 1200 };   /* case 9: big buffer elements, copies, elements per copy */
 static UINT big_first(UINT k) { return k * 12007u + 5u; }
 static UINT big_num(UINT k) { return 100u + 13u * k; }
-struct shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes; };
+struct shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes, rgb32_shader, shader_views, unsafe, big_frames; };
 typedef void (*pfn_shadow_stats)(struct shadow_stats *);
 static pfn_shadow_stats p_stats;
 #define OUT_REGION ((UINT64)NF * 16)   /* one dispatch's output */
@@ -88,9 +97,10 @@ static UINT64              fence_v;
 static ID3D12DescriptorHeap *heap;
 static UINT                inc;
 static ID3D12Resource     *stage, *fbuf, *ubuf, *ibuf, *nbuf, *pbuf, *ring, *outbuf, *rb, *gbuf, *gstage;
-#define NREGIONS (2 * NSLOT)
-static ID3D12RootSignature *rs;
-static ID3D12PipelineState *pso;
+#define NREGIONS (2 * NSLOT)   /* also >= the 5 regions of case 11 */
+static ID3D12RootSignature *rs, *rs_heap;
+static ID3D12PipelineState *pso, *pso_heap;
+static int shader_mode;   /* rgb32-shader, from MadeiraD3D12ShadowStats */
 
 /* staging layout (UPLOAD): data A, B (floats, NF each), U, I (NI), C (NN) */
 #define ST_A 0
@@ -379,7 +389,8 @@ static void refresh_cost(void) {
     stats(&c1, &v1, &k1);
     printf("        copied %llu bytes for views of %llu bytes (refreshing those views whole: %llu; every view at every barrier: %llu)\n",
            (unsigned long long)(c1 - c0), (unsigned long long)(v1 - v0), (unsigned long long)want_v, (unsigned long long)(all * NCOPY));
-    CHECK(c1 - c0 == want_c, "40 small copies refreshed exactly what they wrote: %llu bytes copied, %llu expected", (unsigned long long)(c1 - c0), (unsigned long long)want_c);
+    if (shader_mode) CHECK(c1 - c0 == 0, "rgb32-shader: 40 small copies made no shadow copies (%llu bytes)", (unsigned long long)(c1 - c0));
+    else CHECK(c1 - c0 == want_c, "40 small copies refreshed exactly what they wrote: %llu bytes copied, %llu expected", (unsigned long long)(c1 - c0), (unsigned long long)want_c);
     {
         struct expect Gv = { K_FLOAT, -3.5f, big_first(last) }, Gn = { K_FLOAT, 5.0f, big_first(last) + CPYN };
         read_view_at(K_FLOAT, S_BIG0 + last, 0, big_num(last), 0);
@@ -401,8 +412,9 @@ static void refresh_cost(void) {
     read_view_at(K_FLOAT, S_BIG0, 0, big_num(0), 0);
     if (!finish(1)) { CHECK(0, "case 9d submitted"); return; }
     stats(&c1, &v1, &k1);
-    CHECK(c1 - c0 == all && k1 - k0 == 1, "UAV -> SRV twice with no work between: every view refreshed once (%llu of %llu bytes, %llu skipped)",
-          (unsigned long long)(c1 - c0), (unsigned long long)all, (unsigned long long)(k1 - k0));
+    if (shader_mode) CHECK(c1 - c0 == 0, "rgb32-shader: UAV -> SRV barriers made no shadow copies (%llu bytes)", (unsigned long long)(c1 - c0));
+    else CHECK(c1 - c0 == all && k1 - k0 == 1, "UAV -> SRV twice with no work between: every view refreshed once (%llu of %llu bytes, %llu skipped)",
+               (unsigned long long)(c1 - c0), (unsigned long long)all, (unsigned long long)(k1 - k0));
 }
 
 static void uav_cycle(void) {
@@ -432,7 +444,11 @@ static void dedupe_and_big(void) {
     uav_cycle(); uav_cycle();   /* one frame: shader writes, read, shader writes, read */
     if (!finish(1)) { CHECK(0, "case 10b submitted"); return; }
     b = stats2();
-    {
+    if (shader_mode) CHECK(b.copied == a.copied, "rgb32-shader: shader-write barriers made no shadow copies (%llu bytes)", (unsigned long long)(b.copied - a.copied));
+    else if (!b.big_exact && big_n && b.big_frames != 1) {
+        printf("        rgb32-big-frames = %lld in madeira.cfg: the once-a-frame checks need 1; not checked\n", (long long)(INT64)b.big_frames);
+        return;
+    } else {
         UINT64 want = 2 * small + ((b.big_exact || !big_n) ? 2 : 1) * g_whole_bytes;
         UINT64 want_skips = (b.big_exact || !big_n) ? 0 : 1;
         CHECK(b.copied - a.copied == want && b.big_skips - a.big_skips == want_skips,
@@ -444,13 +460,79 @@ static void dedupe_and_big(void) {
     uav_cycle();   /* the next frame */
     if (!finish(1)) { CHECK(0, "case 10c submitted"); return; }
     b = stats2();
-    CHECK(b.copied - a.copied == g_all_views && b.big_skips == a.big_skips,
-          "next frame: the big view refreshed again (%llu of %llu bytes copied)", (unsigned long long)(b.copied - a.copied), (unsigned long long)g_all_views);
+    if (shader_mode) CHECK(b.copied == a.copied && !b.live, "rgb32-shader: next frame, still no shadow copies and no shadows (%llu live)", (unsigned long long)b.live);
+    else CHECK(b.copied - a.copied == g_all_views && b.big_skips == a.big_skips,
+               "next frame: the big view refreshed again (%llu of %llu bytes copied)", (unsigned long long)(b.copied - a.copied), (unsigned long long)g_all_views);
     {
         struct expect Gw = { K_FLOAT, 5.0f, 13000 };   /* between case 9's copies at views 0 and 2 */
         read_view_at(K_FLOAT, S_WHOLE, 13000, 4096, 0);
         if (finish(1)) verify("whole view still right", 0, 4096, &Gw); else CHECK(0, "case 10d submitted");
     }
+}
+
+/* (x of flat float t of the B data, 0, 0, 1) */
+static void verify_r32(const char *what, UINT region, UINT n) {
+    const UINT *o = NULL; UINT t, bad = 0;
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&o);
+    if (!o) { CHECK(0, "%s: readback mapped", what); return; }
+    o += (SIZE_T)region * (OUT_REGION / 4);
+    for (t = 0; t < n; t++) {
+        UINT v[4] = { fbits(t / 3, t % 3, -7.0f), 0, 0, ONE_F };
+        if (memcmp(&o[4 * t], v, 16) && !bad++)
+            printf("        element %u: got (%#x %#x %#x %#x), expected (%#x 0 0 %#x)\n", t, o[4 * t], o[4 * t + 1], o[4 * t + 2], o[4 * t + 3], v[0], ONE_F);
+    }
+    ID3D12Resource_Unmap(rb, 0, NULL);
+    CHECK(!bad, "%s: %u elements (x, 0, 0, 1) (%u wrong)", what, n, bad);
+}
+static void verify_dims(const char *what, UINT region, UINT want) {
+    const UINT *o = NULL;
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&o);
+    if (!o) { CHECK(0, "%s: readback mapped", what); return; }
+    o += (SIZE_T)region * (OUT_REGION / 4);
+    CHECK(o[0] == want, "%s: GetDimensions %u (expected %u)", what, o[0], want);
+    ID3D12Resource_Unmap(rb, 0, NULL);
+}
+static void read_heap(UINT kind, UINT sel, UINT n, UINT region) {
+    const UINT c[4] = { n, sel, kind, 0 };
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs_heap);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pso_heap);
+    ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 4, c, 0);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 1, ID3D12Resource_GetGPUVirtualAddress(outbuf) + region * OUT_REGION);
+    ID3D12GraphicsCommandList_Dispatch(list, (n + 63) / 64, 1, 1);
+}
+static void r32_and_heap(void) {
+    struct expect B = { K_FLOAT, -7.0f, 0 };
+    D3D12_SHADER_RESOURCE_VIEW_DESC d; D3D12_CPU_DESCRIPTOR_HANDLE h;
+    printf("\n[11] a genuine R32_FLOAT view through the same read site; GetDimensions\n");
+    ZeroMemory(&d, sizeof d);
+    d.Format = DXGI_FORMAT_R32_FLOAT; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Buffer.FirstElement = 0; d.Buffer.NumElements = 3 * NF;
+    heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(heap, &h); h.ptr += (SIZE_T)S_R32 * inc;
+    ID3D12Device_CreateShaderResourceView(dev, fbuf, &d, h);
+    read_view(K_FLOAT, S_R32, 3000, 0);
+    read_view(K_FLOAT, S_F, NF, 1);
+    read_view(3, S_F, 1, 2);
+    read_view(3, S_R32, 1, 3);
+    read_view(3, S_FOFF, 1, 4);
+    if (finish(5)) {
+        verify_r32("R32_FLOAT view", 0, 3000);
+        verify("RGB32 view of the same buffer, same read site", 1, NF, &B);
+        verify_dims("RGB32 view", 2, NF); verify_dims("R32 view", 3, 3 * NF); verify_dims("RGB32 view at FirstElement 37", 4, NOFF);
+    } else CHECK(0, "case 11 submitted");
+
+    printf("\n[12] the same through SM 6.6 ResourceDescriptorHeap indexing\n");
+    if (!pso_heap) { CHECK(0, "SM 6.6 heap-indexing PSO created"); return; }
+    read_heap(0, S_R32, 3000, 0);
+    read_heap(0, S_F, NF, 1);
+    read_heap(1, S_F, 1, 2);
+    read_heap(1, S_R32, 1, 3);
+    if (finish(4)) {
+        verify_r32("heap-indexed R32_FLOAT view", 0, 3000);
+        verify("heap-indexed RGB32 view", 1, NF, &B);
+        verify_dims("heap-indexed RGB32 view", 2, NF); verify_dims("heap-indexed R32 view", 3, 3 * NF);
+    } else CHECK(0, "case 12 submitted");
 }
 
 static void cases(void) {
@@ -520,6 +602,12 @@ static void cases(void) {
     frames_in_flight();
     refresh_cost();
     dedupe_and_big();
+    r32_and_heap();
+    if (shader_mode) {
+        struct shadow_stats st = stats2();
+        CHECK(!st.live && !st.copied && !st.unsafe, "rgb32-shader: the whole run made no shadow and copied nothing (%llu live, %llu bytes; %llu views read in the shader)",
+              (unsigned long long)st.live, (unsigned long long)st.copied, (unsigned long long)st.shader_views);
+    }
 }
 
 int main(void) {
@@ -581,6 +669,28 @@ int main(void) {
         CHECK(SUCCEEDED(hr) && pso, "compute PSO created (%#lx)", hr);
     }
     if (!pso) goto done;
+    {   /* SM 6.6: constants + root UAV, heap directly indexed */
+        D3D12_ROOT_PARAMETER1 p[2]; D3D12_VERSIONED_ROOT_SIGNATURE_DESC v; ID3DBlob *blob = NULL, *err = NULL;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd;
+        ZeroMemory(p, sizeof p); ZeroMemory(&v, sizeof v); ZeroMemory(&cd, sizeof cd);
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 4;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1; v.Desc_1_1.NumParameters = 2; v.Desc_1_1.pParameters = p;
+        v.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED;
+        hr = p_serialize(&v, &blob, &err);
+        if (err) ID3D10Blob_Release(err);
+        if (SUCCEEDED(hr) && blob)
+            ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
+                                             &IID_ID3D12RootSignature, (void **)&rs_heap);
+        if (blob) ID3D10Blob_Release(blob);
+        if (rs_heap) {
+            cd.pRootSignature = rs_heap; cd.CS.pShaderBytecode = rgb_heap_dxil; cd.CS.BytecodeLength = sizeof rgb_heap_dxil;
+            ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso_heap);
+        }
+        CHECK(rs_heap && pso_heap, "SM 6.6 heap-indexing root signature and PSO created");
+    }
+    { struct shadow_stats st = stats2(); shader_mode = (int)st.rgb32_shader;
+      printf("        rgb32-shader = %d: RGB32 views are %s\n", shader_mode, shader_mode ? "read in the shader" : "served from shadows"); }
 
     fill_stage();
     /* every view but the late one exists before any data does */
@@ -596,6 +706,8 @@ int main(void) {
     cases();
 
 done:
+    if (pso_heap) ID3D12PipelineState_Release(pso_heap);
+    if (rs_heap) ID3D12RootSignature_Release(rs_heap);
     if (pso) ID3D12PipelineState_Release(pso);
     if (rs) ID3D12RootSignature_Release(rs);
     if (rb) ID3D12Resource_Release(rb);

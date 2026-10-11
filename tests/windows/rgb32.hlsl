@@ -24,6 +24,7 @@ void cs_main(uint t : SV_DispatchThreadID)
     uint4 v;
     if (kind == 0)      v = asuint(fa[sel][base + t]);
     else if (kind == 1) v = ua[sel][base + t];
-    else                v = asuint(ia[sel][base + t]);
+    else if (kind == 2) v = asuint(ia[sel][base + t]);
+    else { uint w; fa[sel].GetDimensions(w); v = uint4(w, 0, 0, 0); }   // kind 3: the view's element count
     o[t] = v;
 }
