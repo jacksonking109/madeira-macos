@@ -522,6 +522,16 @@ static NTSTATUS blit_t2b(void *args)
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS command_buffer_error_info(void *args)
+{
+    struct madeira_unix_pair_params *p = args;
+    MTLCommandBufferDescriptor *desc = [MTLCommandBufferDescriptor new];
+    desc.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    p->b = (obj_handle_t)[(id<MTLCommandQueue>)p->a commandBufferWithDescriptor:desc];
+    [desc release];
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_newPlacementHeap] = new_placement_heap,
     [madeira_unix_heapBufferSizeAndAlign] = heap_buffer_size_and_align,
@@ -538,6 +548,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_ctl] = ctl,
     [madeira_unix_ir_convert] = ir_convert,
     [madeira_unix_blitT2B] = blit_t2b,
+    [madeira_unix_commandBufferErrorInfo] = command_buffer_error_info,
 };
 
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == madeira_unix_count,

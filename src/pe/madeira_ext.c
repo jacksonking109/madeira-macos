@@ -111,6 +111,13 @@ void MadeiraIRConvert(struct madeira_ir_convert_args *args)
     CALL(ir_convert, args);
 }
 
+obj_handle_t madeira_cb_with_error_info(obj_handle_t queue)
+{
+    struct madeira_unix_pair_params p = { queue, 0 };
+    CALL(commandBufferErrorInfo, &p);
+    return p.b;
+}
+
 void madeira_blit_t2b(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_texture_to_buffer *cmd, uint32_t options)
 {
     struct madeira_unix_blit_params p = { encoder, P(cmd), options };

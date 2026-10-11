@@ -88,6 +88,9 @@ obj_handle_t MTLDevice_newGeometryEmulationPipelineState(obj_handle_t device, co
  * combined format), which DXMT v0.80's command encoding cannot express. */
 void madeira_blit_t2b(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_texture_to_buffer *cmd, uint32_t options);
 void MadeiraCtl(struct madeira_ctl_args *args);
+/* A command buffer whose error, on failure, lists each encoder's label and state
+ * (MTLCommandBufferErrorOptionEncoderExecutionStatus). Autoreleased, like winemetal's. */
+obj_handle_t madeira_cb_with_error_info(obj_handle_t queue);
 void MadeiraIRConvert(struct madeira_ir_convert_args *args);
 #endif
 
@@ -108,6 +111,7 @@ enum madeira_unix_func {
     madeira_unix_ctl,
     madeira_unix_ir_convert,
     madeira_unix_blitT2B,
+    madeira_unix_commandBufferErrorInfo,
     madeira_unix_count,
 };
 

@@ -5802,7 +5802,13 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             if (q->device->resset && InterlockedExchange(&q->device->resset_dirty, 0))
                 mad_resident_commit(q->device);
             mad_queue_revive(q->device);   /* ml1067 */
-            q->open_cb = MTLCommandQueue_commandBuffer(q->device->mtl_queue);
+            {   /* wine-lab port: madeira.cfg cb-error-info = 1 -- a failed command buffer names the encoder that
+                 * faulted or timed out (with encoder-labels = 1, by shader entry point) */
+                static int errinfo = -1;
+                if (errinfo < 0) errinfo = mad_cfg_int_pe("cb-error-info", 0) ? 1 : 0;
+                q->open_cb = errinfo ? madeira_cb_with_error_info(q->device->mtl_queue)
+                                     : MTLCommandQueue_commandBuffer(q->device->mtl_queue);
+            }
             if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
             /* commandBuffer returns an AUTORELEASED object locally and an interned
              * one remotely; holding it across calls means taking our own reference. */
@@ -5892,7 +5898,7 @@ done:
  * ever looked. Borrowed objects (error, description) are NOT released. */
 static void mad_cb_log_error(struct mad_device *d, obj_handle_t cb) {
     static LONG said;
-    char text[512] = "";
+    char text[4096] = "";   /* wine-lab port: room for cb-error-info's per-encoder list */
     obj_handle_t err, desc;
     LONG n = InterlockedIncrement(&said);
     err = MTLCommandBuffer_error(cb);
