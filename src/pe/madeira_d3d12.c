@@ -320,7 +320,7 @@ struct mad_device {
     unsigned ntheaps, theaps_cap;
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
     struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
-    struct { UINT32 value[12]; obj_handle_t buf; } fillpat[32]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 48-byte period: whole 4-, 8-, 12- and 16-byte elements) */
+    struct { UINT32 value[12]; obj_handle_t buf; } fillpat[1024]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 48-byte period: whole 4-, 8-, 12- and 16-byte elements) */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
@@ -5457,7 +5457,10 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
 }
 
-#define MAD_FILLPAT_BYTES (256u << 10)   /* ml1151: one exact UAV-clear pattern buffer */
+/* ml1151: one exact UAV-clear pattern buffer. wine-lab port: 12 KB (256 periods) instead of 256 KB, and 1024 of
+ * them instead of 32: TLOU Part I clears its ray-cast results to 0xDEAD0000 + n for n up to at least 0xc7 and checks
+ * the 0xDEAD guards, which the byte approximation past 32 values destroyed. Worst case 12 MB; longer clears loop. */
+#define MAD_FILLPAT_BYTES (12u << 10)
 #define MAD_FILLPAT_RUN (MAD_FILLPAT_BYTES / 48u * 48u)   /* wine-lab port: the longest copy from it that ends on a whole period */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
