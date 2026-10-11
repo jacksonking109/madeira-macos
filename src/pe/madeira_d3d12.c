@@ -2968,9 +2968,12 @@ struct mad_shadow {
 static LONG g_shadow_refresh, g_shadow_encoders, g_shadow_frames, g_shadow_live;
 /* wine-lab port: madeira.cfg rgb32-shader (default 1, read by d3d12.so as well):
  * RGB32 typed SRVs are read in the shader (MAD_DESC_RGB32) instead of from a
- * shadow. A converted pipeline with typed-buffer reads the rewrite could not
- * reach (ret_rgb32) makes every view created afterwards a shadow again. */
-static int g_rgb32_shader = -1; static volatile LONG g_rgb32_unsafe, g_rgb32_shader_views, g_rgb32_pipes;
+ * shadow. A converted pipeline with typed SRV reads the rewrite could not trace
+ * to a descriptor (ret_rgb32; typed UAV accesses never count, D3D12 has no RGB32
+ * UAVs) is logged and keeps the risk alone: such a read of an RGB32 view sees R32
+ * data. madeira.cfg rgb32-shader-strict = 1 instead makes every view created
+ * afterwards a shadow. */
+static int g_rgb32_shader = -1; static volatile LONG g_rgb32_unsafe, g_rgb32_shader_views, g_rgb32_pipes, g_rgb32_untraced_pipes;
 static int mad_rgb32_shader_on(void) {
     if (g_rgb32_shader < 0) {
         g_rgb32_shader = mad_cfg_int_pe("rgb32-shader", 1) ? 1 : 0;
@@ -11025,11 +11028,14 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         InterlockedIncrement(&g_rgb32_pipes);
         if (left) {
             static LONG said;
-            if (!g_rgb32_unsafe || InterlockedIncrement(&said) <= 8)
-                d3d12_log("[madeira-d3d12] rgb32-shader: %s '%s' has %u typed-buffer access(es) the rewrite could not reach (%s); "
-                          "RGB32 views made from now on use shadows, those made before read as R32 through it\n",
-                          tag, name, left, a.ret_note[0] ? a.ret_note : "no note");
-            InterlockedExchange(&g_rgb32_unsafe, 1);
+            static int strict = -1;
+            if (strict < 0) strict = mad_cfg_int_pe("rgb32-shader-strict", 0) ? 1 : 0;
+            InterlockedIncrement(&g_rgb32_untraced_pipes);
+            if (InterlockedIncrement(&said) <= 16)
+                d3d12_log("[madeira-d3d12] rgb32-shader: %s '%s' has %u typed SRV read(s)/width(s) the rewrite could not trace to a descriptor: "
+                          "an RGB32 view read through them reads R32 data%s\n", tag, name, left,
+                          strict ? "; rgb32-shader-strict = 1: RGB32 views made from now on use shadows" : " (this pipeline only; rgb32-shader-strict = 1 falls back to shadows)");
+            if (strict) InterlockedExchange(&g_rgb32_unsafe, 1);
         }
     }
     if (o && o->air) {   /* ml1008 */
@@ -14331,13 +14337,13 @@ __declspec(dllexport) void MadeiraD3D12LogProbe(const char *msg, unsigned repeat
  * big-view refreshes held to once a frame, live shadows and their bytes, the
  * rgb32-big-exact setting, the big-view threshold in bytes, rgb32-shader, RGB32
  * views made for the shader path, and whether a pipeline turned it off. */
-struct madeira_shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes, rgb32_shader, shader_views, unsafe, big_frames; };
+struct madeira_shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes, rgb32_shader, shader_views, unsafe, big_frames, untraced_pipes; };
 __declspec(dllexport) void MadeiraD3D12ShadowStats(struct madeira_shadow_stats *st) {
     if (!st) return;
     st->copied = (UINT64)g_shadow_sum_copied; st->viewed = (UINT64)g_shadow_sum_viewed; st->skips = (UINT64)g_shadow_sum_skips;
     st->big_skips = (UINT64)g_shadow_sum_big_skips; st->live = (UINT64)g_shadow_live; st->live_bytes = (UINT64)g_shadow_live_bytes;
     st->big_bytes = mad_shadow_big_bytes(); st->big_exact = (UINT64)g_big_exact;
-    st->rgb32_shader = (UINT64)mad_rgb32_shader_on(); st->shader_views = (UINT64)g_rgb32_shader_views; st->unsafe = (UINT64)g_rgb32_unsafe; st->big_frames = (UINT64)(INT64)g_big_frames;
+    st->rgb32_shader = (UINT64)mad_rgb32_shader_on(); st->shader_views = (UINT64)g_rgb32_shader_views; st->unsafe = (UINT64)g_rgb32_unsafe; st->untraced_pipes = (UINT64)g_rgb32_untraced_pipes; st->big_frames = (UINT64)(INT64)g_big_frames;
 }
 __declspec(dllexport) const char *MadeiraD3D12GetBuildMarker(void) {
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)

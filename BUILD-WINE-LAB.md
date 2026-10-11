@@ -60,9 +60,12 @@ memory with bit 62 set in the descriptor's metadata (bits MSC never reads). src/
 the converter's OUTPUT (AIR, LLVM 15, after MSC): every typed-buffer read whose texture is loaded from a descriptor's
 textureViewID field (argument buffer, descriptor table, or the SM 6.6 resource heap at 24 x n + 8) tests that bit and
 then loads x, y, z from the descriptor's gpuVA at element x 12 (w = 1 or 1.0f, 0 out of range); GetDimensions returns
-size / 12. The metallib is repacked (HASH = SHA-256 of the bitcode, MDSZ, header sizes, RLST offset). A pipeline with
-reads the rewrite cannot reach makes later views use RGBA32 shadow copies (logged); SM 5.x (DXBC) shaders reading such
-a view get a shadow made on first use. MAD_RGB32_VERSION (madeira_ir_unix.mm) keys the DXIL cache and must be bumped
+size / 12; a texture chosen through a phi or select of such fields is followed. Typed UAV accesses (a write, an
+atomic, a fence, or a read with read_write access on the texture) are left alone and never counted: D3D12 has no RGB32
+UAVs. The metallib is repacked (HASH = SHA-256 of the bitcode, MDSZ, header sizes, RLST offset). A pipeline with typed
+SRV reads the rewrite still cannot trace is logged and keeps that risk alone (such a read of an RGB32 view sees R32
+data); rgb32-shader-strict = 1 instead makes every view created afterwards an RGBA32 shadow copy. SM 5.x (DXBC)
+shaders reading such a view get a shadow made on first use. MAD_RGB32_VERSION (madeira_ir_unix.mm) keys the DXIL cache and must be bumped
 with every change to madeira_air_rewrite.cpp. rgb32-shader = 0 restores the shadows for every view (refresh rules:
 struct mad_shadow; rgb32-big-mb, rgb32-big-frames, rgb32-big-exact).
 
@@ -116,7 +119,7 @@ D3D12_OPTIONS9 claims them, which it no longer does by default; precompiled DXIL
 d3d12-loopwd-x64.exe (tests/windows/loopwd_test.c, 0 failures, 11 checks: a compute kernel with a counted loop and a
 data-dependent loop, bounds from a buffer, exact for normal bounds and stopped at the default cap for 1 << 24 passes;
 always finite, 0.5 s on an M3 Pro with the watchdog off; precompiled DXIL from loopwd.hlsl);
-d3d12-rgb32-x64.exe (tests/windows/rgb32_test.c, 0 failures, 42 checks (38 in shadow mode with rgb32-big-frames != 1): R32G32B32_FLOAT/_UINT/_SINT typed SRVs, which
+d3d12-rgb32-x64.exe (tests/windows/rgb32_test.c, 0 failures, 46 checks (44 with rgb32-shader = 0): R32G32B32_FLOAT/_UINT/_SINT typed SRVs, which
 Metal has no texture-buffer format for, read as Buffer<float4/uint4/int4> from unbounded descriptor arrays, bit-exact
 with w = 1: CopyBufferRegion + barrier (40000 elements), FirstElement 37, a second copy + barrier in the same list, a
 view made after the data, a copy with no barrier read in the next list, an UPLOAD source the CPU rewrites, and an UPLOAD
@@ -126,8 +129,8 @@ cover (MadeiraD3D12ShadowStats export), two UAV -> SRV barriers with no work bet
 view shares a UINT view's shadow; a big (>= rgb32-big-mb, default 4) view is refreshed once per frame after shader writes
 (every time with rgb32-big-exact = 1; rgb32-big-frames = 0, never, fails 3 checks by design); a genuine R32_FLOAT view
 through the same read site, GetDimensions of both kinds, and SM 6.6 ResourceDescriptorHeap indexing; with
-rgb32-shader = 1 (default) the run must make no shadow and copy nothing; precompiled DXIL from rgb32.hlsl and
-rgb32_heap.hlsl).
+rgb32-shader = 1 (default) the run must make no shadow and copy nothing; typed UAV writes, an atomic and a typed UAV
+load next to an RGB32 read in one kernel; precompiled DXIL from rgb32.hlsl, rgb32_heap.hlsl and rgb32_uav.hlsl).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.

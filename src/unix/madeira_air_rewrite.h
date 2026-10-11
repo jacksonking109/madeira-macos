@@ -26,8 +26,11 @@ extern "C" {
 struct madeira_air_rgb32_info {
     unsigned reads;       /* typed-buffer reads given the RGB32 path */
     unsigned widths;      /* GetDimensions given it */
-    unsigned unmatched;   /* typed-buffer reads or widths whose descriptor could not be found: they read
+    unsigned unmatched;   /* typed SRV reads or widths whose descriptor could not be found: they read
                              an RGB32 view as R32 data */
+    unsigned uav;         /* typed UAV accesses, left alone: D3D12 has no RGB32 UAVs */
+    unsigned traced;      /* of reads + widths: descriptor found through a phi or select */
+    char name[128];       /* the library's function */
     char note[160];
 };
 

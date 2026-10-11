@@ -28,6 +28,7 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -185,9 +186,75 @@ bool rewrite_width(CallInst *call, Value *A) {
     return true;
 }
 
+/* A typed UAV texture: some use of it is a write, an atomic, a fence, or a read
+ * with read_write access (the third argument of air.read_texture_buffer_1d is
+ * the access: 0 for an SRV). D3D12 has no RGB32 UAVs, so these are never an
+ * RGB32 view. */
+bool is_uav_texture(Value *t) {
+    for (User *u : t->users())
+        if (auto *ci = dyn_cast<CallInst>(u))
+            if (Function *f = ci->getCalledFunction()) {
+                StringRef n = f->getName();
+                if (!n.startswith("air.") || !n.contains("texture_buffer_1d")) continue;
+                if (n.startswith("air.write_") || n.contains("atomic") || n.startswith("air.fence_")) return true;
+                if (n.startswith(kRead) && ci->arg_size() >= 3)
+                    if (auto *acc = dyn_cast<ConstantInt>(ci->getArgOperand(2)))
+                        if (!acc->isZero()) return true;
+            }
+    return false;
+}
+
+/* The descriptor field pointer for texture t, also through phis and selects of
+ * textures that each have one (a phi or select of the field pointers is built
+ * next to the original). */
+Value *field_ptr(Value *t, DenseMap<Value *, Value *> &memo, bool &via) {
+    t = t->stripPointerCasts();
+    auto it = memo.find(t);
+    if (it != memo.end()) return it->second;
+    if (Value *A = desc_field1(t)) { memo[t] = A; return A; }
+    if (auto *phi = dyn_cast<PHINode>(t)) {
+        memo[t] = nullptr;   /* a cycle through itself resolves below */
+        SmallVector<Value *, 4> in;
+        Type *ty = nullptr;
+        for (Value *v : phi->incoming_values()) {
+            if (v == phi) { in.push_back(nullptr); continue; }
+            Value *A = field_ptr(v, memo, via);
+            if (!A) return nullptr;
+            if (!ty) ty = A->getType();
+            in.push_back(A);
+        }
+        if (!ty) return nullptr;
+        PHINode *np = PHINode::Create(ty, phi->getNumIncomingValues(), "rgb32.field", phi);
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++) {
+            Value *A = in[i] ? in[i] : np;
+            if (A->getType() != ty) {
+                IRBuilder<> b(phi->getIncomingBlock(i)->getTerminator());
+                A = b.CreateBitCast(A, ty);
+            }
+            np->addIncoming(A, phi->getIncomingBlock(i));
+        }
+        via = true;
+        memo[t] = np;
+        return np;
+    }
+    if (auto *sel = dyn_cast<SelectInst>(t)) {
+        Value *a = field_ptr(sel->getTrueValue(), memo, via), *b2 = field_ptr(sel->getFalseValue(), memo, via);
+        if (!a || !b2) return nullptr;
+        IRBuilder<> b(sel);
+        if (b2->getType() != a->getType()) b2 = b.CreateBitCast(b2, a->getType());
+        Value *r = b.CreateSelect(sel->getCondition(), a, b2, "rgb32.field");
+        via = true;
+        memo[t] = r;
+        return r;
+    }
+    return nullptr;
+}
+
 int rewrite_module(Module &m, madeira_air_rgb32_info *info) {
     std::vector<CallInst *> reads, widths;
-    for (Function &f : m)
+    DenseMap<Value *, Value *> memo;
+    for (Function &f : m) {
+        if (!f.isDeclaration() && !info->name[0]) snprintf(info->name, sizeof info->name, "%s", f.getName().str().c_str());
         for (BasicBlock &bb : f)
             for (Instruction &i : bb)
                 if (auto *ci = dyn_cast<CallInst>(&i))
@@ -196,15 +263,21 @@ int rewrite_module(Module &m, madeira_air_rgb32_info *info) {
                         if (n.startswith(kRead)) reads.push_back(ci);
                         else if (n == kWidth) widths.push_back(ci);
                     }
+    }
     int changed = 0;
     for (CallInst *ci : reads) {
-        Value *A = desc_field1(ci->getArgOperand(0));
-        if (A && rewrite_read(ci, A)) { info->reads++; changed = 1; }
+        auto *acc = ci->arg_size() >= 3 ? dyn_cast<ConstantInt>(ci->getArgOperand(2)) : nullptr;
+        if (!acc || !acc->isZero() || is_uav_texture(ci->getArgOperand(0))) { info->uav++; continue; }
+        bool via = false;
+        Value *A = field_ptr(ci->getArgOperand(0), memo, via);
+        if (A && rewrite_read(ci, A)) { info->reads++; info->traced += via; changed = 1; }
         else info->unmatched++;
     }
     for (CallInst *ci : widths) {
-        Value *A = desc_field1(ci->getArgOperand(0));
-        if (A && rewrite_width(ci, A)) { info->widths++; changed = 1; }
+        if (is_uav_texture(ci->getArgOperand(0))) { info->uav++; continue; }
+        bool via = false;
+        Value *A = field_ptr(ci->getArgOperand(0), memo, via);
+        if (A && rewrite_width(ci, A)) { info->widths++; info->traced += via; changed = 1; }
         else info->unmatched++;
     }
     return changed;
@@ -285,7 +358,7 @@ extern "C" int madeira_air_rgb32_rewrite(const void *lib, size_t len, void **out
     auto mod = parseBitcodeFile(MemoryBufferRef(StringRef((const char *)bc, bclen), "air"), ctx);
     if (!mod) { std::string e = toString(mod.takeError()); FAIL("bitcode: %s", e.c_str()); }
     if (!rewrite_module(**mod, info)) {
-        if (info->unmatched) snprintf(info->note, sizeof info->note, "%u typed-buffer accesses without a descriptor field", info->unmatched);
+        if (info->unmatched) snprintf(info->note, sizeof info->note, "%u typed SRV accesses without a descriptor field", info->unmatched);
         return info->unmatched ? -1 : 0;
     }
     SmallVector<char, 0> nbc;
@@ -306,7 +379,7 @@ extern "C" int madeira_air_rgb32_rewrite(const void *lib, size_t len, void **out
     CC_SHA256(nbc.data(), (CC_LONG)nbc.size(), o + hash_at);
     for (size_t at : moved) { uint64_t off; memcpy(&off, o + at, 8); off += delta; memcpy(o + at, &off, 8); }
     *out = o; *out_len = nlen;
-    if (info->unmatched) snprintf(info->note, sizeof info->note, "%u typed-buffer accesses without a descriptor field", info->unmatched);
+    if (info->unmatched) snprintf(info->note, sizeof info->note, "%u typed SRV accesses without a descriptor field", info->unmatched);
     return 1;
 #undef FAIL
 }
