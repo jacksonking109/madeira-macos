@@ -2727,6 +2727,27 @@ static unsigned g_said_attachless;
  * so Instruments' Metal System Trace attributes GPU time per pass. Off by
  * default: one NSString per encoder is not free. */
 static int g_enc_labels = -1;
+/* wine-lab port: madeira.cfg flight-recorder = 1 keeps the last 1024 dispatches and render passes with
+ * their command buffer; when the GPU STALL watchdog fires it prints the ones in the stuck command buffer
+ * (a GPU hang that freezes the whole Mac never reaches a command-buffer error). */
+static int g_flight = -1;
+static struct { obj_handle_t cb; char what[96]; } g_flight_ring[1024];
+static LONG g_flight_pos;
+static void mad_flight(obj_handle_t cb, const char *fmt, ...) {
+    va_list ap; LONG i;
+    if (g_flight < 0) g_flight = mad_cfg_int_pe("flight-recorder", 0) ? 1 : 0;
+    if (!g_flight) return;
+    i = (InterlockedIncrement(&g_flight_pos) - 1) & 1023;
+    g_flight_ring[i].cb = cb;
+    va_start(ap, fmt); vsnprintf(g_flight_ring[i].what, sizeof g_flight_ring[i].what, fmt, ap); va_end(ap);
+}
+static void mad_flight_dump(obj_handle_t cb) {
+    LONG end = g_flight_pos, i, n = 0;
+    for (i = end > 1024 ? end - 1024 : 0; i < end; i++)
+        if (g_flight_ring[i & 1023].cb == cb && n++ < 64)
+            d3d12_log("[madeira-d3d12] flight-recorder: stuck command buffer ran %s\n", g_flight_ring[i & 1023].what);
+    d3d12_log("[madeira-d3d12] flight-recorder: %ld recorded entries in the stuck command buffer\n", n);
+}
 static void mad_label(obj_handle_t enc, const char *fmt, ...) {
     char s[128]; va_list ap; obj_handle_t str;
     if (g_enc_labels < 0) g_enc_labels = mad_cfg_int_pe("encoder-labels", 0) ? 1 : 0;
@@ -2832,6 +2853,7 @@ static int exec_begin_render_impl(struct mad_exec *e) {
     if (g_perf_replay > 0) { g_pr_x[0] += PR_NOW() - px0; g_pr_x[1]++; }
     memset(&e->sh, 0, sizeof e->sh);   /* wine-lab port: a new encoder knows nothing */
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
+    if (g_flight) mad_flight(e->cb, "render pass R#%u %ux%u (first draw %s|%s)", e->renc_seq, w, h, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-");
     e->f6_natt = 0;   /* ml1134: what this pass writes, for the same-attachment ordering rule */
     for (i = 0; i < e->nrt && e->f6_natt < 8; i++) if (e->rt[i]) e->f6_att[e->f6_natt++] = e->rt[i];
     if (e->depth) e->f6_att[e->f6_natt++] = e->depth;
@@ -5499,6 +5521,10 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     tail->next.ptr = NULL;
 #undef MAD_APPEND
     MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&c_pso);
+    if (g_flight) {
+        if (c->kind == MC_DISPATCH_INDIRECT) mad_flight(e->cb, "dispatch %s (indirect)", e->cpso ? e->cpso->vs_name : "?");
+        else mad_flight(e->cb, "dispatch %s (%ux%ux%u)", e->cpso ? e->cpso->vs_name : "?", c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z);
+    }
     mad_use_commit(e);
     e->draws++;
     if (e->ncap_after_buf) {   /* ml922 */
@@ -6193,6 +6219,9 @@ static DWORD WINAPI mad_fence_worker(void *arg) {
             if (stalled_ms == 5000 || (stalled_ms % 60000) == 0) {
                 char line[300]; int n = 0;
                 for (k = 0; k < job.ncbs; k++) n += snprintf(line + n, sizeof line - n, " %u", (unsigned)MTLCommandBuffer_status(job.cbs[k]));
+                if (stalled_ms == 5000 && g_flight > 0)   /* wine-lab port */
+                    for (k = 0; k < job.ncbs; k++)
+                        if (MTLCommandBuffer_status(job.cbs[k]) < 4) mad_flight_dump(job.cbs[k]);
                 d3d12_log("[madeira-d3d12] ml1061 GPU STALL: serial %llu not reached after %u ms (event at %llu, committed %lld); "
                           "command-buffer status of this batch:%s (2=committed 3=scheduled 4=completed 5=error)\n",
                           (unsigned long long)job.serial, stalled_ms, (unsigned long long)mad_gpu_completed(d),
