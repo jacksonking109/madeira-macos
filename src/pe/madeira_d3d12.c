@@ -14787,6 +14787,13 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             static LONG64 at = -2;
             if (at == -2) at = mad_cfg_int_pe("capture-at", -1);
             if (at >= 0 && (LONG64)s->presents == at) { g_capture_left++; d3d12_log("[capture] capture-at: frame requested at present #%llu\n", (unsigned long long)s->presents); }
+            /* wine-lab port: capture on demand -- create C:\madeira-capture-now (on the Mac:
+             * touch <prefix>/drive_c/madeira-capture-now); checked every 15 presents, deleted when taken */
+            if ((s->presents % 15) == 0 && GetFileAttributesW(L"C:\\madeira-capture-now") != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileW(L"C:\\madeira-capture-now");
+                g_capture_left++;
+                d3d12_log("[capture] trigger file: frame requested at present #%llu\n", (unsigned long long)s->presents);
+            }
         }
         {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
             int want;
