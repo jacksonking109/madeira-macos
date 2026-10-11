@@ -178,7 +178,8 @@ struct madeira_ir_convert_args {
     uint32_t ret_stage;         /* out: IRShaderStage the converter reported */
     uint32_t ret_status;        /* out: madeira_ir_status */
     uint32_t ret_error_code;    /* out: the converter's own code, when it gave one */
-    uint32_t reserved;
+    uint32_t ret_rgb32;         /* out: wine-lab port: RGB32 typed-buffer rewrite (madeira_air_rewrite.h):
+                                   bits 0-15 accesses rewritten, 16-31 accesses it could not rewrite */
     /* ml859: vertex-stage inputs from reflection, so a pipeline can map the
      * application's input layout onto the attribute indices the converted
      * vertex shader actually reads. Ignored for other stages. */

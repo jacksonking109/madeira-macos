@@ -91,6 +91,7 @@ struct mad_dxc_env {
     uint32_t loop_watchdog;     /* wine-lab port: the loop watchdog's version when it guards this
                                    shader's loops, else 0 */
     uint32_t loop_cap;          /* its cap; only keyed with loop_watchdog */
+    uint32_t rgb32;             /* wine-lab port: the RGB32 typed-buffer AIR rewrite's version when on, else 0 */
 };
 
 static inline void mad_dxc_key(const struct madeira_ir_convert_args *a,
@@ -115,6 +116,7 @@ static inline void mad_dxc_key(const struct madeira_ir_convert_args *a,
     if (env->loop_watchdog) {
         mad_dxc_hadd(&s, "lwd", 3); mad_dxc_hu32(&s, env->loop_watchdog); mad_dxc_hu32(&s, env->loop_cap);
     }
+    if (env->rgb32) { mad_dxc_hadd(&s, "rgb", 3); mad_dxc_hu32(&s, env->rgb32); }
 
     mad_dxc_hu64(&s, a->dxil_len);
     if (a->dxil && a->dxil_len) mad_dxc_hadd(&s, (const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
@@ -200,7 +202,7 @@ struct mad_dxc_header {
     uint64_t lib_len, lib2_len;
     uint32_t stage, nlocs, nvsin, vs_input_count;
     uint32_t tg[3], vs_output_size;
-    uint32_t gs_max_prims, gs_payload, gs_passthrough, reserved;
+    uint32_t gs_max_prims, gs_payload, gs_passthrough, rgb32;   /* rgb32: ret_rgb32 */
     char entry[MADEIRA_IR_ENTRY_MAX];
     char note[128];
     uint32_t hs[8], ds[4];   /* ret_hs_* / ret_ds_* in madeira_ir_abi.h order */
@@ -213,7 +215,7 @@ struct mad_dxc_parts {
     const struct madeira_ir_loc *locs; uint32_t nlocs;
     const struct madeira_ir_vs_input *vsin; uint32_t nvsin;
     uint32_t vs_input_count;
-    uint32_t tg[3], vs_output_size, gs_max_prims, gs_payload, gs_passthrough;
+    uint32_t tg[3], vs_output_size, gs_max_prims, gs_payload, gs_passthrough, rgb32;
     uint32_t hs[8], ds[4];
     const void *lib; uint64_t lib_len;
     const void *lib2; uint64_t lib2_len;
@@ -239,7 +241,7 @@ static inline void *mad_dxc_blob_build(uint64_t key, uint64_t check,
     h.stage = p->stage; h.nlocs = p->nlocs; h.nvsin = p->nvsin; h.vs_input_count = p->vs_input_count;
     h.tg[0] = p->tg[0]; h.tg[1] = p->tg[1]; h.tg[2] = p->tg[2];
     h.vs_output_size = p->vs_output_size;
-    h.gs_max_prims = p->gs_max_prims; h.gs_payload = p->gs_payload; h.gs_passthrough = p->gs_passthrough;
+    h.gs_max_prims = p->gs_max_prims; h.gs_payload = p->gs_payload; h.gs_passthrough = p->gs_passthrough; h.rgb32 = p->rgb32;
     memcpy(h.hs, p->hs, sizeof h.hs); memcpy(h.ds, p->ds, sizeof h.ds);
     snprintf(h.entry, sizeof h.entry, "%s", p->entry ? p->entry : "");
     snprintf(h.note, sizeof h.note, "%s", p->note ? p->note : "");
@@ -316,6 +318,7 @@ static inline int mad_dxc_deliver(const void *blob, struct madeira_ir_convert_ar
     a->ret_gs_max_prims = h.gs_max_prims;
     a->ret_gs_payload = h.gs_payload;
     a->ret_gs_passthrough = h.gs_passthrough;
+    a->ret_rgb32 = h.rgb32;
     a->ret_hs_patches_per_tg = h.hs[0]; a->ret_hs_threads_per_patch = h.hs[1];
     a->ret_hs_input_cps = h.hs[2]; a->ret_hs_output_cps = h.hs[3];
     a->ret_hs_output_cp_size = h.hs[4]; a->ret_hs_patch_const_size = h.hs[5];

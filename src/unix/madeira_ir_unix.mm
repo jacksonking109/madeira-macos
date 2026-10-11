@@ -395,6 +395,8 @@ extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_
                                    char *note, size_t note_cap);
 /* wine-lab port: madeira_dxil_rewrite.cpp (LLVM 15 as well). */
 #include "madeira_dxil_rewrite.h"
+/* wine-lab port: madeira_air_rewrite.cpp, on the converter's output. */
+#include "madeira_air_rewrite.h"
 
 #ifndef MADEIRA_NO_AIRCONV
 extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
@@ -1487,6 +1489,24 @@ static uint32_t mad_loop_watchdog_cap(int kind)
     return 0;
 }
 
+/* wine-lab port: madeira.cfg rgb32-shader (default 1): typed-buffer reads in
+ * converted shaders serve R32G32B32 views from their own memory
+ * (madeira_air_rewrite.h); the runtime binds those views accordingly when the
+ * same key says so. MAD_RGB32_VERSION goes into every DXIL cache key while it is
+ * on; bump it when the rewrite's output changes. */
+#define MAD_RGB32_VERSION 2u   /* bump with every change to madeira_air_rewrite.cpp (not part of the build stamp) */
+static unsigned g_rgb32_said;
+static int mad_rgb32_shader_enabled(void)
+{
+    static int on = -1;
+#ifdef MADEIRA_NO_AIRCONV
+    on = 0;   /* no LLVM in this build */
+#else
+    if (on < 0) on = madeira_cfg_int("rgb32-shader", 1) ? 1 : 0;
+#endif
+    return on;
+}
+
 /* 1 the first time a shader (by content hash) is reported, so a shader
  * converted for several root signatures logs once. */
 static int mad_rewrite_first_report(uint64_t h)
@@ -1571,6 +1591,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     a->ret_len = 0;
     a->ret_stage = 0;
     a->ret_error_code = 0;
+    a->ret_rgb32 = 0;
     if (a->out_entry) *(char *)(uintptr_t)a->out_entry = '\0';
 
     a->ret_backend = MADEIRA_IR_BACKEND_MSC;
@@ -1637,6 +1658,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     IRVersionedRootSignatureDescriptor desc;
     /* ml1990: the finished conversion, gathered before it is handed over. */
     uint8_t *lib_bytes = NULL, *lib2_bytes = NULL;
+    uint32_t rgb32_word = 0;   /* wine-lab port: ret_rgb32 */
     struct madeira_ir_loc *all_locs = NULL;
     struct madeira_ir_vs_input *all_vsin = NULL;
     uint32_t n_locs = 0, n_vsin = 0, vs_count = 0, vs_out_size = 0;
@@ -1672,6 +1694,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         env.atomic64 = a64 ? MAD_A64_VERSION : 0;
         env.loop_watchdog = lwd_cap ? MAD_LWD_VERSION : 0;
         env.loop_cap = lwd_cap;
+        env.rgb32 = mad_rgb32_shader_enabled() ? MAD_RGB32_VERSION : 0;
         mad_dxc_key(a, &env, &dxc_key, &dxc_check);
         if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
         if (!hit && dxc_disk) {
@@ -1929,6 +1952,22 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     if (!lib_bytes) { status = MADEIRA_IR_NO_MEMORY; goto done; }
     need = g_ir.IRMetalLibGetBytecode(lib, lib_bytes);
     if (!need) { status = MADEIRA_IR_NO_METALLIB; goto done; }
+    if (mad_rgb32_shader_enabled()) {   /* wine-lab port: RGB32 typed buffers read in the shader */
+        struct madeira_air_rgb32_info ri;
+        void *nb = NULL; size_t nl = 0;
+#ifdef MADEIRA_NO_AIRCONV
+        int rc = 0; memset(&ri, 0, sizeof ri);
+#else
+        int rc = madeira_air_rgb32_rewrite(lib_bytes, need, &nb, &nl, &ri);
+#endif
+        if (rc > 0) { free(lib_bytes); lib_bytes = (uint8_t *)nb; need = nl; a->ret_len = need; }
+        rgb32_word = (uint32_t)(ri.reads + ri.widths > 0xffff ? 0xffff : ri.reads + ri.widths) |
+                     ((uint32_t)(ri.unmatched > 0xffff ? 0xffff : ri.unmatched) << 16);
+        if (rc != 0 && (ri.unmatched || g_rgb32_said++ < 8))
+            fprintf(stderr, "[madeira-ir] rgb32-shader: %s: %u typed-buffer reads and %u widths rewritten, %u left%s%s\n",
+                    a->entry_point ? (const char *)(uintptr_t)a->entry_point : "?", ri.reads, ri.widths, ri.unmatched,
+                    ri.note[0] ? ": " : "", ri.note);
+    }
 
     /* The converter RENAMES entry points, so the name to give Metal comes from
      * reflection rather than from what D3D called it.
@@ -2084,6 +2123,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         parts.gs_max_prims = gs_max; parts.gs_payload = gs_payload; parts.gs_passthrough = gs_pt;
         memcpy(parts.hs, hs, sizeof parts.hs); memcpy(parts.ds, ds, sizeof parts.ds);
         parts.lib = lib_bytes; parts.lib_len = need;
+        parts.rgb32 = rgb32_word;
         parts.lib2 = lib2_bytes; parts.lib2_len = lib2_len;
         dxc_blob = mad_dxc_blob_build(dxc_key, dxc_check, &parts, &dxc_len);
     }

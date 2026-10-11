@@ -25,6 +25,8 @@ uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1 constant-bu
         -c src/unix/madeira_sm5_ia.cpp -o out/madeira_sm5_ia.o $D $IA
     clang++ -arch x86_64 -O2 -fPIC -std=c++17 -fno-rtti -c src/unix/madeira_dxil_rewrite.cpp -o out/madeira_dxil_rewrite.o \
         -I$LL/include
+    clang++ -arch x86_64 -O2 -fPIC -std=c++17 -fno-rtti -c src/unix/madeira_air_rewrite.cpp -o out/madeira_air_rewrite.o \
+        -I$LL/include
     # LLVM components: llvm_deps in dxmt-src/src/airconv/meson.build
     LLVM_LIBS=(Passes Target ObjCARCOpts Coroutines ipo Instrumentation Vectorize Linker IRReader AsmParser
         FrontendOpenMP ScalarOpts InstCombine AggressiveInstCombine TransformUtils BitWriter Analysis ProfileData
@@ -36,12 +38,14 @@ uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1 constant-bu
     EXP=(-Wl,-exported_symbol,___wine_unix_call_funcs -Wl,-exported_symbol,_madeira_ir_convert
         -Wl,-exported_symbol,_madeira_ir_convert_impl -Wl,-exported_symbol,_madeira_ags_rewrite)
     clang++ -arch x86_64 -dynamiclib -o out/d3d12.so out/d3d12_unix.o out/madeira_ir_unix.o out/madeira_sm5_ia.o \
-        out/madeira_dxil_rewrite.o $AIRCONV $EXP -Wl,-install_name,@rpath/d3d12.so -framework Foundation -framework Metal
+        out/madeira_dxil_rewrite.o out/madeira_air_rewrite.o $AIRCONV $EXP -Wl,-install_name,@rpath/d3d12.so \
+        -framework Foundation -framework Metal
 
 (zsh: the flag lists are arrays; `${^LLVM_LIBS}` expands one path per component. LLVM's static libraries are full
 paths on purpose: `-L$LL/lib` would also make the linker pick LLVM's own libc++.dylib.) To build without LLVM, add
--DMADEIRA_NO_AIRCONV to D, drop madeira_sm5_ia.o, madeira_dxil_rewrite.o, $AIRCONV and $EXP; DXBC shaders are then
-refused, and so are DXIL 64-bit atomics whose old value is read; loops are not guarded.
+-DMADEIRA_NO_AIRCONV to D, drop madeira_sm5_ia.o, madeira_dxil_rewrite.o, madeira_air_rewrite.o, $AIRCONV and $EXP; DXBC
+shaders are then refused, and so are DXIL 64-bit atomics whose old value is read; loops are not guarded; RGB32 typed
+buffers fall back to shadow copies.
 
 64-bit atomics whose old value is read: the converter refuses them (code 7); madeira_dxil_rewrite.cpp reads the old value
 with a plain load (and a device memory fence for textures and typed buffers) before the atomic, whose result is then
@@ -49,6 +53,18 @@ unused. Not atomic with the update: an invocation between the load and the atomi
 dxil-atomic64-emulation = 0 turns it off. Its output is keyed in the DXIL cache by MAD_A64_VERSION (madeira_ir_unix.mm),
 which a change to madeira_dxil_rewrite.cpp must bump (that file is not part of the build stamp). Host test, the three saved
 TLOU Part I shaders included: see the header of tests/native/atomic64_rewrite_test.cpp.
+
+RGB32 typed buffers (madeira.cfg rgb32-shader, default 1): Metal has no 3-channel 32-bit texture-buffer format. A
+typed SRV of R32G32B32_{FLOAT,UINT,SINT,TYPELESS} is bound as an R32 texture buffer of 3 x NumElements over the same
+memory with bit 62 set in the descriptor's metadata (bits MSC never reads). src/unix/madeira_air_rewrite.cpp rewrites
+the converter's OUTPUT (AIR, LLVM 15, after MSC): every typed-buffer read whose texture is loaded from a descriptor's
+textureViewID field (argument buffer, descriptor table, or the SM 6.6 resource heap at 24 x n + 8) tests that bit and
+then loads x, y, z from the descriptor's gpuVA at element x 12 (w = 1 or 1.0f, 0 out of range); GetDimensions returns
+size / 12. The metallib is repacked (HASH = SHA-256 of the bitcode, MDSZ, header sizes, RLST offset). A pipeline with
+reads the rewrite cannot reach makes later views use RGBA32 shadow copies (logged); SM 5.x (DXBC) shaders reading such
+a view get a shadow made on first use. MAD_RGB32_VERSION (madeira_ir_unix.mm) keys the DXIL cache and must be bumped
+with every change to madeira_air_rewrite.cpp. rgb32-shader = 0 restores the shadows for every view (refresh rules:
+struct mad_shadow; rgb32-big-mb, rgb32-big-frames, rgb32-big-exact).
 
 Loop watchdog: Metal never times out a command buffer, so a compute kernel stuck in a loop holds the GPU until the
 WindowServer watchdog reboots the Mac (TLOU Part I's CS_ComputeVolProbeBufferWriteCache BVH walk). Every natural loop of
@@ -100,7 +116,7 @@ D3D12_OPTIONS9 claims them, which it no longer does by default; precompiled DXIL
 d3d12-loopwd-x64.exe (tests/windows/loopwd_test.c, 0 failures, 11 checks: a compute kernel with a counted loop and a
 data-dependent loop, bounds from a buffer, exact for normal bounds and stopped at the default cap for 1 << 24 passes;
 always finite, 0.5 s on an M3 Pro with the watchdog off; precompiled DXIL from loopwd.hlsl);
-d3d12-rgb32-x64.exe (tests/windows/rgb32_test.c, 0 failures, 31 checks: R32G32B32_FLOAT/_UINT/_SINT typed SRVs, which
+d3d12-rgb32-x64.exe (tests/windows/rgb32_test.c, 0 failures, 42 checks (38 in shadow mode with rgb32-big-frames != 1): R32G32B32_FLOAT/_UINT/_SINT typed SRVs, which
 Metal has no texture-buffer format for, read as Buffer<float4/uint4/int4> from unbounded descriptor arrays, bit-exact
 with w = 1: CopyBufferRegion + barrier (40000 elements), FirstElement 37, a second copy + barrier in the same list, a
 view made after the data, a copy with no barrier read in the next list, an UPLOAD source the CPU rewrites, and an UPLOAD
@@ -108,8 +124,10 @@ ring of 3 per-frame slots rewritten every frame with 3 frames in flight, read th
 view; refresh cost: 40 small copies into a 12 MB buffer with 81 views copy exactly the bytes they wrote that views
 cover (MadeiraD3D12ShadowStats export), two UAV -> SRV barriers with no work between refresh every view once; a SINT
 view shares a UINT view's shadow; a big (>= rgb32-big-mb, default 4) view is refreshed once per frame after shader writes
-(every time with rgb32-big-exact = 1; rgb32-big-frames = 0, never, fails 3 checks by design); served
-from RGBA32 shadow buffers, see struct mad_shadow; precompiled DXIL from rgb32.hlsl).
+(every time with rgb32-big-exact = 1; rgb32-big-frames = 0, never, fails 3 checks by design); a genuine R32_FLOAT view
+through the same read site, GetDimensions of both kinds, and SM 6.6 ResourceDescriptorHeap indexing; with
+rgb32-shader = 1 (default) the run must make no shadow and copy nothing; precompiled DXIL from rgb32.hlsl and
+rgb32_heap.hlsl).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
