@@ -320,7 +320,7 @@ struct mad_device {
     unsigned ntheaps, theaps_cap;
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
     struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
-    struct { UINT32 value[12]; obj_handle_t buf; } fillpat[1024]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 48-byte period: whole 4-, 8-, 12- and 16-byte elements) */
+    struct { UINT32 value[12]; obj_handle_t buf; } fillpat[64]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 48-byte period: whole 4-, 8-, 12- and 16-byte elements) */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
 };
 static LONG g_tview_live, g_tview_made, g_xview_live;   /* ml1126 */
@@ -1265,7 +1265,7 @@ struct mad_cmd {
         struct { struct mad_resource *dst, *src; UINT dlevel, dslice, slevel, sslice; UINT w, h, d; UINT dx, dy, dz, sx, sy, sz; UINT dplane, splane; } tt;
         struct { UINT x, y, z; } dispatch;
         struct { struct mad_resource *args; UINT64 off; UINT count; UINT stride; struct mad_resource *cnt; UINT64 cnt_off; } ind;
-        struct { struct mad_resource *res; UINT64 off, len; UINT8 byte; obj_handle_t pattern; } fill;   /* ml1151: pattern = exact 32-bit source */
+        struct { struct mad_resource *res; UINT64 off, len; UINT8 byte, ring; obj_handle_t pattern; UINT32 pat[12]; } fill;   /* ml1151: pattern = exact 32-bit source; wine-lab port: ring = pat[] goes through the list ring at replay */
         struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
         struct { float rgba[4]; } blend;
         struct { struct mad_resource *res; UINT8 unk; } shadow;   /* MC_SHADOW; unk = left a write state other than COPY_DEST */
@@ -5457,9 +5457,10 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
 }
 
-/* ml1151: one exact UAV-clear pattern buffer. wine-lab port: 12 KB (256 periods) instead of 256 KB, and 1024 of
- * them instead of 32: TLOU Part I clears its ray-cast results to 0xDEAD0000 + n for n up to at least 0xc7 and checks
- * the 0xDEAD guards, which the byte approximation past 32 values destroyed. Worst case 12 MB; longer clears loop. */
+/* ml1151: one exact UAV-clear pattern buffer. wine-lab port: 12 KB (256 periods), 64 of them for the values a title
+ * repeats; past those a clear's pattern is written into the list's ring at replay (exec_copy) instead of being
+ * approximated by its low byte. TLOU Part I clears its ray-cast results to 0xDEAD0000 + n with n growing without
+ * bound (0xb01 a few minutes in) and validates the 0xDEAD guards. */
 #define MAD_FILLPAT_BYTES (12u << 10)
 #define MAD_FILLPAT_RUN (MAD_FILLPAT_BYTES / 48u * 48u)   /* wine-lab port: the longest copy from it that ends on a whole period */
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
@@ -5474,6 +5475,20 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_FILL_BB: {
         struct wmtcmd_blit_fillbuffer k;
         if (!c->u.fill.res->buffer) { MAD_SKIP(e); return; }
+        if (c->u.fill.ring) {   /* wine-lab port: a slice of the list ring holding the pattern, copied period by period */
+            struct wmtcmd_blit_copy_from_buffer_to_buffer cp; obj_handle_t rb; UINT64 roff, rgpu, o; void *cpu; UINT32 *w; unsigned j;
+            if (!exec_ring_take_z(e, MAD_FILLPAT_BYTES, 0, &rb, &roff, &cpu, &rgpu)) { MAD_SKIP(e); return; }
+            w = cpu; for (j = 0; j < MAD_FILLPAT_BYTES / 4; j++) w[j] = c->u.fill.pat[j % 12];
+            for (o = 0; o < c->u.fill.len; o += MAD_FILLPAT_RUN) {
+                memset(&cp, 0, sizeof cp);
+                cp.type = WMTBlitCommandCopyFromBufferToBuffer;
+                cp.src = rb; cp.src_offset = roff;
+                cp.dst = c->u.fill.res->buffer; cp.dst_offset = c->u.fill.off + o;
+                cp.copy_length = c->u.fill.len - o < MAD_FILLPAT_RUN ? c->u.fill.len - o : MAD_FILLPAT_RUN;
+                MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&cp);
+            }
+            return;
+        }
         if (c->u.fill.pattern) {   /* ml1151: a value whose bytes differ, copied from its pattern buffer */
             struct wmtcmd_blit_copy_from_buffer_to_buffer cp; UINT64 o;
             for (o = 0; o < c->u.fill.len; o += MAD_FILLPAT_RUN) {   /* each copy restarts the pattern: whole periods only */
@@ -12785,7 +12800,7 @@ static int mad_record_typed_buffer_clear(struct mad_list *l, struct mad_cmd *c, 
     for (i = 1; i < 48 && pat[i] == pat[0]; i++) ;
     c->u.fill.byte = pat[0];
     c->u.fill.pattern = i == 48 ? 0 : mad_fill_pattern48(l->device, w);
-    if (i < 48 && !c->u.fill.pattern) return 0;
+    if (i < 48 && !c->u.fill.pattern) { c->u.fill.ring = 1; memcpy(c->u.fill.pat, w, 48); }   /* wine-lab port */
     if (said++ < 16)
         d3d12_log("[madeira-d3d12] %s on a typed buffer view, format %u (%u-byte elements), values %#x %#x %#x %#x: "
                   "resource '%s' range +%llu len %llu\n", what, (unsigned)fmt, bpp, v[0], v[1], v[2], v[3],
@@ -12822,17 +12837,20 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
     if (typed != DXGI_FORMAT_UNKNOWN && mad_record_typed_buffer_clear(l, c, typed, v, is_float, what)) return;
     {   /* raw and structured views (and typed ones not packed): Values[0] in every dword */
         UINT32 x = v ? v[0] : 0; UINT8 b = (UINT8)(x & 0xff);
-        c->u.fill.byte = b; c->u.fill.pattern = 0;
+        c->u.fill.byte = b; c->u.fill.pattern = 0; c->u.fill.ring = 0;
         if (!(((x >> 8) & 0xff) == b && ((x >> 16) & 0xff) == b && ((x >> 24) & 0xff) == b))
         {
             static unsigned said_pat;
             c->u.fill.pattern = mad_fill_pattern(l->device, x);   /* ml1151 */
+            if (!c->u.fill.pattern) {   /* wine-lab port: cache full -- exact through the ring at replay */
+                unsigned j; c->u.fill.ring = 1; for (j = 0; j < 12; j++) c->u.fill.pat[j] = x;
+            }
             if (c->u.fill.pattern && said_pat++ < 16)
                 d3d12_log("[madeira-d3d12] ml1151 %s value %#x exact: resource '%s' %llu bytes, range +%llu len %llu (gpu 0x%llx)\n",
                           what, x, r->name ? r->name : "?", (unsigned long long)r->size, (unsigned long long)off,
                           (unsigned long long)len, (unsigned long long)r->gpu_address);
             else if (!c->u.fill.pattern && said_approx++ < 4)
-                d3d12_log("[madeira-d3d12] %s with value %#x is approximated by byte %#x (no pattern buffer)\n", what, x, b);
+                d3d12_log("[madeira-d3d12] %s with value %#x: pattern cache full, written exactly through the ring\n", what, x);
         }
         /* wine-lab port: Values[1..3] differing from Values[0] mean nothing for a
          * raw or structured view; for a typed one whose format was not recorded

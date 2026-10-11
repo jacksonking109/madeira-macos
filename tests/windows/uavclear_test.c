@@ -369,6 +369,17 @@ int main(void) {
         buffer_case("R32_UINT whole buffer, Uint (4, 1, 1, 1)", b_args, DXGI_FORMAT_R32_UINT, FALSE, 0, BUF_DWORDS, FALSE, r32, want);
         expect(want, 0, BUF_DWORDS, p_raw, 1);
         buffer_case("raw view whole buffer, Uint (9, 1, 2, 3)", b_args, DXGI_FORMAT_R32_TYPELESS, TRUE, 0, BUF_DWORDS, FALSE, rawv, want);
+        {   /* wine-lab port: more distinct values than the runtime's pattern cache (64) stay exact -- TLOU Part I
+             * clears its ray-cast results to 0xDEAD0000 + n with n growing without bound and checks the 0xDEAD half */
+            UINT i; char nm[64];
+            for (i = 0; i < 80; i++) {
+                UINT v4[4]; UINT32 pv[1];
+                v4[0] = v4[1] = v4[2] = v4[3] = pv[0] = 0xDEAD0000u + i * 3u + 1u;
+                expect(want, 0, BUF_DWORDS, pv, 1);
+                snprintf(nm, sizeof nm, "raw view, distinct value #%u (%#x)", i, v4[0]);
+                buffer_case(nm, b_args, DXGI_FORMAT_R32_TYPELESS, TRUE, 0, BUF_DWORDS, FALSE, v4, want);
+            }
+        }
     }
 
 done:
