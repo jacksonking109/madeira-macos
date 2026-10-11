@@ -269,6 +269,9 @@ struct mad_device {
     struct mad_viewrec { UINT64 id; UINT32 a, b; } *vmap; unsigned vmap_cap, vmap_used, vmap_live;
     volatile LONG64 vmap_ver;   /* wine-lab port: odd while a writer changes vmap; lets mad_vmap_get read it lock-free */
     void *vmap_old[24]; unsigned nvmap_old;   /* outgrown blocks a lock-free reader may still be searching; freed with the device */
+    /* wine-lab port: RGB32 typed-buffer shadows (see mad_shadow_view), under view_lock */
+    struct mad_shadow **shadows; unsigned nshadows, shadows_cap;
+    volatile LONG shadow_ever;   /* a shadow was ever made: barriers record MC_SHADOW from then on */
     /* ml1061: GPU timeline. Every committed batch signals `gpu_event` with its
      * serial, so "has the GPU finished X" is a read of one value instead of a
      * blocking wait. Fences are delivered by a worker thread; argument-ring
@@ -680,6 +683,7 @@ struct mad_resource {
     unsigned nxview, xview_cap;
     UINT64 reserved_bytes;   /* d3d12-tiled-resources: created by CreateReservedResource (fully backed), its tiles x 64 KB */
     LONG rbdbg_said;         /* wine-lab port: debug-readback, what this buffer has been logged for */
+    unsigned nshadow;        /* wine-lab port: RGB32 typed-buffer shadows of this buffer (view_lock) */
 };
 /* srv_res / uav_res membership, O(1) through the resource's slot (the linear
  * scan it replaces ran over ~15,000 textures on every view creation). */
@@ -1232,6 +1236,7 @@ enum mad_ck {
     MC_CROOTSIG, MC_CROOT, MC_CROOT_CONST,
     MC_QUERY_BEGIN, MC_QUERY_END, MC_QUERY_RESOLVE,   /* ml1088: occlusion queries */
     MC_BARRIER,   /* ml1091: a ResourceBarrier; ends an open compute or blit encoder so the fence chain orders what follows */
+    MC_SHADOW,    /* wine-lab port: refresh the RGB32 typed-buffer shadows of u.shadow.res (a barrier made it readable) */
 };
 struct mad_cmd {
     enum mad_ck kind;
@@ -1262,6 +1267,7 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off, len; UINT8 byte; obj_handle_t pattern; } fill;   /* ml1151: pattern = exact 32-bit source */
         struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
         struct { float rgba[4]; } blend;
+        struct { struct mad_resource *res; } shadow;   /* MC_SHADOW */
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
     } u;
 };
@@ -1562,6 +1568,7 @@ struct mad_exec {
     struct mad_resource *cap_after_cs;   /* ml920: texture to capture after the current dispatch */
     struct { struct mad_resource *r; UINT64 off; char label[96]; } cap_after_buf[6]; unsigned ncap_after_buf;   /* ml922 */
     struct { struct mad_resource *r; UINT slice; char label[96]; } cap_after_tex[6]; unsigned ncap_after_tex;   /* ml924 */
+    struct mad_resource *shadow_res[8]; unsigned nshadow_res; int shadow_all;   /* wine-lab port: buffers with RGB32 shadows a copy or fill wrote; refreshed at the list end */
     UINT64 root[MAD_ROOT_PARAM_MAX]; UINT nroot;
     UINT32 consts[MAD_ROOT_PARAM_MAX][64];
     UINT stencil_ref;
@@ -2889,6 +2896,93 @@ static int exec_begin_blit(struct mad_exec *e) {
     if (e->benc) exec_fence_blit(e, e->benc, 0);   /* ml1091 */
     if (!e->benc) d3d12_log("[madeira-d3d12] no blit encoder\n");
     return e->benc != 0;
+}
+
+/* wine-lab port: RGB32 TYPED-BUFFER SHADOWS.
+ * Metal has no 3-channel 32-bit texture-buffer format, so a typed SRV of
+ * R32G32B32_FLOAT/_UINT/_SINT/_TYPELESS over a buffer cannot be a texture-buffer
+ * view of that buffer; it used to fall back to a raw descriptor, and every typed
+ * load through it read zeros (TLOU1's mesh ray caster reads vertex positions as
+ * Buffer<float4> from 8 such views). Each distinct (buffer, format, FirstElement,
+ * NumElements) now gets a hidden shared buffer of 16-byte elements, bound as an
+ * RGBA32 texture buffer of the same numeric type. w is written once at creation
+ * (1.0f, or 1 for the integer formats: what D3D returns for a missing alpha) and
+ * never again: a refresh copies the 12-byte elements into x, y, z only, as a blit
+ * into R32Uint 2D linear textures over the shadow's storage (3 texels wide,
+ * 16-byte rows, MAD_SHADOW_ROWS rows each), so no kernel is needed.
+ * Refreshes are encoded in GPU order, each in its own blit encoder fenced on both
+ * sides like a barrier:
+ *  - at the start of the next list replayed after the shadow is made (the source
+ *    may already hold data), and at every list start for a CPU-visible (UPLOAD)
+ *    source, which the CPU writes without telling us;
+ *  - after a ResourceBarrier that makes the source readable (MC_SHADOW);
+ *  - at the end of a list in which a copy or fill wrote the source (copy queues
+ *    and implicit promotion from COMMON need no barrier).
+ * A shader write to the source (UAV) is seen at its barrier only. UAVs of these
+ * formats keep a raw descriptor: D3D12 has no typed UAV loads or stores for them. */
+struct mad_shadow {
+    struct mad_resource *src;
+    UINT fmt; UINT64 first, num;   /* the view, in 12-byte elements of src */
+    UINT64 rows;                   /* elements src holds from first on (<= num): what a refresh copies */
+    obj_handle_t buf; UINT64 gpu;  /* num x 16 bytes, shared */
+    obj_handle_t tbv; UINT64 id;   /* the RGBA32 texture buffer the descriptors name */
+    obj_handle_t *dst; unsigned ndst;   /* blit destinations, MAD_SHADOW_ROWS elements each */
+    volatile LONG dirty;           /* made, not refreshed yet */
+};
+#define MAD_SHADOW_ROWS 16384u     /* the largest 2D texture height */
+static LONG g_shadow_refresh;
+static void exec_shadow_encode(struct mad_exec *e, const struct mad_shadow *s) {
+    unsigned k;
+    for (k = 0; k < s->ndst; k++) {
+        struct wmtcmd_blit_copy_from_buffer_to_texture c;
+        UINT64 r0 = (UINT64)k * MAD_SHADOW_ROWS, n;
+        if (r0 >= s->rows) break;
+        n = s->rows - r0; if (n > MAD_SHADOW_ROWS) n = MAD_SHADOW_ROWS;
+        memset(&c, 0, sizeof c);
+        c.type = WMTBlitCommandCopyFromBufferToTexture;
+        c.src = s->src->buffer; c.src_offset = (s->first + r0) * 12;
+        c.bytes_per_row = 12; c.bytes_per_image = (UINT32)(n * 12);
+        c.size.width = 3; c.size.height = (UINT32)n; c.size.depth = 1;
+        c.dst = s->dst[k];
+        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&c);
+    }
+}
+/* which: 0 = the shadows of rs[0..nr); 1 = list start: those not refreshed since
+ * they were made, and those of CPU-visible sources; 2 = every shadow. */
+static void exec_shadows(struct mad_exec *e, struct mad_resource *const *rs, unsigned nr, int which) {
+    struct mad_device *d = e->q->device;
+    unsigned i, j, n = 0;
+    if (!d->nshadows) return;
+    EnterCriticalSection(&d->view_lock);
+    for (i = 0; i < d->nshadows; i++) {
+        struct mad_shadow *s = d->shadows[i];
+        int hit = which == 2 || (which == 1 && (s->dirty || s->src->cpu));
+        for (j = 0; j < nr && !hit; j++) hit = rs[j] == s->src;
+        if (!hit || !s->rows || !s->src->buffer) continue;
+        if (!n++) {   /* its own encoder, synced on both sides as after a barrier */
+            exec_end(e);
+            e->fence_needed = 1; e->f6_sync_needed = 1;
+            if (!exec_begin_blit(e)) break;
+        }
+        InterlockedExchange(&s->dirty, 0);
+        exec_shadow_encode(e, s);
+        InterlockedIncrement(&g_shadow_refresh);
+    }
+    LeaveCriticalSection(&d->view_lock);
+    if (n) { exec_end(e); e->fence_needed = 1; e->f6_sync_needed = 1; }
+}
+static void exec_shadow_note_write(struct mad_exec *e, struct mad_resource *r) {
+    unsigned i;
+    if (!r || !r->nshadow || e->shadow_all) return;
+    for (i = 0; i < e->nshadow_res; i++) if (e->shadow_res[i] == r) return;
+    if (e->nshadow_res < 8) e->shadow_res[e->nshadow_res++] = r; else e->shadow_all = 1;
+}
+static void exec_shadow_barrier(struct mad_exec *e, struct mad_resource *r) {   /* MC_SHADOW */
+    unsigned i;
+    if (!r || !r->nshadow) return;
+    exec_shadows(e, &r, 1, 0);
+    for (i = 0; i < e->nshadow_res; i++)   /* refreshed after the write: the list end need not again */
+        if (e->shadow_res[i] == r) { e->shadow_res[i] = e->shadow_res[--e->nshadow_res]; break; }
 }
 
 /* One slot of root values for this draw, from the list's shared chunks. */
@@ -5190,8 +5284,9 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
-    case MC_FILL_BB: exec_note_write(e, c->u.fill.res); break;
-    case MC_COPY_BB: exec_note_write(e, c->u.bb.dst); break;
+    case MC_FILL_BB: exec_note_write(e, c->u.fill.res); exec_shadow_note_write(e, c->u.fill.res); break;
+    case MC_COPY_BB: exec_note_write(e, c->u.bb.dst); exec_shadow_note_write(e, c->u.bb.dst); break;
+    case MC_COPY_T2B: e->wr_all = 1; exec_shadow_note_write(e, c->u.bt.buf); break;
     default: e->wr_all = 1; break;   /* texture copies: destination fields differ per kind; be conservative */
     }
     switch (c->kind) {
@@ -5599,6 +5694,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
     }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    if (q->device->nshadows) exec_shadows(&e, NULL, 0, 1);   /* wine-lab port: new shadows, CPU-written sources */
     LONG64 pr_list_t0 = mad_perf_replay_on() ? PR_NOW() : 0;   /* perf-replay */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
@@ -5674,6 +5770,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
             } else e.fence_needed = 1;   /* ml1111 */
             if (e.cenc || e.benc || (g_barrier_render && e.renc)) { if (e.renc) InterlockedIncrement(&g_barrier_renc_closed); exec_end(&e); }
             break;
+        case MC_SHADOW: exec_shadow_barrier(&e, c->u.shadow.res); break;   /* wine-lab port */
         case MC_QUERY_BEGIN: exec_query_begin(&e, c); break;     /* ml1088 */
         case MC_QUERY_END: exec_query_end(&e, c); break;
         case MC_QUERY_RESOLVE: exec_query_resolve(&e, c); break;
@@ -5698,6 +5795,8 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
         g_pr_t[PR_LIST] += PR_NOW() - pr_list_t0; g_pr_lists++; g_pr_cmds += l->ncmds;
         if (g_pr_draws >= 20000) mad_perf_replay_report();
     }
+    if (e.shadow_all) exec_shadows(&e, NULL, 0, 2);   /* wine-lab port: sources a copy wrote */
+    else if (e.nshadow_res) exec_shadows(&e, e.shadow_res, e.nshadow_res, 0);
     q->open_draws += e.draws;   /* wine-lab port: batch-draws */
     if (e.renc && !e.npend && e.mode != 6 && mad_pass_carry_on() &&
         (q->carry || (q->carry = malloc(sizeof *q->carry)))) {   /* wine-lab port: pass-carry */
@@ -6921,7 +7020,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
         if (d->mtl_queue) NSObject_release(d->mtl_queue);
         if (d->mtl_device) NSObject_release(d->mtl_device);
         DeleteCriticalSection(&d->live_lock);
-        DeleteCriticalSection(&d->view_lock); free(d->vmap);
+        DeleteCriticalSection(&d->view_lock); free(d->vmap); free(d->shadows);
         while (d->nvmap_old) free(d->vmap_old[--d->nvmap_old]);   /* wine-lab port */
         d3d12_log("[madeira-d3d12] destroyed %s\n", d->name);
         free(d);
@@ -7382,8 +7481,116 @@ static void mad_view_census(const char *kind, struct mad_resource *r, unsigned n
                   r->name, (unsigned long long)r->size, n, kind);
 }
 
+/* wine-lab port: an RGB32 typed SRV, served from a shadow (see struct mad_shadow).
+ * view_lock held. */
+static LONG g_shadow_live;
+static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt, UINT64 first, UINT64 num) {
+    struct mad_shadow *s; struct WMTBufferInfo bi; struct WMTTextureInfo ti;
+    enum WMTPixelFormat pf; int is_depth = 0; DXGI_FORMAT wide; UINT32 one, *w; UINT64 k, avail;
+    unsigned i;
+    static unsigned said;
+    for (i = 0; i < d->nshadows; i++) {
+        s = d->shadows[i];
+        if (s->src == r && s->fmt == (UINT)fmt && s->first == first && s->num == num) return s;
+    }
+    if (!num || num > (1u << 26) || !mad_grow((void **)&d->shadows, &d->shadows_cap, d->nshadows + 1, sizeof *d->shadows)) return NULL;
+    wide = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? DXGI_FORMAT_R32G32B32A32_FLOAT :
+           fmt == DXGI_FORMAT_R32G32B32_SINT ? DXGI_FORMAT_R32G32B32A32_SINT : DXGI_FORMAT_R32G32B32A32_UINT;   /* TYPELESS: bits */
+    one = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? 0x3f800000u : 1u;
+    if (!mad_map_texture_format(wide, 0, &pf, &is_depth)) return NULL;
+    avail = r->size > first * 12 ? (r->size - first * 12) / 12 : 0;
+    if (!(s = calloc(1, sizeof *s))) return NULL;
+    s->src = r; s->fmt = (UINT)fmt; s->first = first; s->num = num; s->rows = avail < num ? avail : num;
+    memset(&bi, 0, sizeof bi); bi.length = num * 16; bi.options = WMTResourceStorageModeShared;
+    s->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
+    if (!s->buf || !bi.memory.ptr) goto fail;
+    s->gpu = bi.gpu_address;
+    w = (UINT32 *)bi.memory.ptr;
+    for (k = 0; k < num; k++) { w[4 * k] = w[4 * k + 1] = w[4 * k + 2] = 0; w[4 * k + 3] = one; }
+    memset(&ti, 0, sizeof ti);
+    ti.pixel_format = pf; ti.width = (uint32_t)num; ti.height = 1; ti.depth = 1; ti.array_length = 1;
+    ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
+    ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModeShared;
+    s->tbv = MTLBuffer_newTexture(s->buf, &ti, 0, num * 16);
+    if (!s->tbv || !ti.gpu_resource_id) goto fail;
+    s->id = ti.gpu_resource_id;
+    s->ndst = (unsigned)((num + MAD_SHADOW_ROWS - 1) / MAD_SHADOW_ROWS);
+    if (!(s->dst = calloc(s->ndst, sizeof *s->dst))) goto fail;
+    for (i = 0; i < s->ndst; i++) {
+        UINT64 n = num - (UINT64)i * MAD_SHADOW_ROWS;
+        memset(&ti, 0, sizeof ti);
+        ti.pixel_format = WMTPixelFormatR32Uint; ti.width = 3; ti.height = (uint32_t)(n < MAD_SHADOW_ROWS ? n : MAD_SHADOW_ROWS);
+        ti.depth = 1; ti.array_length = 1; ti.type = WMTTextureType2D; ti.mipmap_level_count = 1; ti.sample_count = 1;
+        ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModeShared;
+        if (!(s->dst[i] = MTLBuffer_newTexture(s->buf, &ti, (UINT64)i * MAD_SHADOW_ROWS * 16, 16))) goto fail;
+    }
+    mad_resident(d, s->buf);   /* the views alias it (ml1126) */
+    mad_vmap_put_locked(d, s->id, (UINT32)num, 0);
+    s->dirty = 1;
+    d->shadows[d->nshadows++] = s;
+    r->nshadow++;
+    InterlockedExchange(&d->shadow_ever, 1);
+    InterlockedIncrement(&g_shadow_live);
+    if (said++ < 16)
+        d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) first %llu num %llu of '%s' (%llu bytes%s) -> RGBA32 shadow, %llu elements copied per refresh, w = %#x\n",
+                  (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, r->name ? r->name : "?",
+                  (unsigned long long)r->size, r->cpu ? ", CPU-visible: refreshed at every list start" : "",
+                  (unsigned long long)s->rows, one);
+    return s;
+fail:
+    if (s->dst) { for (i = 0; i < s->ndst; i++) if (s->dst[i]) NSObject_release(s->dst[i]); free(s->dst); }
+    if (s->tbv) NSObject_release(s->tbv);
+    if (s->buf) NSObject_release(s->buf);
+    free(s);
+    if (said++ < 16) d3d12_log("[madeira-d3d12] typed buffer view: RGB32 shadow FAILED: fmt %u first %llu num %llu\n",
+                               (unsigned)fmt, (unsigned long long)first, (unsigned long long)num);
+    return NULL;
+}
+/* With the resource (res_Release): its shadows go too. */
+static void mad_shadow_free(struct mad_device *d, struct mad_resource *r) {
+    unsigned i = 0, k;
+    EnterCriticalSection(&d->view_lock);
+    while (i < d->nshadows && r->nshadow) {
+        struct mad_shadow *s = d->shadows[i];
+        if (s->src != r) { i++; continue; }
+        d->shadows[i] = d->shadows[--d->nshadows];
+        r->nshadow--;
+        mad_vmap_del_locked(d, s->id);
+        for (k = 0; k < s->ndst; k++) if (s->dst[k]) NSObject_release(s->dst[k]);
+        free(s->dst);
+        NSObject_release(s->tbv);
+        mad_unresident(d, s->buf);
+        NSObject_release(s->buf);
+        free(s);
+        InterlockedDecrement(&g_shadow_live);
+    }
+    LeaveCriticalSection(&d->view_lock);
+}
+static int mad_is_rgb32(DXGI_FORMAT f) {
+    return f == DXGI_FORMAT_R32G32B32_TYPELESS || f == DXGI_FORMAT_R32G32B32_FLOAT || f == DXGI_FORMAT_R32G32B32_UINT || f == DXGI_FORMAT_R32G32B32_SINT;
+}
 static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,
                                  UINT64 first, UINT64 num, int uav, struct mad_descriptor *e) {
+    if (mad_is_rgb32(fmt) && r->buffer) {   /* wine-lab port: Metal has no RGB32 texture buffer */
+        struct mad_shadow *s;
+        static unsigned said_uav;
+        if (uav) {
+            if (said_uav++ < 8)
+                d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) UAV first %llu num %llu is NOT supported (no Metal RGB32 texture buffer; "
+                          "D3D12 has no typed UAV loads/stores for it either); raw descriptor\n",
+                          (unsigned)fmt, (unsigned long long)first, (unsigned long long)num);
+            return 0;
+        }
+        EnterCriticalSection(&d->view_lock);
+        s = mad_shadow_get_locked(d, r, fmt, first, num);
+        if (s) {
+            e->gpu_va = s->gpu;
+            e->texture_view_id = s->id;
+            e->metadata = ((num * 16) & 0xffffffffull) | (1ull << 63);
+        }
+        LeaveCriticalSection(&d->view_lock);
+        return s != NULL;
+    }
     enum WMTPixelFormat pf; int is_depth = 0; UINT bytes, block; unsigned k;
     UINT64 byte_off, aligned, elem_off, width, bpr;
     struct WMTTextureInfo ti;
@@ -8390,6 +8597,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
             mad_uavtex_forget(r, r->gpu_resource_id);
             for (k = 0; k < r->nxview; k++) mad_uavtex_forget(r, r->xview[k].id);
         }
+        if (r->nshadow && r->owner) mad_shadow_free(r->owner, r);   /* wine-lab port */
         { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
         { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
         if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
@@ -12547,6 +12755,22 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
         }
         if (c->u.barrier.n < 8) { c->u.barrier.cls[c->u.barrier.n] = cls; c->u.barrier.res[c->u.barrier.n++] = r; }
         else { c->u.barrier.all = 1; c->u.barrier.cls_noref = BC_ALL; }
+    }
+    /* wine-lab port: a buffer made readable again (out of a write state or
+     * COMMON into a read state or COMMON) refreshes its RGB32 typed-buffer
+     * shadows right after the barrier. Recorded for every such buffer once any
+     * shadow exists, so a view made after this list was recorded is covered. */
+    if (l->device && l->device->shadow_ever) {
+        const UINT W = D3D12_RESOURCE_STATE_RENDER_TARGET | D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_DEPTH_WRITE |
+                       D3D12_RESOURCE_STATE_STREAM_OUT | D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        for (i = 0; i < n; i++) {
+            struct mad_resource *r = (struct mad_resource *)b[i].Transition.pResource;
+            UINT bs = (UINT)b[i].Transition.StateBefore, as = (UINT)b[i].Transition.StateAfter;
+            struct mad_cmd *sc;
+            if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) continue;
+            if (!r || !r->buffer || (as & W) || (bs && !(bs & W))) continue;
+            if ((sc = mad_list_push(l, MC_SHADOW))) sc->u.shadow.res = r;
+        }
     }
 }
 /* ml889: ExecuteIndirect. D3D12's argument records are byte-for-byte Metal's
