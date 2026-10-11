@@ -28,6 +28,11 @@
  *       with 3 frames in flight (no wait between submissions), read through
  *       one view per slot AND one view over the whole ring at the slot's
  *       offset (a shadow shared by all frames in flight)
+ *    9  refresh cost: 80 small views and one whole-buffer view of one 12 MB
+ *       buffer; 40 small copies, each made readable by a barrier and read,
+ *       must copy exactly the bytes those copies wrote that views cover (the
+ *       runtime's MadeiraD3D12ShadowStats), not every view each time; two
+ *       UAV -> SRV barriers with no work between refresh the views once
  *
  *  Exit code = number of failed checks. Every dispatch is finite.
  */
@@ -57,7 +62,12 @@ enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FI
 enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_COUNT = S_SLOT0 + NSLOT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_COUNT };
+enum { NG = 1 << 20, NCOPY = 40, CPYN = 1200 };   /* case 9: big buffer elements, copies, elements per copy */
+static UINT big_first(UINT k) { return k * 12007u + 5u; }
+static UINT big_num(UINT k) { return 100u + 13u * k; }
+typedef void (*pfn_shadow_stats)(UINT64 *, UINT64 *, UINT64 *);
+static pfn_shadow_stats p_stats;
 #define OUT_REGION ((UINT64)NF * 16)   /* one dispatch's output */
 #define ONE_F 0x3f800000u
 
@@ -70,7 +80,7 @@ static ID3D12Fence        *fence;
 static UINT64              fence_v;
 static ID3D12DescriptorHeap *heap;
 static UINT                inc;
-static ID3D12Resource     *stage, *fbuf, *ubuf, *ibuf, *nbuf, *pbuf, *ring, *outbuf, *rb;
+static ID3D12Resource     *stage, *fbuf, *ubuf, *ibuf, *nbuf, *pbuf, *ring, *outbuf, *rb, *gbuf, *gstage;
 #define NREGIONS (2 * NSLOT)
 static ID3D12RootSignature *rs;
 static ID3D12PipelineState *pso;
@@ -320,6 +330,67 @@ out:
     for (k = 0; k < NSLOT; k++) { if (fl[k]) ID3D12GraphicsCommandList_Release(fl[k]); if (fa[k]) ID3D12CommandAllocator_Release(fa[k]); }
 }
 
+static void stats(UINT64 *c, UINT64 *v, UINT64 *k) { *c = *v = *k = 0; if (p_stats) p_stats(c, v, k); }
+static void refresh_cost(void) {
+    struct expect G1 = { K_FLOAT, 5.0f, 0 };
+    UINT64 c0, v0, k0, c1, v1, k1, want_c = 0, want_v = 0, all = 0;
+    float *p = NULL; UINT i, c, k, last = 2 * (NCOPY - 1);
+    printf("\n[9] refresh cost: %u small views + 1 whole view of one %u MB buffer\n", NBIGV, NG * 12 >> 20);
+    if (!p_stats) { CHECK(0, "MadeiraD3D12ShadowStats exported (another runtime?)"); return; }
+    ID3D12Resource_Map(gstage, 0, NULL, (void **)&p);
+    if (!p) { CHECK(0, "big staging buffer mapped"); return; }
+    for (i = 0; i < NG; i++) for (c = 0; c < 3; c++) { p[3 * i + c] = fval(i, c, 5.0f); p[3 * ((SIZE_T)NG + i) + c] = fval(i, c, -3.5f); }
+    ID3D12Resource_Unmap(gstage, 0, NULL);
+    for (k = 0; k < NBIGV; k++) { make_view(S_BIG0 + k, gbuf, DXGI_FORMAT_R32G32B32_FLOAT, big_first(k), big_num(k)); all += big_num(k) * 12ull; }
+    make_view(S_WHOLE, gbuf, DXGI_FORMAT_R32G32B32_FLOAT, 0, NG); all += NG * 12ull;
+
+    /* whole contents (seed 5), read */
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, gbuf, 0, gstage, 0, (UINT64)NG * 12);
+    barrier(gbuf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    read_view_at(K_FLOAT, S_WHOLE, 0, 4096, 0);
+    if (finish(1)) verify("whole view after the first copy", 0, 4096, &G1); else CHECK(0, "case 9a submitted");
+
+    /* NCOPY small copies (seed -3.5) at even views' starts, each made readable and read */
+    stats(&c0, &v0, &k0);
+    for (i = 0; i < NCOPY; i++) {
+        UINT v = 2 * i, o = big_first(v);
+        barrier(gbuf, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, gbuf, (UINT64)o * 12, gstage, ((UINT64)NG + o) * 12, (UINT64)CPYN * 12);
+        barrier(gbuf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        read_view_at(K_FLOAT, S_BIG0 + v, 0, big_num(v), 0);
+        want_c += big_num(v) * 12ull + CPYN * 12ull;   /* the view, and the copied range of the whole view */
+        want_v += big_num(v) * 12ull + NG * 12ull;
+    }
+    if (!finish(1)) { CHECK(0, "case 9b submitted"); return; }
+    stats(&c1, &v1, &k1);
+    printf("        copied %llu bytes for views of %llu bytes (refreshing those views whole: %llu; every view at every barrier: %llu)\n",
+           (unsigned long long)(c1 - c0), (unsigned long long)(v1 - v0), (unsigned long long)want_v, (unsigned long long)(all * NCOPY));
+    CHECK(c1 - c0 == want_c, "40 small copies refreshed exactly what they wrote: %llu bytes copied, %llu expected", (unsigned long long)(c1 - c0), (unsigned long long)want_c);
+    {
+        struct expect Gv = { K_FLOAT, -3.5f, big_first(last) }, Gn = { K_FLOAT, 5.0f, big_first(last) + CPYN };
+        read_view_at(K_FLOAT, S_BIG0 + last, 0, big_num(last), 0);
+        read_view_at(K_FLOAT, S_WHOLE, big_first(last), CPYN, 1);
+        read_view_at(K_FLOAT, S_WHOLE, big_first(last) + CPYN, 500, 2);
+        if (finish(3)) {
+            verify("last small view: new data", 0, big_num(last), &Gv);
+            verify("whole view over the last copy: new data", 1, CPYN, &Gv);
+            verify("whole view just past it: old data", 2, 500, &Gn);
+        } else CHECK(0, "case 9c submitted");
+    }
+
+    /* two UAV -> SRV barriers with no work between: one whole refresh */
+    stats(&c0, &v0, &k0);
+    barrier(gbuf, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    barrier(gbuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    barrier(gbuf, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    barrier(gbuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    read_view_at(K_FLOAT, S_BIG0, 0, big_num(0), 0);
+    if (!finish(1)) { CHECK(0, "case 9d submitted"); return; }
+    stats(&c1, &v1, &k1);
+    CHECK(c1 - c0 == all && k1 - k0 == 1, "UAV -> SRV twice with no work between: every view refreshed once (%llu of %llu bytes, %llu skipped)",
+          (unsigned long long)(c1 - c0), (unsigned long long)all, (unsigned long long)(k1 - k0));
+}
+
 static void cases(void) {
     struct expect A = { K_FLOAT, 0.25f, 0 }, Aoff = { K_FLOAT, 0.25f, OFF }, B = { K_FLOAT, -7.0f, 0 }, Boff = { K_FLOAT, -7.0f, OFF };
     struct expect U = { K_UINT, 0, 0 }, I = { K_SINT, 0, 0 }, C = { K_FLOAT, 1000.0f, 0 }, Blate = { K_FLOAT, -7.0f, LATE_FIRST };
@@ -385,6 +456,7 @@ static void cases(void) {
     if (finish(1)) verify("upload view, rewritten", 0, NP, &P2); else CHECK(0, "case 7b submitted");
 
     frames_in_flight();
+    refresh_cost();
 }
 
 int main(void) {
@@ -398,6 +470,7 @@ int main(void) {
     if (!create || !p_serialize) goto done;
     pfn_marker marker = (pfn_marker)GetProcAddress(d12, "MadeiraD3D12GetBuildMarker");
     if (marker) printf("        implementation: %s\n", marker());
+    p_stats = (pfn_shadow_stats)GetProcAddress(d12, "MadeiraD3D12ShadowStats");
 
     hr = create(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev);
     CHECK(SUCCEEDED(hr) && dev, "device created (%#lx)", hr);
@@ -413,7 +486,7 @@ int main(void) {
     ID3D12Device_CreateFence(dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void **)&fence);
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd; ZeroMemory(&hd, sizeof hd);
-        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 16;
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 128;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&heap);
         inc = ID3D12Device_GetDescriptorHandleIncrementSize(dev, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -428,11 +501,13 @@ int main(void) {
     nbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, (UINT64)NN * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON);
     pbuf = make_buffer(D3D12_HEAP_TYPE_UPLOAD, (UINT64)NP * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     ring = make_buffer(D3D12_HEAP_TYPE_UPLOAD, (UINT64)NSLOT * NR * 12, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+    gbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, (UINT64)NG * 12, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+    gstage = make_buffer(D3D12_HEAP_TYPE_UPLOAD, (UINT64)NG * 24, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
     outbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, NREGIONS * OUT_REGION, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     rb = make_buffer(D3D12_HEAP_TYPE_READBACK, NREGIONS * OUT_REGION, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
-    CHECK(stage && fbuf && ubuf && ibuf && nbuf && pbuf && ring && outbuf && rb, "source, staging, output and readback buffers created");
-    if (!stage || !fbuf || !ubuf || !ibuf || !nbuf || !pbuf || !ring || !outbuf || !rb) goto done;
+    CHECK(stage && fbuf && ubuf && ibuf && nbuf && pbuf && ring && gbuf && gstage && outbuf && rb, "source, staging, output and readback buffers created");
+    if (!stage || !fbuf || !ubuf || !ibuf || !nbuf || !pbuf || !ring || !gbuf || !gstage || !outbuf || !rb) goto done;
     rs = make_rs();
     if (!rs) goto done;
     {
@@ -463,6 +538,8 @@ done:
     if (rb) ID3D12Resource_Release(rb);
     if (outbuf) ID3D12Resource_Release(outbuf);
     if (ring) ID3D12Resource_Release(ring);
+    if (gstage) ID3D12Resource_Release(gstage);
+    if (gbuf) ID3D12Resource_Release(gbuf);
     if (pbuf) ID3D12Resource_Release(pbuf);
     if (nbuf) ID3D12Resource_Release(nbuf);
     if (ibuf) ID3D12Resource_Release(ibuf);
