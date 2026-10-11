@@ -1,4 +1,8 @@
-/* wine-lab port: 64-bit atomics whose old value is read.
+/* wine-lab port: DXIL rewrites before the Metal Shader Converter
+ * (madeira_dxil_rewrite.h): the module is parsed once, each rewrite the
+ * options ask for runs on it, and it is written back once.
+ *
+ * ---- 64-bit atomics whose old value is read ----
  *
  * Metal's 64-bit atomics (atomic_ulong min/max on buffers and textures) return
  * nothing, so the Metal Shader Converter refuses any dx.op.atomicBinOp.i64
@@ -38,13 +42,7 @@
  * buffer) with the old value used, MSC 4.0b2 CRASHES (a null dereference in
  * metallib::LazyLinker::CanLinkSymbols, every GPU family and flag set tried,
  * on tests/windows/atomic64.hlsl ps_cmpxchg) -- a fault inside the game's
- * process. Such a shader is reported so the runtime refuses it unconverted.
- *
- * Returns 1 and a malloc'd container when something was rewritten, 0 when the
- * shader has no 64-bit atomic whose result is used and that the converter
- * refuses (nothing allocated), -1 when it has some but none could be rewritten
- * (note says why; convert the original, which fails as before), and -2 when it
- * must not reach the converter at all (note says why). */
+ * process. Such a shader is reported so the runtime refuses it unconverted. */
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -64,6 +62,8 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include "madeira_dxil_rewrite.h"
 
 using namespace llvm;
 
@@ -294,20 +294,33 @@ extern "C" int madeira_atomic64_candidate(const void *bc, size_t len)
     return dxil && (!sfi0 || (flags & (kSfi0Int64Ops | kSfi0AtomicInt64Typed | kSfi0AtomicInt64Shared | kSfi0AtomicInt64Heap)));
 }
 
-extern "C" int madeira_atomic64_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
-                                        unsigned *n_rewritten, char *note, size_t note_cap)
+/* The container's DXIL part, or false. */
+static bool find_dxil(const uint8_t *d, size_t len, const uint8_t **dxil, uint32_t *size, uint32_t *part)
 {
-    const uint8_t *d = (const uint8_t *)bc;
-    *out = nullptr; *out_len = 0; *n_rewritten = 0;
-    if (note && note_cap) note[0] = 0;
-    if (!madeira_atomic64_candidate(bc, len)) return 0;
+    if (!d || len < 32 || memcmp(d, "DXBC", 4)) return false;
     uint32_t nparts = rd32(d + 28);
-    const uint8_t *dxil = nullptr; uint32_t dxil_size = 0, dxil_part = 0;
+    if (32 + 4ull * nparts > len) return false;
     for (uint32_t i = 0; i < nparts; i++) {
         uint32_t off = rd32(d + 32 + 4 * i);
-        if (!memcmp(d + off, "DXIL", 4)) { dxil = d + off + 8; dxil_size = rd32(d + off + 4); dxil_part = i; }
+        if (off + 8ull > len) return false;
+        uint32_t sz = rd32(d + off + 4);
+        if (off + 8ull + sz > len) return false;
+        if (!memcmp(d + off, "DXIL", 4)) { *dxil = d + off + 8; *size = sz; *part = i; return true; }
     }
-    if (!dxil || dxil_size < 24) return 0;
+    return false;
+}
+
+extern "C" int madeira_dxil_rewrite(const void *bc, size_t len, const struct madeira_dxil_rewrite_opts *opts,
+                                    void **out, size_t *out_len, struct madeira_dxil_rewrite_info *info)
+{
+    const uint8_t *d = (const uint8_t *)bc;
+    const uint8_t *dxil = nullptr;
+    uint32_t dxil_size = 0, dxil_part = 0;
+    *out = nullptr; *out_len = 0;
+    memset(info, 0, sizeof *info);
+    if (!opts->atomic64) return 0;
+    if (!find_dxil(d, len, &dxil, &dxil_size, &dxil_part) || dxil_size < 24) return 0;
+    uint32_t nparts = rd32(d + 28);
     uint32_t bc_off = rd32(dxil + 16), bc_size = rd32(dxil + 20);
     if (8ull + bc_off + bc_size > dxil_size) return 0;
 
@@ -317,22 +330,29 @@ extern "C" int madeira_atomic64_rewrite(const void *bc, size_t len, void **out, 
     auto mod = parseBitcodeFile(mb->getMemBufferRef(), ctx);
     if (!mod) {
         std::string err = toString(mod.takeError());
-        if (note && note_cap) snprintf(note, note_cap, "bitcode reader: %s", err.c_str());
+        snprintf(info->a64_note, sizeof info->a64_note, "bitcode reader: %s", err.c_str());
         return -1;
     }
-    counts_t n;
-    rewrite_module(**mod, n);
-    if (n.typed_cmpxchg) {
-        if (note && note_cap)
-            snprintf(note, note_cap, "%u 64-bit compare-exchange(s) on a texture or typed buffer read the old value; "
+    bool changed = false;
+    if (opts->atomic64) {
+        counts_t n;
+        rewrite_module(**mod, n);
+        if (n.typed_cmpxchg) {
+            info->a64_refuse = 1;
+            snprintf(info->a64_note, sizeof info->a64_note,
+                     "%u 64-bit compare-exchange(s) on a texture or typed buffer read the old value; "
                      "the converter crashes on that, so the shader is refused unconverted", n.typed_cmpxchg);
-        return -2;
+            return 0;
+        }
+        if (n.other)
+            snprintf(info->a64_note, sizeof info->a64_note,
+                     "%u 64-bit atomic(s) on %s left as they were (the converter refuses them)",
+                     n.other, n.other_why.c_str());
+        info->a64_rewritten = n.rewritten;
+        info->a64_left = n.other;
+        changed |= n.rewritten != 0;
     }
-    if (!n.rewritten && !n.other) return 0;
-    if (n.other && note && note_cap)
-        snprintf(note, note_cap, "%u 64-bit atomic(s) on %s left as they were (the converter refuses them)",
-                 n.other, n.other_why.c_str());
-    if (!n.rewritten) return -1;
+    if (!changed) return 0;
 
     SmallVector<char, 0> nb;
     { raw_svector_ostream os(nb); WriteBitcodeToFile(**mod, os); }
@@ -344,7 +364,7 @@ extern "C" int madeira_atomic64_rewrite(const void *bc, size_t len, void **out, 
     for (uint32_t i = 0; i < nparts; i++)
         total += 8 + (i == dxil_part ? 24 + nb.size() : rd32(d + rd32(d + 32 + 4 * i) + 4));
     uint8_t *o = (uint8_t *)malloc(total);
-    if (!o) return -1;
+    if (!o) return 0;
     memcpy(o, d, 32);
     memset(o + 4, 0, 16);
     wr32(o + 24, (uint32_t)total);
@@ -369,6 +389,6 @@ extern "C" int madeira_atomic64_rewrite(const void *bc, size_t len, void **out, 
             w += 8 + (size_t)sz;
         }
     }
-    *out = o; *out_len = total; *n_rewritten = n.rewritten;
+    *out = o; *out_len = total;
     return 1;
 }

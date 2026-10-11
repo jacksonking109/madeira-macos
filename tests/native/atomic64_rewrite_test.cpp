@@ -1,22 +1,22 @@
-/* wine-lab port: host test for src/unix/madeira_atomic64.cpp, the rewrite that
+/* wine-lab port: host test for src/unix/madeira_dxil_rewrite.cpp's rewrite that
  * lets the Metal Shader Converter take 64-bit atomics whose old value is read.
  *
  * Converts each shader through the converter twice, the way famtest does (no
  * root signature; GPU families Metal3, Apple8 and Apple9): as given,
  * which must fail with IRErrorCode 7 (UnsupportedInstruction), and after
- * madeira_atomic64_rewrite, which must convert. The shaders are the ps_6_6
+ * madeira_dxil_rewrite, which must convert. The shaders are the ps_6_6
  * arrays of tests/windows/atomic64_dxil.h plus any containers named on the
  * command line -- the three TLOU Part I k-buffer shaders the runtime saved.
  * ps_cmpxchg (a texture compare-exchange whose old value is used) crashes the
- * converter, so it is never converted here: the rewrite must report it (-2).
+ * converter, so it is never converted here: the rewrite must refuse it.
  *
  *   cd ~/wine-lab/d3d12-port; LL=~/wine-lab/deps/llvm15-x86_64
  *   clang++ -arch x86_64 -O1 -std=c++17 -fno-rtti -I$LL/include -Ithird_party/metal-shader-converter/include \
- *       -Itests/windows tests/native/atomic64_rewrite_test.cpp src/unix/madeira_atomic64.cpp \
+ *       -Isrc/unix -Itests/windows tests/native/atomic64_rewrite_test.cpp src/unix/madeira_dxil_rewrite.cpp \
  *       $($LL/bin/llvm-config --libfiles bitreader bitwriter core) -lz -lcurses \
  *       -L ~/wine-lab/wine11/lib/wine/x86_64-unix -lmetalirconverter \
  *       -Wl,-rpath,$HOME/wine-lab/wine11/lib/wine/x86_64-unix -o out/atomic64_rewrite_test
- *   out/atomic64_rewrite_test ~/wine-lab/d3d12-config/madeira-failed-shaders/shader_0{2,3,4}_code7.bin
+ *   out/atomic64_rewrite_test ~/wine-lab/d3d12-config/failed-shaders-tlou1-2026-10-09/shader_0{2,3,4}_code7.bin
  *
  * Exit code = number of failed checks. */
 #include <cstdio>
@@ -24,10 +24,7 @@
 #include <cstring>
 #include <metal_irconverter/metal_irconverter.h>
 #include "atomic64_dxil.h"
-
-extern "C" int madeira_atomic64_candidate(const void *bc, size_t len);
-extern "C" int madeira_atomic64_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
-                                        unsigned *n_rewritten, char *note, size_t note_cap);
+#include "madeira_dxil_rewrite.h"
 
 static int checks, fails;
 #define CHECK(cond, ...) do { checks++; if (!(cond)) { fails++; printf("  FAIL  "); } else printf("  ok    "); \
@@ -60,13 +57,16 @@ static void run(const char *name, const void *b, size_t n, unsigned expect_n)
 {
     void *nb = nullptr;
     size_t nl = 0;
-    unsigned got_n = 0;
-    char note[256];
+    madeira_dxil_rewrite_opts o = {};
+    madeira_dxil_rewrite_info inf;
+    o.atomic64 = 1;
     CHECK(madeira_atomic64_candidate(b, n), "%s: SFI0 makes it a candidate", name);
-    int rc = madeira_atomic64_rewrite(b, n, &nb, &nl, &got_n, note, sizeof note);
-    if (note[0]) printf("        note: %s\n", note);
+    int rc = madeira_dxil_rewrite(b, n, &o, &nb, &nl, &inf);
+    unsigned got_n = inf.a64_rewritten;
+    if (inf.a64_note[0]) printf("        note: %s\n", inf.a64_note);
     if (!expect_n) {
-        CHECK(rc == -2 && !nb && strstr(note, "compare-exchange"), "%s: refused unconverted, the note names it (rc %d)", name, rc);
+        CHECK(rc == 0 && !nb && inf.a64_refuse && strstr(inf.a64_note, "compare-exchange"),
+              "%s: refused unconverted, the note names it (rc %d)", name, rc);
         return;
     }
     unsigned before = convert(b, n);
@@ -78,8 +78,7 @@ static void run(const char *name, const void *b, size_t n, unsigned expect_n)
         CHECK(after == 0, "%s: converts after the rewrite (code %u)", name, after);
         void *nb2 = nullptr;
         size_t nl2 = 0;
-        unsigned n2 = 0;
-        CHECK(madeira_atomic64_rewrite(nb, nl, &nb2, &nl2, &n2, note, sizeof note) == 0 && !nb2,
+        CHECK(madeira_dxil_rewrite(nb, nl, &o, &nb2, &nl2, &inf) == 0 && !nb2 && !inf.a64_left,
               "%s: nothing left to rewrite in the result", name);
         free(nb2);
     }

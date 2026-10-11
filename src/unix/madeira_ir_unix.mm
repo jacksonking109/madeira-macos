@@ -393,10 +393,8 @@ static void mad_air_entry_name(const unsigned char *b, size_t len, char *out, si
 /* ml1149: madeira_ags.cpp (LLVM 15, plain C++ like the IA resolver). */
 extern "C" int madeira_ags_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
                                    char *note, size_t note_cap);
-/* wine-lab port: madeira_atomic64.cpp (LLVM 15 as well). */
-extern "C" int madeira_atomic64_candidate(const void *bc, size_t len);
-extern "C" int madeira_atomic64_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
-                                        unsigned *n_rewritten, char *note, size_t note_cap);
+/* wine-lab port: madeira_dxil_rewrite.cpp (LLVM 15 as well). */
+#include "madeira_dxil_rewrite.h"
 
 #ifndef MADEIRA_NO_AIRCONV
 extern "C" int madeira_sm5_resolve_ia(const void *bc, size_t bclen,
@@ -1452,7 +1450,7 @@ static int mad_ags_enabled(void)
 }
 
 /* wine-lab port: madeira.cfg dxil-atomic64-emulation = 0 turns the 64-bit
- * atomic rewrite (madeira_atomic64.cpp) off. MAD_A64_VERSION goes into the
+ * atomic rewrite (madeira_dxil_rewrite.cpp) off. MAD_A64_VERSION goes into the
  * DXIL cache key of every shader the rewrite may apply to; bump it when the
  * rewrite's output changes. */
 #define MAD_A64_VERSION 1u
@@ -1465,7 +1463,7 @@ static int mad_atomic64_enabled(void)
 
 /* 1 the first time a shader (by content hash) is reported, so a shader
  * converted for several root signatures logs once. */
-static int mad_atomic64_first_report(uint64_t h)
+static int mad_rewrite_first_report(uint64_t h)
 {
     static uint64_t seen[256];
     static unsigned n;
@@ -1623,7 +1621,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     void *dxc_blob = NULL;
     uint64_t dxc_key = 0, dxc_check = 0;
     int dxc_disk = 0, dxc_slot = 0;
-    void *a64_buf = NULL;   /* wine-lab port: container with the 64-bit atomics rewritten */
+    void *rw_buf = NULL;   /* wine-lab port: container after the DXIL rewrites */
     int a64_refused = 0;
     /* Decided from the container alone, before the cache is consulted: the
      * key must say whether the rewrite can have shaped the entry. */
@@ -1767,30 +1765,35 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         }
         if (rc == 1) { src = (const uint8_t *)ags_buf; src_len = ags_len; }
 
-        /* wine-lab port: Metal's 64-bit atomics return nothing, so the converter
-         * refuses one whose old value is read (code 7); madeira_atomic64.cpp
-         * reads the old value with a plain load before the atomic instead. */
+        /* wine-lab port: DXIL rewrites (madeira_dxil_rewrite.cpp). Metal's 64-bit
+         * atomics return nothing, so the converter refuses one whose old value
+         * is read (code 7); the rewrite reads the old value with a plain load
+         * before the atomic instead. */
         if (a64) {
-            size_t a64_len = 0;
-            unsigned n = 0;
-            int r = madeira_atomic64_rewrite(src, src_len, &a64_buf, &a64_len, &n, note, sizeof note);
-            if (r != 0) {
+            struct madeira_dxil_rewrite_opts o;
+            struct madeira_dxil_rewrite_info inf;
+            size_t rw_len = 0;
+            int r;
+            memset(&o, 0, sizeof o);
+            o.atomic64 = a64;
+            r = madeira_dxil_rewrite(src, src_len, &o, &rw_buf, &rw_len, &inf);
+            if (r != 0 || inf.a64_left || inf.a64_refuse) {
                 uint64_t h = 1469598103934665603ull;   /* the ml1149 log's name for the shader */
                 mad_sc_hash_add(&h, (const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
-                if (mad_atomic64_first_report(h)) {
-                    if (r == 1)
+                if (mad_rewrite_first_report(h)) {
+                    if (inf.a64_rewritten)
                         dprintf(2, "[madeira-ir] atomic64 %016llx: %u 64-bit atomics given a non-atomic old-value read "
                                    "(race: another invocation between the read and the atomic can be missed)%s%s\n",
-                                (unsigned long long)h, n, note[0] ? "; " : "", note);
+                                (unsigned long long)h, inf.a64_rewritten, inf.a64_note[0] ? "; " : "", inf.a64_note);
                     else
-                        dprintf(2, "[madeira-ir] atomic64 %016llx: %s%s\n", (unsigned long long)h, note,
-                                r == -1 ? " -- converting the original, which the converter will refuse" : "");
+                        dprintf(2, "[madeira-ir] atomic64 %016llx: %s%s\n", (unsigned long long)h, inf.a64_note,
+                                inf.a64_left ? " -- converting the original, which the converter will refuse" : "");
                 }
             }
-            if (r == 1) { src = (const uint8_t *)a64_buf; src_len = a64_len; }
-            if (r == -2) {
+            if (r == 1) { src = (const uint8_t *)rw_buf; src_len = rw_len; }
+            if (inf.a64_refuse) {
                 a64_refused = 1;
-                snprintf(a->ret_note, sizeof a->ret_note, "%s", note);
+                snprintf(a->ret_note, sizeof a->ret_note, "%s", inf.a64_note);
             }
         }
         input = g_ir.IRObjectCreateFromDXIL(src, src_len, IRBytecodeOwnershipNone);
@@ -2069,7 +2072,7 @@ done:
     free(irr);
     free(irp);
     free(ags_buf);
-    free(a64_buf);
+    free(rw_buf);
     free(dxc_blob);
     free(lib_bytes);
     free(lib2_bytes);
@@ -2086,18 +2089,19 @@ extern "C" int madeira_ir_convert(void *args) {
 }
 
 #ifdef MADEIRA_NO_AIRCONV
-/* wine-lab port: madeira_atomic64.cpp needs LLVM 15 too; without it no shader
- * is a candidate, and a 64-bit atomic whose old value is read is refused. */
+/* wine-lab port: madeira_dxil_rewrite.cpp needs LLVM 15 too; without it no
+ * shader is a candidate, and a 64-bit atomic whose old value is read is refused. */
 extern "C" int madeira_atomic64_candidate(const void *bc, size_t len)
 {
     (void)bc; (void)len;
     return 0;
 }
-extern "C" int madeira_atomic64_rewrite(const void *bc, size_t len, void **out, size_t *out_len,
-                                        unsigned *n_rewritten, char *note, size_t note_cap)
+extern "C" int madeira_dxil_rewrite(const void *bc, size_t len, const struct madeira_dxil_rewrite_opts *opts,
+                                    void **out, size_t *out_len, struct madeira_dxil_rewrite_info *info)
 {
-    (void)bc; (void)len; (void)note; (void)note_cap;
-    *out = NULL; *out_len = 0; *n_rewritten = 0;
+    (void)bc; (void)len; (void)opts;
+    *out = NULL; *out_len = 0;
+    memset(info, 0, sizeof *info);
     return 0;
 }
 #endif
