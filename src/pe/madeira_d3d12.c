@@ -2966,6 +2966,19 @@ struct mad_shadow {
 #define MAD_SHADOW_ROWS 16384u     /* the largest 2D texture height */
 #define MAD_FRAME_NEVER (~(UINT64)0)
 static LONG g_shadow_refresh, g_shadow_encoders, g_shadow_frames, g_shadow_live;
+/* wine-lab port: madeira.cfg rgb32-shader (default 1, read by d3d12.so as well):
+ * RGB32 typed SRVs are read in the shader (MAD_DESC_RGB32) instead of from a
+ * shadow. A converted pipeline with typed-buffer reads the rewrite could not
+ * reach (ret_rgb32) makes every view created afterwards a shadow again. */
+static int g_rgb32_shader = -1; static volatile LONG g_rgb32_unsafe, g_rgb32_shader_views, g_rgb32_pipes;
+static int mad_rgb32_shader_on(void) {
+    if (g_rgb32_shader < 0) {
+        g_rgb32_shader = mad_cfg_int_pe("rgb32-shader", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] rgb32-shader = %d (RGB32 typed buffers %s)\n", g_rgb32_shader,
+                  g_rgb32_shader ? "read in the shader from their own memory" : "served from RGBA32 shadow copies");
+    }
+    return g_rgb32_shader;
+}
 static void mad_shadow_cpu_sync(struct mad_device *d);
 static LONG64 g_shadow_refresh_bytes, g_shadow_cpu_bytes, g_shadow_cpu_changed;
 static LONG64 g_shadow_req_bytes, g_shadow_full_adds, g_shadow_full_skips, g_shadow_live_bytes, g_shadow_shared;
@@ -3745,6 +3758,15 @@ static struct mad_resource *mad_texture_of_view(struct mad_device *d, UINT64 id,
  *   texture      : texture_view_id != 0, metadata bit 63 clear, low half = min LOD clamp
  *   typed buffer : texture_view_id != 0, metadata bit 63 SET (mad_typed_buffer_view) */
 #define MAD_DESC_TYPEDBUF (1ull << 63)
+/* wine-lab port: an R32G32B32 typed SRV read in the shader (src/unix/madeira_air_rewrite.h):
+ * bound as an R32 texture buffer of 3 x NumElements, gpu_va = its first element,
+ * size = NumElements x 12. Bits 60-61: 0 FLOAT, 1 UINT/TYPELESS, 2 SINT (for the
+ * SM 5.x tables, which serve it from a shadow). MSC reads none of bits 40-62. */
+#define MAD_DESC_RGB32 (1ull << 62)
+#define MAD_DESC_RGB32_KIND(m) ((UINT)(((m) >> 60) & 3))
+struct mad_shadow;
+static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt, UINT64 first, UINT64 num);
+static UINT64 mad_shadow_tex_locked(struct mad_device *d, struct mad_shadow *s, DXGI_FORMAT fmt);
 
 /* The view's array length, which the backend packs above the min LOD clamp.
  * mad_texture_of_view already reverses a view id to its resource and view
@@ -4073,7 +4095,29 @@ static int mad_air_build_tables_ex(struct mad_exec *e, const struct mad_rootsig 
             tab[off + 0] = de.gpu_va;
             tab[off + 1] = de.metadata & 0xffffffffull;          /* byte length */
         } else if (rg->flags & MADEIRA_IR_AIR_F_TEXTURE) {
-            if (de.metadata & MAD_DESC_TYPEDBUF) {
+            if ((de.metadata & MAD_DESC_TYPEDBUF) && (de.metadata & MAD_DESC_RGB32)) {
+                /* wine-lab port: an RGB32 view the DXIL shaders read in place;
+                 * this backend reads typed buffers as textures, so it gets the
+                 * view's shadow (made on first use, refreshed like any other). */
+                UINT64 roff = 0, rid = 0, rnum = (de.metadata & 0xffffffffull) / 12;
+                struct mad_resource *rr = mad_resolve_address(d, de.gpu_va, &roff);
+                UINT k = MAD_DESC_RGB32_KIND(de.metadata);
+                DXGI_FORMAT rf = k == 2 ? DXGI_FORMAT_R32G32B32_SINT : k == 1 ? DXGI_FORMAT_R32G32B32_UINT : DXGI_FORMAT_R32G32B32_FLOAT;
+                static LONG said_rgb;
+                if (rr && rr->buffer && rnum && !(roff % 12)) {
+                    struct mad_shadow *sh;
+                    EnterCriticalSection(&d->view_lock);
+                    sh = mad_shadow_get_locked(d, rr, rf, roff / 12, rnum);
+                    if (sh) rid = mad_shadow_tex_locked(d, sh, rf);
+                    LeaveCriticalSection(&d->view_lock);
+                }
+                if (!rid) { why = "RGB32 typed buffer view: no shadow for the SM 5.x backend"; goto bad; }
+                if (InterlockedIncrement(&said_rgb) <= 4)
+                    d3d12_log("[madeira-d3d12] rgb32-shader: an SM 5.x shader reads an RGB32 view (%llu elements): served from a shadow\n",
+                              (unsigned long long)rnum);
+                tab[off + 0] = rid;
+                tab[off + 1] = rnum << 32;
+            } else if (de.metadata & MAD_DESC_TYPEDBUF) {
                 UINT32 count = 0, first = 0;
                 if (!mad_air_texbuf(d, de.texture_view_id, &count, &first)) {
                     why = "typed buffer view not found"; goto bad;
@@ -7774,6 +7818,19 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                           (unsigned)fmt, (unsigned long long)first, (unsigned long long)num);
             return 0;
         }
+        if (mad_rgb32_shader_on() && !g_rgb32_unsafe && num && num <= (1u << 28) / 3) {
+            DXGI_FORMAT r32 = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? DXGI_FORMAT_R32_FLOAT : fmt == DXGI_FORMAT_R32G32B32_SINT ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT;
+            UINT kind = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? 0 : fmt == DXGI_FORMAT_R32G32B32_SINT ? 2 : 1;
+            static unsigned said_sh;
+            if (mad_typed_buffer_view(d, r, r32, first * 3, num * 3, 0, e)) {
+                e->metadata |= MAD_DESC_RGB32 | ((UINT64)kind << 60);
+                InterlockedIncrement(&g_rgb32_shader_views);
+                if (said_sh++ < 16)
+                    d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) first %llu num %llu of '%s': read in the shader (rgb32-shader), no shadow\n",
+                              (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, r->name ? r->name : "?");
+                return 1;
+            }
+        }
         EnterCriticalSection(&d->view_lock);
         s = mad_shadow_get_locked(d, r, fmt, first, num);
         if (s && (id = mad_shadow_tex_locked(d, s, fmt))) {
@@ -10963,6 +11020,18 @@ static obj_handle_t mad_convert_stage_opts(struct mad_device *d, struct mad_root
         }
     }
     mad_convert_note_time(t0, retried);
+    if (a.ret_rgb32) {   /* wine-lab port: see mad_rgb32_shader_on */
+        UINT left = a.ret_rgb32 >> 16;
+        InterlockedIncrement(&g_rgb32_pipes);
+        if (left) {
+            static LONG said;
+            if (!g_rgb32_unsafe || InterlockedIncrement(&said) <= 8)
+                d3d12_log("[madeira-d3d12] rgb32-shader: %s '%s' has %u typed-buffer access(es) the rewrite could not reach (%s); "
+                          "RGB32 views made from now on use shadows, those made before read as R32 through it\n",
+                          tag, name, left, a.ret_note[0] ? a.ret_note : "no note");
+            InterlockedExchange(&g_rgb32_unsafe, 1);
+        }
+    }
     if (o && o->air) {   /* ml1008 */
         o->air->backend    = a.ret_backend;
         o->air->cb_bind    = a.ret_cb_table_bind;
@@ -14260,13 +14329,15 @@ __declspec(dllexport) void MadeiraD3D12LogProbe(const char *msg, unsigned repeat
  * bytes copied, bytes of the views refreshed (what whole refreshes would copy),
  * whole-buffer refreshes skipped because nothing ran that could write the buffer,
  * big-view refreshes held to once a frame, live shadows and their bytes, the
- * rgb32-big-exact setting and the big-view threshold in bytes. */
-struct madeira_shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes; };
+ * rgb32-big-exact setting, the big-view threshold in bytes, rgb32-shader, RGB32
+ * views made for the shader path, and whether a pipeline turned it off. */
+struct madeira_shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes, rgb32_shader, shader_views, unsafe, big_frames; };
 __declspec(dllexport) void MadeiraD3D12ShadowStats(struct madeira_shadow_stats *st) {
     if (!st) return;
     st->copied = (UINT64)g_shadow_sum_copied; st->viewed = (UINT64)g_shadow_sum_viewed; st->skips = (UINT64)g_shadow_sum_skips;
     st->big_skips = (UINT64)g_shadow_sum_big_skips; st->live = (UINT64)g_shadow_live; st->live_bytes = (UINT64)g_shadow_live_bytes;
     st->big_bytes = mad_shadow_big_bytes(); st->big_exact = (UINT64)g_big_exact;
+    st->rgb32_shader = (UINT64)mad_rgb32_shader_on(); st->shader_views = (UINT64)g_rgb32_shader_views; st->unsafe = (UINT64)g_rgb32_unsafe; st->big_frames = (UINT64)(INT64)g_big_frames;
 }
 __declspec(dllexport) const char *MadeiraD3D12GetBuildMarker(void) {
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
