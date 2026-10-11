@@ -16,6 +16,7 @@ EXPORTS
     D3D12SerializeVersionedRootSignature
     MadeiraD3D12CreateDevice
     MadeiraD3D12GetBuildMarker
+    MadeiraD3D12ShadowStats
     MadeiraD3D12LogProbe
     MadeiraD3D12GetQueueStats
     MadeiraD3D12SerializeRootSignature

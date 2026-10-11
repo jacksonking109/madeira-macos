@@ -1268,7 +1268,7 @@ struct mad_cmd {
         struct { struct mad_resource *res; UINT64 off, len; UINT8 byte; obj_handle_t pattern; } fill;   /* ml1151: pattern = exact 32-bit source */
         struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
         struct { float rgba[4]; } blend;
-        struct { struct mad_resource *res; } shadow;   /* MC_SHADOW */
+        struct { struct mad_resource *res; UINT8 unk; } shadow;   /* MC_SHADOW; unk = left a write state other than COPY_DEST */
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
     } u;
 };
@@ -1546,6 +1546,7 @@ struct mad_tcent {
     const void *airv; const struct mad_rootsig *rs; const void *srv, *smp; unsigned vis_mask, nair, cb_bind, arg_bind, arg_qwords;
     struct mad_tcpart cb, arg;
 };
+#define MAD_SHRANGE_N 32
 struct mad_exec {
     int fence_needed;
     struct mad_resource *wr[64]; unsigned nwr; int wr_all;   /* ml1116: written since the last fence wait (mode 3) */   /* ml1111: fence-chain = 2: a barrier (or list start) was seen since the last wait */
@@ -1569,7 +1570,9 @@ struct mad_exec {
     struct mad_resource *cap_after_cs;   /* ml920: texture to capture after the current dispatch */
     struct { struct mad_resource *r; UINT64 off; char label[96]; } cap_after_buf[6]; unsigned ncap_after_buf;   /* ml922 */
     struct { struct mad_resource *r; UINT slice; char label[96]; } cap_after_tex[6]; unsigned ncap_after_tex;   /* ml924 */
-    struct mad_resource *shadow_res[8]; unsigned nshadow_res; int shadow_all;   /* wine-lab port: buffers with RGB32 shadows a copy or fill wrote; refreshed at the list end */
+    /* wine-lab port: RGB32 shadows (see struct mad_shadow): ranges copies wrote, ranges due before the next reader */
+    struct mad_shrange { struct mad_resource *r; UINT64 lo, hi; } shw[MAD_SHRANGE_N], shp[MAD_SHRANGE_N]; unsigned nshw, nshp; int sh_all;
+    unsigned sh_work; struct { struct mad_resource *r; unsigned work; } shfull[16]; unsigned nshfull;   /* draws + dispatches so far; when each buffer was last added whole */
     UINT64 root[MAD_ROOT_PARAM_MAX]; UINT nroot;
     UINT32 consts[MAD_ROOT_PARAM_MAX][64];
     UINT stencil_ref;
@@ -2912,13 +2915,22 @@ static int exec_begin_blit(struct mad_exec *e) {
  * into R32Uint 2D linear textures over the shadow's storage (3 texels wide,
  * 16-byte rows, MAD_SHADOW_ROWS rows each), so no kernel is needed.
  * A source the GPU writes (DEFAULT, READBACK) is refreshed in GPU order, in a
- * blit encoder of its own fenced on both sides like a barrier:
- *  - at the start of the next list replayed after the shadow is made (the source
- *    may already hold data);
- *  - after a ResourceBarrier that makes the source readable (MC_SHADOW; the
- *    shadows of one ResourceBarrier call share one encoder);
- *  - at the end of a list in which a copy or fill wrote the source (copy queues
- *    and implicit promotion from COMMON need no barrier).
+ * blit encoder of its own fenced on both sides like a barrier, and only the
+ * bytes that may have changed:
+ *  - copies and fills (and texture-to-buffer copies) record the byte range they
+ *    write (e->shw); a ResourceBarrier that makes the source readable again
+ *    (MC_SHADOW) moves its ranges to the pending set (e->shp), and a barrier out
+ *    of UNORDERED_ACCESS (or another non-copy write state) adds the WHOLE buffer,
+ *    since shader writes are not enumerated -- unless no draw or dispatch ran
+ *    since the buffer was last added whole in this list;
+ *  - pending ranges are refreshed lazily, just before the next draw, dispatch or
+ *    ExecuteIndirect (the first possible reader), and at the list end with any
+ *    copy ranges never made readable by a barrier (copy queues, implicit
+ *    promotion); everything due then shares one encoder, and each shadow copies
+ *    only its intersection with the ranges;
+ *  - at the start of the next list replayed after a shadow is made, whole.
+ * (34a7bd6 refreshed every shadow of a buffer whole at each such barrier: TLOU1
+ * has 84 views of one 64 MB pool, and moved 3.7 GB per frame.)
  * An UPLOAD source is written by the CPU only, so its shadow is expanded on the
  * CPU (mad_shadow_cpu_sync) at creation and in every ExecuteCommandLists call,
  * on the caller's thread before anything is queued: elements whose x, y, z
@@ -2946,61 +2958,117 @@ struct mad_shadow {
 static LONG g_shadow_refresh, g_shadow_encoders, g_shadow_frames, g_shadow_live;
 static void mad_shadow_cpu_sync(struct mad_device *d);
 static LONG64 g_shadow_refresh_bytes, g_shadow_cpu_bytes, g_shadow_cpu_changed;
-static void exec_shadow_encode(struct mad_exec *e, const struct mad_shadow *s) {
+static LONG64 g_shadow_req_bytes, g_shadow_full_adds, g_shadow_full_skips, g_shadow_live_bytes;
+static LONG64 g_shadow_sum_copied, g_shadow_sum_viewed, g_shadow_sum_skips;   /* since load, never reset: MadeiraD3D12ShadowStats */
+/* Elements [a, b) of the view (a < b <= rows) into the shadow. */
+static void exec_shadow_encode(struct mad_exec *e, const struct mad_shadow *s, UINT64 a, UINT64 b) {
     unsigned k;
-    for (k = 0; k < s->ndst; k++) {
+    for (k = (unsigned)(a / MAD_SHADOW_ROWS); k < s->ndst && (UINT64)k * MAD_SHADOW_ROWS < b; k++) {
         struct wmtcmd_blit_copy_from_buffer_to_texture c;
-        UINT64 r0 = (UINT64)k * MAD_SHADOW_ROWS, n;
-        if (r0 >= s->rows) break;
-        n = s->rows - r0; if (n > MAD_SHADOW_ROWS) n = MAD_SHADOW_ROWS;
+        UINT64 r0 = (UINT64)k * MAD_SHADOW_ROWS, lo = a > r0 ? a : r0, hi = b < r0 + MAD_SHADOW_ROWS ? b : r0 + MAD_SHADOW_ROWS, n = hi - lo;
         memset(&c, 0, sizeof c);
         c.type = WMTBlitCommandCopyFromBufferToTexture;
-        c.src = s->src->buffer; c.src_offset = (s->first + r0) * 12;
+        c.src = s->src->buffer; c.src_offset = (s->first + lo) * 12;
         c.bytes_per_row = 12; c.bytes_per_image = (UINT32)(n * 12);
         c.size.width = 3; c.size.height = (UINT32)n; c.size.depth = 1;
-        c.dst = s->dst[k];
+        c.dst = s->dst[k]; c.origin.y = (UINT32)(lo - r0);
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&c);
-        InterlockedExchangeAdd64(&g_shadow_refresh_bytes, (LONG64)(n * 12));
+        InterlockedExchangeAdd64(&g_shadow_refresh_bytes, (LONG64)(n * 12)); InterlockedExchangeAdd64(&g_shadow_sum_copied, (LONG64)(n * 12));
     }
 }
-/* which: 0 = the shadows of rs[0..nr); 1 = list start: those not refreshed since
- * they were made; 2 = every shadow. Never the CPU-expanded ones. */
-static void exec_shadows(struct mad_exec *e, struct mad_resource *const *rs, unsigned nr, int which) {
+static int exec_shadow_open(struct mad_exec *e) {   /* its own encoder, synced on both sides as after a barrier */
+    exec_end(e);
+    e->fence_needed = 1; e->f6_sync_needed = 1;
+    if (!exec_begin_blit(e)) return 0;
+    InterlockedIncrement(&g_shadow_encoders);
+    return 1;
+}
+static void exec_shadow_close(struct mad_exec *e) { exec_end(e); e->fence_needed = 1; e->f6_sync_needed = 1; }
+/* List start: the shadows made since, whole. */
+static void exec_shadows_new(struct mad_exec *e) {
     struct mad_device *d = e->q->device;
-    unsigned i, j, n = 0;
-    if (!d->nshadows) return;
+    unsigned i, n = 0;
     EnterCriticalSection(&d->view_lock);
     for (i = 0; i < d->nshadows; i++) {
         struct mad_shadow *s = d->shadows[i];
-        int hit = which == 2 || (which == 1 && s->dirty);
-        for (j = 0; j < nr && !hit; j++) hit = rs[j] == s->src;
-        if (!hit || s->cpu || !s->rows || !s->src->buffer) continue;
-        if (!n++) {   /* its own encoder, synced on both sides as after a barrier */
-            exec_end(e);
-            e->fence_needed = 1; e->f6_sync_needed = 1;
-            if (!exec_begin_blit(e)) break;
-            InterlockedIncrement(&g_shadow_encoders);
-        }
+        if (!s->dirty || s->cpu || !s->rows || !s->src->buffer) continue;
+        if (!n++ && !exec_shadow_open(e)) break;
         if (InterlockedExchange(&s->dirty, 0)) InterlockedDecrement(&d->shadow_pending);
-        exec_shadow_encode(e, s);
-        InterlockedIncrement(&g_shadow_refresh);
+        exec_shadow_encode(e, s, 0, s->rows);
+        InterlockedIncrement(&g_shadow_refresh); InterlockedExchangeAdd64(&g_shadow_req_bytes, (LONG64)(s->rows * 12)); InterlockedExchangeAdd64(&g_shadow_sum_viewed, (LONG64)(s->rows * 12));
     }
     LeaveCriticalSection(&d->view_lock);
-    if (n) { exec_end(e); e->fence_needed = 1; e->f6_sync_needed = 1; }
+    if (n) exec_shadow_close(e);
 }
-static void exec_shadow_note_write(struct mad_exec *e, struct mad_resource *r) {
+/* Adds [lo, hi) of r to a range set, merging with an overlapping or adjacent
+ * range of r; when full, widened into another range of r, else "everything". */
+static void exec_shrange_add(struct mad_exec *e, struct mad_shrange *a, unsigned *n, struct mad_resource *r, UINT64 lo, UINT64 hi) {
+    unsigned i, close_i = ~0u;
+    if (hi <= lo || e->sh_all) return;
+    for (i = 0; i < *n; i++) if (a[i].r == r) {
+        if (lo <= a[i].hi && hi >= a[i].lo) {
+            if (lo < a[i].lo) a[i].lo = lo;
+            if (hi > a[i].hi) a[i].hi = hi;
+            return;
+        }
+        close_i = i;
+    }
+    if (*n < MAD_SHRANGE_N) { a[*n].r = r; a[*n].lo = lo; a[*n].hi = hi; ++*n; return; }
+    if (close_i != ~0u) { if (lo < a[close_i].lo) a[close_i].lo = lo; if (hi > a[close_i].hi) a[close_i].hi = hi; return; }
+    e->sh_all = 1;
+}
+static void exec_shadow_note_write(struct mad_exec *e, struct mad_resource *r, UINT64 off, UINT64 len) {
+    if (!r || !r->nshadow) return;
+    if (off > r->size) off = r->size;
+    if (len > r->size - off) len = r->size - off;
+    exec_shrange_add(e, e->shw, &e->nshw, r, off, off + len);
+}
+/* MC_SHADOW: r is readable again; unk = it left a write state other than COPY_DEST. */
+static void exec_shadow_barrier(struct mad_exec *e, struct mad_resource *r, int unk) {
     unsigned i;
-    if (!r || !r->nshadow || e->shadow_all) return;
-    for (i = 0; i < e->nshadow_res; i++) if (e->shadow_res[i] == r) return;
-    if (e->nshadow_res < 8) e->shadow_res[e->nshadow_res++] = r; else e->shadow_all = 1;
+    if (!r || !r->nshadow) return;
+    if (unk) {
+        for (i = 0; i < e->nshfull; i++) if (e->shfull[i].r == r) break;
+        if (i < e->nshfull && e->shfull[i].work == e->sh_work) { InterlockedIncrement64(&g_shadow_full_skips); InterlockedIncrement64(&g_shadow_sum_skips); }   /* nothing ran that could write it */
+        else {
+            exec_shrange_add(e, e->shp, &e->nshp, r, 0, r->size);
+            InterlockedIncrement64(&g_shadow_full_adds);
+            if (i == e->nshfull && e->nshfull < 16) e->nshfull++;
+            if (i < 16) { e->shfull[i].r = r; e->shfull[i].work = e->sh_work; }
+        }
+    }
+    for (i = 0; i < e->nshw; )
+        if (e->shw[i].r == r) { exec_shrange_add(e, e->shp, &e->nshp, r, e->shw[i].lo, e->shw[i].hi); e->shw[i] = e->shw[--e->nshw]; }
+        else i++;
 }
-static void exec_shadow_barrier(struct mad_exec *e, struct mad_resource *const *rs, unsigned nr) {   /* MC_SHADOW run */
-    unsigned i, k;
-    if (!nr) return;
-    exec_shadows(e, rs, nr, 0);
-    for (k = 0; k < nr; k++)   /* refreshed after the write: the list end need not again */
-        for (i = 0; i < e->nshadow_res; i++)
-            if (e->shadow_res[i] == rs[k]) { e->shadow_res[i] = e->shadow_res[--e->nshadow_res]; break; }
+/* Before a possible reader (and at the list end): every pending range. */
+static void exec_shadow_flush(struct mad_exec *e) {
+    struct mad_device *d = e->q->device;
+    unsigned i, j, n = 0;
+    if (!e->nshp && !e->sh_all) return;
+    EnterCriticalSection(&d->view_lock);
+    for (i = 0; i < d->nshadows; i++) {
+        struct mad_shadow *s = d->shadows[i];
+        UINT64 vlo, vhi; int hit = 0;
+        if (s->cpu || !s->rows || !s->src->buffer) continue;
+        vlo = s->first * 12; vhi = vlo + s->rows * 12;
+        for (j = 0; j < (e->sh_all ? 1 : e->nshp); j++) {
+            UINT64 lo = e->sh_all ? vlo : e->shp[j].lo, hi = e->sh_all ? vhi : e->shp[j].hi, a, b;
+            if (!e->sh_all && e->shp[j].r != s->src) continue;
+            if (hi <= vlo || lo >= vhi) continue;
+            a = lo > vlo ? (lo - vlo) / 12 : 0;
+            b = hi < vhi ? (hi - vlo + 11) / 12 : s->rows;
+            if (a >= b) continue;
+            if (!n++ && !exec_shadow_open(e)) goto out;
+            exec_shadow_encode(e, s, a, b);
+            hit = 1;
+        }
+        if (hit) { InterlockedIncrement(&g_shadow_refresh); InterlockedExchangeAdd64(&g_shadow_req_bytes, (LONG64)(s->rows * 12)); InterlockedExchangeAdd64(&g_shadow_sum_viewed, (LONG64)(s->rows * 12)); }
+    }
+out:
+    LeaveCriticalSection(&d->view_lock);
+    e->nshp = 0; e->sh_all = 0;
+    if (n) exec_shadow_close(e);
 }
 
 /* One slot of root values for this draw, from the list's shared chunks. */
@@ -5302,9 +5370,9 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
-    case MC_FILL_BB: exec_note_write(e, c->u.fill.res); exec_shadow_note_write(e, c->u.fill.res); break;
-    case MC_COPY_BB: exec_note_write(e, c->u.bb.dst); exec_shadow_note_write(e, c->u.bb.dst); break;
-    case MC_COPY_T2B: e->wr_all = 1; exec_shadow_note_write(e, c->u.bt.buf); break;
+    case MC_FILL_BB: exec_note_write(e, c->u.fill.res); exec_shadow_note_write(e, c->u.fill.res, c->u.fill.off, c->u.fill.len); break;
+    case MC_COPY_BB: exec_note_write(e, c->u.bb.dst); exec_shadow_note_write(e, c->u.bb.dst, c->u.bb.doff, c->u.bb.len); break;
+    case MC_COPY_T2B: e->wr_all = 1; exec_shadow_note_write(e, c->u.bt.buf, c->u.bt.off, ~(UINT64)0); break;
     default: e->wr_all = 1; break;   /* texture copies: destination fields differ per kind; be conservative */
     }
     switch (c->kind) {
@@ -5712,11 +5780,16 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
     }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    if (q->device->shadow_pending) exec_shadows(&e, NULL, 0, 1);   /* wine-lab port: shadows made since the last list */
+    if (q->device->shadow_pending) exec_shadows_new(&e);   /* wine-lab port: shadows made since the last list */
     LONG64 pr_list_t0 = mad_perf_replay_on() ? PR_NOW() : 0;   /* perf-replay */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
         e.cur = i;   /* ml1137 */
+        if (c->kind == MC_DRAW || c->kind == MC_DRAW_INDEXED || c->kind == MC_DISPATCH || c->kind == MC_DRAW_INDIRECT ||
+            c->kind == MC_DRAW_INDEXED_INDIRECT || c->kind == MC_DISPATCH_INDIRECT) {   /* wine-lab port: a possible shadow reader */
+            if (e.nshp || e.sh_all) exec_shadow_flush(&e);
+            e.sh_work++;
+        }
         switch (c->kind) {
         case MC_PSO: if (c->u.pso && c->u.pso->is_compute) e.cpso = c->u.pso; else e.pso = c->u.pso; break;
         case MC_CROOTSIG: e.crs = c->u.rootsig; break;
@@ -5788,17 +5861,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
             } else e.fence_needed = 1;   /* ml1111 */
             if (e.cenc || e.benc || (g_barrier_render && e.renc)) { if (e.renc) InterlockedIncrement(&g_barrier_renc_closed); exec_end(&e); }
             break;
-        case MC_SHADOW: {   /* wine-lab port: a run of them (one ResourceBarrier call) shares one encoder */
-            struct mad_resource *rs[16]; unsigned nr = 0;
-            for (;;) {
-                struct mad_resource *r = c->u.shadow.res;
-                if (r && r->nshadow) rs[nr++] = r;
-                if (nr == 16 || i + 1 >= l->ncmds || l->cmds[i + 1].kind != MC_SHADOW) break;
-                c = &l->cmds[++i];
-            }
-            exec_shadow_barrier(&e, rs, nr);
-            break;
-        }
+        case MC_SHADOW: exec_shadow_barrier(&e, c->u.shadow.res, c->u.shadow.unk); break;   /* wine-lab port: due before the next reader */
         case MC_QUERY_BEGIN: exec_query_begin(&e, c); break;     /* ml1088 */
         case MC_QUERY_END: exec_query_end(&e, c); break;
         case MC_QUERY_RESOLVE: exec_query_resolve(&e, c); break;
@@ -5823,8 +5886,12 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
         g_pr_t[PR_LIST] += PR_NOW() - pr_list_t0; g_pr_lists++; g_pr_cmds += l->ncmds;
         if (g_pr_draws >= 20000) mad_perf_replay_report();
     }
-    if (e.shadow_all) exec_shadows(&e, NULL, 0, 2);   /* wine-lab port: sources a copy wrote */
-    else if (e.nshadow_res) exec_shadows(&e, e.shadow_res, e.nshadow_res, 0);
+    if (e.nshw || e.nshp || e.sh_all) {   /* wine-lab port: ranges still due, and copies no barrier made readable */
+        unsigned k;
+        for (k = 0; k < e.nshw; k++) exec_shrange_add(&e, e.shp, &e.nshp, e.shw[k].r, e.shw[k].lo, e.shw[k].hi);
+        e.nshw = 0;
+        exec_shadow_flush(&e);
+    }
     q->open_draws += e.draws;   /* wine-lab port: batch-draws */
     if (e.renc && !e.npend && e.mode != 6 && mad_pass_carry_on() &&
         (q->carry || (q->carry = malloc(sizeof *q->carry)))) {   /* wine-lab port: pass-carry */
@@ -5874,10 +5941,13 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
             if (g_shadow_live) {   /* wine-lab port */
                 LONG fr = InterlockedExchange(&g_shadow_frames, 0), rf = InterlockedExchange(&g_shadow_refresh, 0), en = InterlockedExchange(&g_shadow_encoders, 0);
                 LONG64 rb = InterlockedExchange64(&g_shadow_refresh_bytes, 0), cb = InterlockedExchange64(&g_shadow_cpu_bytes, 0), ch = InterlockedExchange64(&g_shadow_cpu_changed, 0);
+                LONG64 rq = InterlockedExchange64(&g_shadow_req_bytes, 0), fa = InterlockedExchange64(&g_shadow_full_adds, 0), fs = InterlockedExchange64(&g_shadow_full_skips, 0);
                 double f = fr ? (double)fr : 1.0;   /* no Present: per-frame figures are the 5 s totals */
-                d3d12_log("[madeira-d3d12] rgb32 shadows: %ld live; last 5 s, %ld frames%s: GPU %ld refreshes in %ld encoders (%.1f/frame), %.2f MB (%.3f MB/frame); "
+                d3d12_log("[madeira-d3d12] rgb32 shadows: %ld live (%.1f MB); last 5 s, %ld frames%s: GPU %ld view refreshes in %ld encoders (%.1f/frame), "
+                          "%.2f MB copied (%.3f MB/frame) of %.2f MB viewed (%.3f MB/frame); whole-buffer adds after a shader-write barrier %lld, skipped (no work since) %lld; "
                           "CPU %.2f MB scanned (%.3f MB/frame), %lld elements changed (%.0f/frame)\n",
-                          g_shadow_live, fr, fr ? "" : " (no Present: totals)", rf, en, rf / f, rb / 1048576.0, rb / 1048576.0 / f,
+                          g_shadow_live, g_shadow_live_bytes / 1048576.0, fr, fr ? "" : " (no Present: totals)", rf, en, rf / f,
+                          rb / 1048576.0, rb / 1048576.0 / f, rq / 1048576.0, rq / 1048576.0 / f, (long long)fa, (long long)fs,
                           cb / 1048576.0, cb / 1048576.0 / f, (long long)ch, ch / f);
             }
             if (e.q && e.q->device)
@@ -7544,7 +7614,7 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
     struct mad_shadow *s; struct WMTBufferInfo bi; struct WMTTextureInfo ti;
     enum WMTPixelFormat pf; int is_depth = 0; DXGI_FORMAT wide; UINT32 one, *w; UINT64 k, avail;
     unsigned i;
-    static unsigned said;
+    static unsigned said, said_big;
     for (i = 0; i < d->nshadows; i++) {
         s = d->shadows[i];
         if (s->src == r && s->fmt == (UINT)fmt && s->first == first && s->num == num) return s;
@@ -7588,9 +7658,9 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
     d->shadows[d->nshadows++] = s;
     r->nshadow++;
     InterlockedExchange(&d->shadow_ever, 1);
-    InterlockedIncrement(&g_shadow_live);
-    if (said++ < 16)
-        d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) first %llu num %llu of '%s' (%llu bytes%s) -> RGBA32 shadow, %llu elements copied per refresh, w = %#x\n",
+    InterlockedIncrement(&g_shadow_live); InterlockedExchangeAdd64(&g_shadow_live_bytes, (LONG64)(num * 16));
+    if (said++ < 16 || (num * 12 >= (1u << 20) && said_big++ < 32))
+        d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) first %llu num %llu of '%s' (%llu bytes%s) -> RGBA32 shadow, %llu elements at most per refresh, w = %#x\n",
                   (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, r->name ? r->name : "?",
                   (unsigned long long)r->size, s->cpu ? ", UPLOAD: expanded on the CPU at every ExecuteCommandLists" : "",
                   (unsigned long long)s->rows, one);
@@ -7621,6 +7691,7 @@ static void mad_shadow_free(struct mad_device *d, struct mad_resource *r) {
         NSObject_release(s->tbv);
         mad_unresident(d, s->buf);
         NSObject_release(s->buf);
+        InterlockedExchangeAdd64(&g_shadow_live_bytes, -(LONG64)(s->num * 16));
         free(s);
         InterlockedDecrement(&g_shadow_live);
     }
@@ -12833,7 +12904,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             struct mad_cmd *sc;
             if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) continue;
             if (!r || !r->buffer || (as & W) || (bs && !(bs & W)) || (r->cpu && r->heap != D3D12_HEAP_TYPE_READBACK)) continue;
-            if ((sc = mad_list_push(l, MC_SHADOW))) sc->u.shadow.res = r;
+            if ((sc = mad_list_push(l, MC_SHADOW))) { sc->u.shadow.res = r; sc->u.shadow.unk = (bs & W & ~(UINT)D3D12_RESOURCE_STATE_COPY_DEST) != 0; }
         }
     }
 }
@@ -14122,6 +14193,14 @@ static void build_vtables(void) {
 __declspec(dllexport) void MadeiraD3D12LogProbe(const char *msg, unsigned repeat) {
     unsigned i;
     for (i = 0; i < repeat; i++) d3d12_log("[log-probe] %u %s", i, msg ? msg : "");
+}
+/* wine-lab port: RGB32 shadow GPU refresh totals since load (tests/windows/rgb32_test.c):
+ * bytes copied, bytes of the views refreshed (what whole refreshes would copy),
+ * whole-buffer refreshes skipped because nothing ran that could write the buffer. */
+__declspec(dllexport) void MadeiraD3D12ShadowStats(UINT64 *copied, UINT64 *viewed, UINT64 *skips) {
+    if (copied) *copied = (UINT64)g_shadow_sum_copied;
+    if (viewed) *viewed = (UINT64)g_shadow_sum_viewed;
+    if (skips) *skips = (UINT64)g_shadow_sum_skips;
 }
 __declspec(dllexport) const char *MadeiraD3D12GetBuildMarker(void) {
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
