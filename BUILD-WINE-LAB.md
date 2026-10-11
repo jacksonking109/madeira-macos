@@ -57,7 +57,8 @@ loop leaves through one of its own exits, an exiting branch that every iteration
 (no new edges, so the IR stays valid; a phi, an add, a compare and an or/and per pass). Loops without such a branch
 are left alone and logged. madeira.cfg loop-watchdog = 0 turns it off, loop-watchdog-ps = 1 also guards pixel shaders.
 MAD_LWD_VERSION and the cap are keyed in the DXIL cache of the shaders it guards. The rewrite costs ~0.3-1 ms per
-compute shader (parse + write, Rosetta), only on a cache miss.
+compute shader (parse + write, Rosetta), only on a cache miss. Host test, conversion only, with the captured TLOU
+kernels: see the header of tests/native/loop_watchdog_test.cpp.
 
 libmetalirconverter.dylib (MSC 4.0 beta 2, x86_64 slice) goes next to d3d12.so, or set MADEIRA_MSC_DYLIB.
 
@@ -93,7 +94,10 @@ d3d12-readback-x64.exe (tests/windows/readback_test.c, 0 failures, 15 checks: a 
 read exactly the moment its fence passes, 150 iterations each of one list, lists batched together, the copy on a copy
 queue behind Wait, a compute queue, and frames in flight in a 16 MB readback buffer; 64-bit InterlockedMin without the
 old value is exact on raw, structured and 2 MB typed R32G32_UINT buffers; groupshared 64-bit atomics only while
-D3D12_OPTIONS9 claims them, which it no longer does by default; precompiled DXIL from readback.hlsl).
+D3D12_OPTIONS9 claims them, which it no longer does by default; precompiled DXIL from readback.hlsl);
+d3d12-loopwd-x64.exe (tests/windows/loopwd_test.c, 0 failures, 11 checks: a compute kernel with a counted loop and a
+data-dependent loop, bounds from a buffer, exact for normal bounds and stopped at the default cap for 1 << 24 passes;
+always finite, 0.5 s on an M3 Pro with the watchdog off; precompiled DXIL from loopwd.hlsl).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
