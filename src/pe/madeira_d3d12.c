@@ -1571,7 +1571,7 @@ struct mad_exec {
     struct { struct mad_resource *r; UINT64 off; char label[96]; } cap_after_buf[6]; unsigned ncap_after_buf;   /* ml922 */
     struct { struct mad_resource *r; UINT slice; char label[96]; } cap_after_tex[6]; unsigned ncap_after_tex;   /* ml924 */
     /* wine-lab port: RGB32 shadows (see struct mad_shadow): ranges copies wrote, ranges due before the next reader */
-    struct mad_shrange { struct mad_resource *r; UINT64 lo, hi; } shw[MAD_SHRANGE_N], shp[MAD_SHRANGE_N]; unsigned nshw, nshp; int sh_all;
+    struct mad_shrange { struct mad_resource *r; UINT64 lo, hi; int unk; } shw[MAD_SHRANGE_N], shp[MAD_SHRANGE_N]; unsigned nshw, nshp; int sh_all;   /* unk: a shader may have written it */
     unsigned sh_work; struct { struct mad_resource *r; unsigned work; } shfull[16]; unsigned nshfull;   /* draws + dispatches so far; when each buffer was last added whole */
     UINT64 root[MAD_ROOT_PARAM_MAX]; UINT nroot;
     UINT32 consts[MAD_ROOT_PARAM_MAX][64];
@@ -2931,6 +2931,12 @@ static int exec_begin_blit(struct mad_exec *e) {
  *  - at the start of the next list replayed after a shadow is made, whole.
  * (34a7bd6 refreshed every shadow of a buffer whole at each such barrier: TLOU1
  * has 84 views of one 64 MB pool, and moved 3.7 GB per frame.)
+ * UINT, SINT and TYPELESS views of one range share one shadow (same bytes, w = 1),
+ * each format with its own texture-buffer view of it; FLOAT has its own (w = 1.0f).
+ * Big views (rgb32-big-mb) are refreshed after shader writes at most once per
+ * frame: see mad_shadow_big_bytes. Shadows live as long as their buffer: a
+ * descriptor anywhere in a heap may name one, and nothing says when it is read,
+ * so an unused one cannot be found and freed safely.
  * An UPLOAD source is written by the CPU only, so its shadow is expanded on the
  * CPU (mad_shadow_cpu_sync) at creation and in every ExecuteCommandLists call,
  * on the caller's thread before anything is queued: elements whose x, y, z
@@ -2948,17 +2954,46 @@ struct mad_shadow {
     UINT fmt; UINT64 first, num;   /* the view, in 12-byte elements of src */
     UINT64 rows;                   /* elements src holds from first on (<= num): what a refresh copies */
     obj_handle_t buf; UINT64 gpu;  /* num x 16 bytes, shared */
-    obj_handle_t tbv; UINT64 id;   /* the RGBA32 texture buffer the descriptors name */
+    obj_handle_t tbv[3]; UINT64 id[3];   /* the RGBA32 Float / Uint / Sint texture buffers descriptors name, made on demand */
+    UINT cls;                      /* 0 FLOAT; 1 UINT, SINT and TYPELESS views, which share a shadow (same bytes, w = 1) */
+    int big;                       /* rows x 12 >= rgb32-big-mb: refreshed after shader writes at most once per frame */
+    UINT64 unk_frame;              /* the frame of its last such refresh, MAD_FRAME_NEVER before one */
     obj_handle_t *dst; unsigned ndst;   /* blit destinations, MAD_SHADOW_ROWS elements each */
     volatile LONG dirty;           /* made, not refreshed yet */
     int cpu;                       /* an UPLOAD source: expanded on the CPU, never by a blit */
     UINT32 *map;                   /* the shadow's CPU view */
 };
 #define MAD_SHADOW_ROWS 16384u     /* the largest 2D texture height */
+#define MAD_FRAME_NEVER (~(UINT64)0)
 static LONG g_shadow_refresh, g_shadow_encoders, g_shadow_frames, g_shadow_live;
 static void mad_shadow_cpu_sync(struct mad_device *d);
 static LONG64 g_shadow_refresh_bytes, g_shadow_cpu_bytes, g_shadow_cpu_changed;
-static LONG64 g_shadow_req_bytes, g_shadow_full_adds, g_shadow_full_skips, g_shadow_live_bytes;
+static LONG64 g_shadow_req_bytes, g_shadow_full_adds, g_shadow_full_skips, g_shadow_live_bytes, g_shadow_shared;
+static LONG64 g_shadow_big_skips, g_shadow_big_skip_bytes, g_shadow_sum_big_skips;
+/* Frames for the big-view rule: Presents, or ExecuteCommandLists calls while the device never presented. */
+static volatile LONG64 g_present_seq, g_ecl_seq;
+static UINT64 mad_frame_now(void) { return g_present_seq ? (UINT64)g_present_seq : (UINT64)g_ecl_seq; }
+/* madeira.cfg rgb32-big-mb (default 4): a view of at least that many MB is "big":
+ * after a shader-write barrier (unknown range) it is refreshed whole at most once
+ * per rgb32-big-frames frames (default 1; 0 = never, copies only), on the first
+ * possible reader after the frame starts. Readers later in that frame may see data
+ * from before that frame's later shader writes: TLOU1 has whole-pool UINT/SINT views
+ * of 64 MB pools (90 MB shadows) and ~20 shader-write barriers on them a frame.
+ * Copy and fill ranges stay exact. rgb32-big-exact = 1 refreshes at every one. */
+static LONG64 g_big_bytes = -1; static int g_big_exact, g_big_frames;
+static UINT64 mad_shadow_big_bytes(void) {
+    if (g_big_bytes < 0) {
+        LONG64 mb = mad_cfg_int_pe("rgb32-big-mb", 4);
+        g_big_exact = mad_cfg_int_pe("rgb32-big-exact", 0) ? 1 : 0;
+        g_big_frames = (int)mad_cfg_int_pe("rgb32-big-frames", 1);
+        if (mb < 0) mb = 4;
+        d3d12_log("[madeira-d3d12] rgb32 shadows: views of %lld MB and more are big: %s\n", (long long)mb,
+                  g_big_exact ? "rgb32-big-exact = 1, refreshed at every shader-write barrier" :
+                  g_big_frames > 0 ? "after shader writes, refreshed at most once per rgb32-big-frames frames" : "rgb32-big-frames = 0, never refreshed after shader writes");
+        g_big_bytes = mb << 20;
+    }
+    return (UINT64)g_big_bytes;
+}
 static LONG64 g_shadow_sum_copied, g_shadow_sum_viewed, g_shadow_sum_skips;   /* since load, never reset: MadeiraD3D12ShadowStats */
 /* Elements [a, b) of the view (a < b <= rows) into the shadow. */
 static void exec_shadow_encode(struct mad_exec *e, const struct mad_shadow *s, UINT64 a, UINT64 b) {
@@ -3002,10 +3037,10 @@ static void exec_shadows_new(struct mad_exec *e) {
 }
 /* Adds [lo, hi) of r to a range set, merging with an overlapping or adjacent
  * range of r; when full, widened into another range of r, else "everything". */
-static void exec_shrange_add(struct mad_exec *e, struct mad_shrange *a, unsigned *n, struct mad_resource *r, UINT64 lo, UINT64 hi) {
+static void exec_shrange_add(struct mad_exec *e, struct mad_shrange *a, unsigned *n, struct mad_resource *r, UINT64 lo, UINT64 hi, int unk) {
     unsigned i, close_i = ~0u;
     if (hi <= lo || e->sh_all) return;
-    for (i = 0; i < *n; i++) if (a[i].r == r) {
+    for (i = 0; i < *n; i++) if (a[i].r == r && a[i].unk == unk) {
         if (lo <= a[i].hi && hi >= a[i].lo) {
             if (lo < a[i].lo) a[i].lo = lo;
             if (hi > a[i].hi) a[i].hi = hi;
@@ -3013,7 +3048,7 @@ static void exec_shrange_add(struct mad_exec *e, struct mad_shrange *a, unsigned
         }
         close_i = i;
     }
-    if (*n < MAD_SHRANGE_N) { a[*n].r = r; a[*n].lo = lo; a[*n].hi = hi; ++*n; return; }
+    if (*n < MAD_SHRANGE_N) { a[*n].r = r; a[*n].lo = lo; a[*n].hi = hi; a[*n].unk = unk; ++*n; return; }
     if (close_i != ~0u) { if (lo < a[close_i].lo) a[close_i].lo = lo; if (hi > a[close_i].hi) a[close_i].hi = hi; return; }
     e->sh_all = 1;
 }
@@ -3021,7 +3056,7 @@ static void exec_shadow_note_write(struct mad_exec *e, struct mad_resource *r, U
     if (!r || !r->nshadow) return;
     if (off > r->size) off = r->size;
     if (len > r->size - off) len = r->size - off;
-    exec_shrange_add(e, e->shw, &e->nshw, r, off, off + len);
+    exec_shrange_add(e, e->shw, &e->nshw, r, off, off + len, 0);
 }
 /* MC_SHADOW: r is readable again; unk = it left a write state other than COPY_DEST. */
 static void exec_shadow_barrier(struct mad_exec *e, struct mad_resource *r, int unk) {
@@ -3031,21 +3066,23 @@ static void exec_shadow_barrier(struct mad_exec *e, struct mad_resource *r, int 
         for (i = 0; i < e->nshfull; i++) if (e->shfull[i].r == r) break;
         if (i < e->nshfull && e->shfull[i].work == e->sh_work) { InterlockedIncrement64(&g_shadow_full_skips); InterlockedIncrement64(&g_shadow_sum_skips); }   /* nothing ran that could write it */
         else {
-            exec_shrange_add(e, e->shp, &e->nshp, r, 0, r->size);
+            exec_shrange_add(e, e->shp, &e->nshp, r, 0, r->size, 1);
             InterlockedIncrement64(&g_shadow_full_adds);
             if (i == e->nshfull && e->nshfull < 16) e->nshfull++;
             if (i < 16) { e->shfull[i].r = r; e->shfull[i].work = e->sh_work; }
         }
     }
     for (i = 0; i < e->nshw; )
-        if (e->shw[i].r == r) { exec_shrange_add(e, e->shp, &e->nshp, r, e->shw[i].lo, e->shw[i].hi); e->shw[i] = e->shw[--e->nshw]; }
+        if (e->shw[i].r == r) { exec_shrange_add(e, e->shp, &e->nshp, r, e->shw[i].lo, e->shw[i].hi, 0); e->shw[i] = e->shw[--e->nshw]; }
         else i++;
 }
 /* Before a possible reader (and at the list end): every pending range. */
 static void exec_shadow_flush(struct mad_exec *e) {
     struct mad_device *d = e->q->device;
     unsigned i, j, n = 0;
+    UINT64 frame = mad_frame_now();
     if (!e->nshp && !e->sh_all) return;
+    (void)mad_shadow_big_bytes();
     EnterCriticalSection(&d->view_lock);
     for (i = 0; i < d->nshadows; i++) {
         struct mad_shadow *s = d->shadows[i];
@@ -3056,6 +3093,14 @@ static void exec_shadow_flush(struct mad_exec *e) {
             UINT64 lo = e->sh_all ? vlo : e->shp[j].lo, hi = e->sh_all ? vhi : e->shp[j].hi, a, b;
             if (!e->sh_all && e->shp[j].r != s->src) continue;
             if (hi <= vlo || lo >= vhi) continue;
+            if (!e->sh_all && e->shp[j].unk && s->big && !g_big_exact) {   /* see mad_shadow_big_bytes */
+                if (g_big_frames <= 0 || (s->unk_frame != MAD_FRAME_NEVER && frame - s->unk_frame < (UINT64)g_big_frames)) {
+                    InterlockedIncrement64(&g_shadow_big_skips); InterlockedIncrement64(&g_shadow_sum_big_skips);
+                    InterlockedExchangeAdd64(&g_shadow_big_skip_bytes, (LONG64)(s->rows * 12));
+                    continue;
+                }
+                s->unk_frame = frame;
+            }
             a = lo > vlo ? (lo - vlo) / 12 : 0;
             b = hi < vhi ? (hi - vlo + 11) / 12 : s->rows;
             if (a >= b) continue;
@@ -5888,7 +5933,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
     }
     if (e.nshw || e.nshp || e.sh_all) {   /* wine-lab port: ranges still due, and copies no barrier made readable */
         unsigned k;
-        for (k = 0; k < e.nshw; k++) exec_shrange_add(&e, e.shp, &e.nshp, e.shw[k].r, e.shw[k].lo, e.shw[k].hi);
+        for (k = 0; k < e.nshw; k++) exec_shrange_add(&e, e.shp, &e.nshp, e.shw[k].r, e.shw[k].lo, e.shw[k].hi, 0);
         e.nshw = 0;
         exec_shadow_flush(&e);
     }
@@ -5942,12 +5987,15 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
                 LONG fr = InterlockedExchange(&g_shadow_frames, 0), rf = InterlockedExchange(&g_shadow_refresh, 0), en = InterlockedExchange(&g_shadow_encoders, 0);
                 LONG64 rb = InterlockedExchange64(&g_shadow_refresh_bytes, 0), cb = InterlockedExchange64(&g_shadow_cpu_bytes, 0), ch = InterlockedExchange64(&g_shadow_cpu_changed, 0);
                 LONG64 rq = InterlockedExchange64(&g_shadow_req_bytes, 0), fa = InterlockedExchange64(&g_shadow_full_adds, 0), fs = InterlockedExchange64(&g_shadow_full_skips, 0);
+                LONG64 bs = InterlockedExchange64(&g_shadow_big_skips, 0), bb = InterlockedExchange64(&g_shadow_big_skip_bytes, 0);
                 double f = fr ? (double)fr : 1.0;   /* no Present: per-frame figures are the 5 s totals */
                 d3d12_log("[madeira-d3d12] rgb32 shadows: %ld live (%.1f MB); last 5 s, %ld frames%s: GPU %ld view refreshes in %ld encoders (%.1f/frame), "
-                          "%.2f MB copied (%.3f MB/frame) of %.2f MB viewed (%.3f MB/frame); whole-buffer adds after a shader-write barrier %lld, skipped (no work since) %lld; "
+                          "%.2f MB copied (%.3f MB/frame) of %.2f MB viewed (%.3f MB/frame); whole-buffer adds after a shader-write barrier %lld, skipped (no work since) %lld; big views held to once a frame %lld times (%.0f MB not copied); "
+                          "%lld UINT/SINT views share a shadow; "
                           "CPU %.2f MB scanned (%.3f MB/frame), %lld elements changed (%.0f/frame)\n",
                           g_shadow_live, g_shadow_live_bytes / 1048576.0, fr, fr ? "" : " (no Present: totals)", rf, en, rf / f,
                           rb / 1048576.0, rb / 1048576.0 / f, rq / 1048576.0, rq / 1048576.0 / f, (long long)fa, (long long)fs,
+                          (long long)bs, bb / 1048576.0, (long long)g_shadow_shared,
                           cb / 1048576.0, cb / 1048576.0 / f, (long long)ch, ch / f);
             }
             if (e.q && e.q->device)
@@ -6081,6 +6129,7 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);   /* ml1119: caller-thread time in here */
     InterlockedIncrement(&g_perf_ecl);   /* ml1109 */
+    InterlockedIncrement64(&g_ecl_seq);
     if (q && q->device && q->device->shadow_ncpu) mad_shadow_cpu_sync(q->device);   /* wine-lab port: UPLOAD RGB32 shadows */
     mad_xp_role('E'); InterlockedIncrement64(&g_xp.ecl_calls);   /* ml1128 */
     if (q && q->sub_thread) {   /* ml1120: validate here, replay on the worker */
@@ -7612,21 +7661,20 @@ static void mad_shadow_cpu_sync(struct mad_device *d) {
 }
 static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt, UINT64 first, UINT64 num) {
     struct mad_shadow *s; struct WMTBufferInfo bi; struct WMTTextureInfo ti;
-    enum WMTPixelFormat pf; int is_depth = 0; DXGI_FORMAT wide; UINT32 one, *w; UINT64 k, avail;
+    UINT32 one, *w; UINT64 k, avail;
+    UINT cls = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? 0 : 1;
     unsigned i;
     static unsigned said, said_big;
     for (i = 0; i < d->nshadows; i++) {
         s = d->shadows[i];
-        if (s->src == r && s->fmt == (UINT)fmt && s->first == first && s->num == num) return s;
+        if (s->src == r && s->cls == cls && s->first == first && s->num == num) return s;
     }
     if (!num || num > (1u << 26) || !mad_grow((void **)&d->shadows, &d->shadows_cap, d->nshadows + 1, sizeof *d->shadows)) return NULL;
-    wide = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? DXGI_FORMAT_R32G32B32A32_FLOAT :
-           fmt == DXGI_FORMAT_R32G32B32_SINT ? DXGI_FORMAT_R32G32B32A32_SINT : DXGI_FORMAT_R32G32B32A32_UINT;   /* TYPELESS: bits */
-    one = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? 0x3f800000u : 1u;
-    if (!mad_map_texture_format(wide, 0, &pf, &is_depth)) return NULL;
+    one = cls ? 1u : 0x3f800000u;
     avail = r->size > first * 12 ? (r->size - first * 12) / 12 : 0;
     if (!(s = calloc(1, sizeof *s))) return NULL;
-    s->src = r; s->fmt = (UINT)fmt; s->first = first; s->num = num; s->rows = avail < num ? avail : num;
+    s->src = r; s->fmt = (UINT)fmt; s->cls = cls; s->first = first; s->num = num; s->rows = avail < num ? avail : num;
+    s->big = s->rows * 12 >= mad_shadow_big_bytes(); s->unk_frame = MAD_FRAME_NEVER;
     s->cpu = r->cpu && r->heap != D3D12_HEAP_TYPE_READBACK;   /* UPLOAD: only the CPU writes it */
     memset(&bi, 0, sizeof bi); bi.length = num * 16; bi.options = WMTResourceStorageModeShared;
     s->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
@@ -7634,13 +7682,6 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
     s->gpu = bi.gpu_address;
     w = s->map = (UINT32 *)bi.memory.ptr;
     for (k = 0; k < num; k++) { w[4 * k] = w[4 * k + 1] = w[4 * k + 2] = 0; w[4 * k + 3] = one; }
-    memset(&ti, 0, sizeof ti);
-    ti.pixel_format = pf; ti.width = (uint32_t)num; ti.height = 1; ti.depth = 1; ti.array_length = 1;
-    ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
-    ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModeShared;
-    s->tbv = MTLBuffer_newTexture(s->buf, &ti, 0, num * 16);
-    if (!s->tbv || !ti.gpu_resource_id) goto fail;
-    s->id = ti.gpu_resource_id;
     s->ndst = (unsigned)((num + MAD_SHADOW_ROWS - 1) / MAD_SHADOW_ROWS);
     if (!(s->dst = calloc(s->ndst, sizeof *s->dst))) goto fail;
     for (i = 0; i < s->ndst; i++) {
@@ -7652,7 +7693,6 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
         if (!(s->dst[i] = MTLBuffer_newTexture(s->buf, &ti, (UINT64)i * MAD_SHADOW_ROWS * 16, 16))) goto fail;
     }
     mad_resident(d, s->buf);   /* the views alias it (ml1126) */
-    mad_vmap_put_locked(d, s->id, (UINT32)num, 0);
     if (s->cpu) { mad_shadow_expand(s); InterlockedIncrement(&d->shadow_ncpu); }
     else { s->dirty = 1; InterlockedIncrement(&d->shadow_pending); }
     d->shadows[d->nshadows++] = s;
@@ -7662,17 +7702,40 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
     if (said++ < 16 || (num * 12 >= (1u << 20) && said_big++ < 32))
         d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) first %llu num %llu of '%s' (%llu bytes%s) -> RGBA32 shadow, %llu elements at most per refresh, w = %#x\n",
                   (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, r->name ? r->name : "?",
-                  (unsigned long long)r->size, s->cpu ? ", UPLOAD: expanded on the CPU at every ExecuteCommandLists" : "",
+                  (unsigned long long)r->size, s->cpu ? ", UPLOAD: expanded on the CPU at every ExecuteCommandLists" : s->big ? ", big" : "",
                   (unsigned long long)s->rows, one);
     return s;
 fail:
     if (s->dst) { for (i = 0; i < s->ndst; i++) if (s->dst[i]) NSObject_release(s->dst[i]); free(s->dst); }
-    if (s->tbv) NSObject_release(s->tbv);
     if (s->buf) NSObject_release(s->buf);
     free(s);
     if (said++ < 16) d3d12_log("[madeira-d3d12] typed buffer view: RGB32 shadow FAILED: fmt %u first %llu num %llu\n",
                                (unsigned)fmt, (unsigned long long)first, (unsigned long long)num);
     return NULL;
+}
+/* The shadow's RGBA32 texture buffer for a view of fmt (made on first use). view_lock held. */
+static UINT64 mad_shadow_tex_locked(struct mad_device *d, struct mad_shadow *s, DXGI_FORMAT fmt) {
+    struct WMTTextureInfo ti; enum WMTPixelFormat pf; int is_depth = 0;
+    unsigned nk = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? 0 : fmt == DXGI_FORMAT_R32G32B32_SINT ? 2 : 1;   /* TYPELESS: bits, as Uint */
+    if (s->tbv[nk]) return s->id[nk];
+    if (!mad_map_texture_format(nk == 0 ? DXGI_FORMAT_R32G32B32A32_FLOAT : nk == 2 ? DXGI_FORMAT_R32G32B32A32_SINT : DXGI_FORMAT_R32G32B32A32_UINT,
+                                0, &pf, &is_depth)) return 0;
+    memset(&ti, 0, sizeof ti);
+    ti.pixel_format = pf; ti.width = (uint32_t)s->num; ti.height = 1; ti.depth = 1; ti.array_length = 1;
+    ti.type = WMTTextureTypeTextureBuffer; ti.mipmap_level_count = 1; ti.sample_count = 1;
+    ti.usage = WMTTextureUsageShaderRead; ti.options = WMTResourceStorageModeShared;
+    s->tbv[nk] = MTLBuffer_newTexture(s->buf, &ti, 0, s->num * 16);
+    if (!s->tbv[nk] || !ti.gpu_resource_id) { if (s->tbv[nk]) NSObject_release(s->tbv[nk]); s->tbv[nk] = 0; return 0; }
+    s->id[nk] = ti.gpu_resource_id;
+    mad_vmap_put_locked(d, s->id[nk], (UINT32)s->num, 0);
+    if (nk && s->tbv[3 - nk]) {
+        static unsigned said;
+        InterlockedIncrement64(&g_shadow_shared);
+        if (said++ < 16)
+            d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) first %llu num %llu shares the %s view's shadow (%.1f MB saved)\n",
+                      (unsigned)fmt, (unsigned long long)s->first, (unsigned long long)s->num, nk == 2 ? "UINT" : "SINT", s->num * 16 / 1048576.0);
+    }
+    return s->id[nk];
 }
 /* With the resource (res_Release): its shadows go too. */
 static void mad_shadow_free(struct mad_device *d, struct mad_resource *r) {
@@ -7685,10 +7748,9 @@ static void mad_shadow_free(struct mad_device *d, struct mad_resource *r) {
         r->nshadow--;
         if (s->cpu) InterlockedDecrement(&d->shadow_ncpu);
         else if (InterlockedExchange(&s->dirty, 0)) InterlockedDecrement(&d->shadow_pending);
-        mad_vmap_del_locked(d, s->id);
+        for (k = 0; k < 3; k++) if (s->tbv[k]) { mad_vmap_del_locked(d, s->id[k]); NSObject_release(s->tbv[k]); }
         for (k = 0; k < s->ndst; k++) if (s->dst[k]) NSObject_release(s->dst[k]);
         free(s->dst);
-        NSObject_release(s->tbv);
         mad_unresident(d, s->buf);
         NSObject_release(s->buf);
         InterlockedExchangeAdd64(&g_shadow_live_bytes, -(LONG64)(s->num * 16));
@@ -7703,7 +7765,7 @@ static int mad_is_rgb32(DXGI_FORMAT f) {
 static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt,
                                  UINT64 first, UINT64 num, int uav, struct mad_descriptor *e) {
     if (mad_is_rgb32(fmt) && r->buffer) {   /* wine-lab port: Metal has no RGB32 texture buffer */
-        struct mad_shadow *s;
+        struct mad_shadow *s; UINT64 id = 0;
         static unsigned said_uav;
         if (uav) {
             if (said_uav++ < 8)
@@ -7714,11 +7776,11 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         }
         EnterCriticalSection(&d->view_lock);
         s = mad_shadow_get_locked(d, r, fmt, first, num);
-        if (s) {
+        if (s && (id = mad_shadow_tex_locked(d, s, fmt))) {
             e->gpu_va = s->gpu;
-            e->texture_view_id = s->id;
+            e->texture_view_id = id;
             e->metadata = ((num * 16) & 0xffffffffull) | (1ull << 63);
-        }
+        } else s = NULL;
         LeaveCriticalSection(&d->view_lock);
         return s != NULL;
     }
@@ -14196,11 +14258,15 @@ __declspec(dllexport) void MadeiraD3D12LogProbe(const char *msg, unsigned repeat
 }
 /* wine-lab port: RGB32 shadow GPU refresh totals since load (tests/windows/rgb32_test.c):
  * bytes copied, bytes of the views refreshed (what whole refreshes would copy),
- * whole-buffer refreshes skipped because nothing ran that could write the buffer. */
-__declspec(dllexport) void MadeiraD3D12ShadowStats(UINT64 *copied, UINT64 *viewed, UINT64 *skips) {
-    if (copied) *copied = (UINT64)g_shadow_sum_copied;
-    if (viewed) *viewed = (UINT64)g_shadow_sum_viewed;
-    if (skips) *skips = (UINT64)g_shadow_sum_skips;
+ * whole-buffer refreshes skipped because nothing ran that could write the buffer,
+ * big-view refreshes held to once a frame, live shadows and their bytes, the
+ * rgb32-big-exact setting and the big-view threshold in bytes. */
+struct madeira_shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes; };
+__declspec(dllexport) void MadeiraD3D12ShadowStats(struct madeira_shadow_stats *st) {
+    if (!st) return;
+    st->copied = (UINT64)g_shadow_sum_copied; st->viewed = (UINT64)g_shadow_sum_viewed; st->skips = (UINT64)g_shadow_sum_skips;
+    st->big_skips = (UINT64)g_shadow_sum_big_skips; st->live = (UINT64)g_shadow_live; st->live_bytes = (UINT64)g_shadow_live_bytes;
+    st->big_bytes = mad_shadow_big_bytes(); st->big_exact = (UINT64)g_big_exact;
 }
 __declspec(dllexport) const char *MadeiraD3D12GetBuildMarker(void) {
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
@@ -14567,7 +14633,7 @@ static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
-    InterlockedIncrement(&g_shadow_frames);   /* wine-lab port: per-frame RGB32 shadow figures */
+    InterlockedIncrement(&g_shadow_frames); InterlockedIncrement64(&g_present_seq);   /* wine-lab port: per-frame RGB32 shadow figures and rules */
     QueryPerformanceCounter(&t0);
     hr = swap_Present_pool(T, sync, flags);
     QueryPerformanceCounter(&t1);
