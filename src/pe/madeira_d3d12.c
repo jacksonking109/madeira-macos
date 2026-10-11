@@ -272,6 +272,7 @@ struct mad_device {
     /* wine-lab port: RGB32 typed-buffer shadows (see mad_shadow_view), under view_lock */
     struct mad_shadow **shadows; unsigned nshadows, shadows_cap;
     volatile LONG shadow_ever;   /* a shadow was ever made: barriers record MC_SHADOW from then on */
+    volatile LONG shadow_pending, shadow_ncpu;   /* GPU-refreshed shadows not refreshed since made; CPU-expanded shadows */
     /* ml1061: GPU timeline. Every committed batch signals `gpu_event` with its
      * serial, so "has the GPU finished X" is a read of one value instead of a
      * blocking wait. Fences are delivered by a worker thread; argument-ring
@@ -2910,14 +2911,24 @@ static int exec_begin_blit(struct mad_exec *e) {
  * never again: a refresh copies the 12-byte elements into x, y, z only, as a blit
  * into R32Uint 2D linear textures over the shadow's storage (3 texels wide,
  * 16-byte rows, MAD_SHADOW_ROWS rows each), so no kernel is needed.
- * Refreshes are encoded in GPU order, each in its own blit encoder fenced on both
- * sides like a barrier:
+ * A source the GPU writes (DEFAULT, READBACK) is refreshed in GPU order, in a
+ * blit encoder of its own fenced on both sides like a barrier:
  *  - at the start of the next list replayed after the shadow is made (the source
- *    may already hold data), and at every list start for a CPU-visible (UPLOAD)
- *    source, which the CPU writes without telling us;
- *  - after a ResourceBarrier that makes the source readable (MC_SHADOW);
+ *    may already hold data);
+ *  - after a ResourceBarrier that makes the source readable (MC_SHADOW; the
+ *    shadows of one ResourceBarrier call share one encoder);
  *  - at the end of a list in which a copy or fill wrote the source (copy queues
  *    and implicit promotion from COMMON need no barrier).
+ * An UPLOAD source is written by the CPU only, so its shadow is expanded on the
+ * CPU (mad_shadow_cpu_sync) at creation and in every ExecuteCommandLists call,
+ * on the caller's thread before anything is queued: elements whose x, y, z
+ * differ from the source are rewritten, the rest are not touched. The data a
+ * submission reads was written before its ExecuteCommandLists, so it is in the
+ * shadow before that work exists; work already in flight reads only elements
+ * the application may not change under it (D3D12's rule for upload memory),
+ * which therefore keep their bytes. No GPU work, no encoder, no pass ended.
+ * (The first version blitted every UPLOAD shadow at every list start: 15 shadows
+ * x dozens of lists took TLOU1's menu from 15-20 fps to under 3.)
  * A shader write to the source (UAV) is seen at its barrier only. UAVs of these
  * formats keep a raw descriptor: D3D12 has no typed UAV loads or stores for them. */
 struct mad_shadow {
@@ -2928,9 +2939,13 @@ struct mad_shadow {
     obj_handle_t tbv; UINT64 id;   /* the RGBA32 texture buffer the descriptors name */
     obj_handle_t *dst; unsigned ndst;   /* blit destinations, MAD_SHADOW_ROWS elements each */
     volatile LONG dirty;           /* made, not refreshed yet */
+    int cpu;                       /* an UPLOAD source: expanded on the CPU, never by a blit */
+    UINT32 *map;                   /* the shadow's CPU view */
 };
 #define MAD_SHADOW_ROWS 16384u     /* the largest 2D texture height */
-static LONG g_shadow_refresh;
+static LONG g_shadow_refresh, g_shadow_encoders, g_shadow_frames, g_shadow_live;
+static void mad_shadow_cpu_sync(struct mad_device *d);
+static LONG64 g_shadow_refresh_bytes, g_shadow_cpu_bytes, g_shadow_cpu_changed;
 static void exec_shadow_encode(struct mad_exec *e, const struct mad_shadow *s) {
     unsigned k;
     for (k = 0; k < s->ndst; k++) {
@@ -2945,10 +2960,11 @@ static void exec_shadow_encode(struct mad_exec *e, const struct mad_shadow *s) {
         c.size.width = 3; c.size.height = (UINT32)n; c.size.depth = 1;
         c.dst = s->dst[k];
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&c);
+        InterlockedExchangeAdd64(&g_shadow_refresh_bytes, (LONG64)(n * 12));
     }
 }
 /* which: 0 = the shadows of rs[0..nr); 1 = list start: those not refreshed since
- * they were made, and those of CPU-visible sources; 2 = every shadow. */
+ * they were made; 2 = every shadow. Never the CPU-expanded ones. */
 static void exec_shadows(struct mad_exec *e, struct mad_resource *const *rs, unsigned nr, int which) {
     struct mad_device *d = e->q->device;
     unsigned i, j, n = 0;
@@ -2956,15 +2972,16 @@ static void exec_shadows(struct mad_exec *e, struct mad_resource *const *rs, uns
     EnterCriticalSection(&d->view_lock);
     for (i = 0; i < d->nshadows; i++) {
         struct mad_shadow *s = d->shadows[i];
-        int hit = which == 2 || (which == 1 && (s->dirty || s->src->cpu));
+        int hit = which == 2 || (which == 1 && s->dirty);
         for (j = 0; j < nr && !hit; j++) hit = rs[j] == s->src;
-        if (!hit || !s->rows || !s->src->buffer) continue;
+        if (!hit || s->cpu || !s->rows || !s->src->buffer) continue;
         if (!n++) {   /* its own encoder, synced on both sides as after a barrier */
             exec_end(e);
             e->fence_needed = 1; e->f6_sync_needed = 1;
             if (!exec_begin_blit(e)) break;
+            InterlockedIncrement(&g_shadow_encoders);
         }
-        InterlockedExchange(&s->dirty, 0);
+        if (InterlockedExchange(&s->dirty, 0)) InterlockedDecrement(&d->shadow_pending);
         exec_shadow_encode(e, s);
         InterlockedIncrement(&g_shadow_refresh);
     }
@@ -2977,12 +2994,13 @@ static void exec_shadow_note_write(struct mad_exec *e, struct mad_resource *r) {
     for (i = 0; i < e->nshadow_res; i++) if (e->shadow_res[i] == r) return;
     if (e->nshadow_res < 8) e->shadow_res[e->nshadow_res++] = r; else e->shadow_all = 1;
 }
-static void exec_shadow_barrier(struct mad_exec *e, struct mad_resource *r) {   /* MC_SHADOW */
-    unsigned i;
-    if (!r || !r->nshadow) return;
-    exec_shadows(e, &r, 1, 0);
-    for (i = 0; i < e->nshadow_res; i++)   /* refreshed after the write: the list end need not again */
-        if (e->shadow_res[i] == r) { e->shadow_res[i] = e->shadow_res[--e->nshadow_res]; break; }
+static void exec_shadow_barrier(struct mad_exec *e, struct mad_resource *const *rs, unsigned nr) {   /* MC_SHADOW run */
+    unsigned i, k;
+    if (!nr) return;
+    exec_shadows(e, rs, nr, 0);
+    for (k = 0; k < nr; k++)   /* refreshed after the write: the list end need not again */
+        for (i = 0; i < e->nshadow_res; i++)
+            if (e->shadow_res[i] == rs[k]) { e->shadow_res[i] = e->shadow_res[--e->nshadow_res]; break; }
 }
 
 /* One slot of root values for this draw, from the list's shared chunks. */
@@ -5694,7 +5712,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
     }
     l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    if (q->device->nshadows) exec_shadows(&e, NULL, 0, 1);   /* wine-lab port: new shadows, CPU-written sources */
+    if (q->device->shadow_pending) exec_shadows(&e, NULL, 0, 1);   /* wine-lab port: shadows made since the last list */
     LONG64 pr_list_t0 = mad_perf_replay_on() ? PR_NOW() : 0;   /* perf-replay */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
@@ -5770,7 +5788,17 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
             } else e.fence_needed = 1;   /* ml1111 */
             if (e.cenc || e.benc || (g_barrier_render && e.renc)) { if (e.renc) InterlockedIncrement(&g_barrier_renc_closed); exec_end(&e); }
             break;
-        case MC_SHADOW: exec_shadow_barrier(&e, c->u.shadow.res); break;   /* wine-lab port */
+        case MC_SHADOW: {   /* wine-lab port: a run of them (one ResourceBarrier call) shares one encoder */
+            struct mad_resource *rs[16]; unsigned nr = 0;
+            for (;;) {
+                struct mad_resource *r = c->u.shadow.res;
+                if (r && r->nshadow) rs[nr++] = r;
+                if (nr == 16 || i + 1 >= l->ncmds || l->cmds[i + 1].kind != MC_SHADOW) break;
+                c = &l->cmds[++i];
+            }
+            exec_shadow_barrier(&e, rs, nr);
+            break;
+        }
         case MC_QUERY_BEGIN: exec_query_begin(&e, c); break;     /* ml1088 */
         case MC_QUERY_END: exec_query_end(&e, c); break;
         case MC_QUERY_RESOLVE: exec_query_resolve(&e, c); break;
@@ -5843,6 +5871,15 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
         if (!qpf.QuadPart) QueryPerformanceFrequency(&qpf);
         if (now - prev > 5 * qpf.QuadPart && InterlockedCompareExchange64(&last_census, now, prev) == prev) {
             mad_acct_report();
+            if (g_shadow_live) {   /* wine-lab port */
+                LONG fr = InterlockedExchange(&g_shadow_frames, 0), rf = InterlockedExchange(&g_shadow_refresh, 0), en = InterlockedExchange(&g_shadow_encoders, 0);
+                LONG64 rb = InterlockedExchange64(&g_shadow_refresh_bytes, 0), cb = InterlockedExchange64(&g_shadow_cpu_bytes, 0), ch = InterlockedExchange64(&g_shadow_cpu_changed, 0);
+                double f = fr ? (double)fr : 1.0;   /* no Present: per-frame figures are the 5 s totals */
+                d3d12_log("[madeira-d3d12] rgb32 shadows: %ld live; last 5 s, %ld frames%s: GPU %ld refreshes in %ld encoders (%.1f/frame), %.2f MB (%.3f MB/frame); "
+                          "CPU %.2f MB scanned (%.3f MB/frame), %lld elements changed (%.0f/frame)\n",
+                          g_shadow_live, fr, fr ? "" : " (no Present: totals)", rf, en, rf / f, rb / 1048576.0, rb / 1048576.0 / f,
+                          cb / 1048576.0, cb / 1048576.0 / f, (long long)ch, ch / f);
+            }
             if (e.q && e.q->device)
                 d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n",
                           (unsigned long long)(MTLDevice_currentAllocatedSize(e.q->device->mtl_device) >> 20));
@@ -5974,6 +6011,7 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);   /* ml1119: caller-thread time in here */
     InterlockedIncrement(&g_perf_ecl);   /* ml1109 */
+    if (q && q->device && q->device->shadow_ncpu) mad_shadow_cpu_sync(q->device);   /* wine-lab port: UPLOAD RGB32 shadows */
     mad_xp_role('E'); InterlockedIncrement64(&g_xp.ecl_calls);   /* ml1128 */
     if (q && q->sub_thread) {   /* ml1120: validate here, replay on the worker */
         struct mad_subjob *j = calloc(1, sizeof *j + (count ? count : 1) * sizeof(struct mad_list *));
@@ -7483,7 +7521,25 @@ static void mad_view_census(const char *kind, struct mad_resource *r, unsigned n
 
 /* wine-lab port: an RGB32 typed SRV, served from a shadow (see struct mad_shadow).
  * view_lock held. */
-static LONG g_shadow_live;
+/* An UPLOAD source's elements into its shadow, on the CPU: only those whose
+ * x, y, z changed are written (see struct mad_shadow). view_lock held. */
+static void mad_shadow_expand(struct mad_shadow *s) {
+    const UINT32 *src = (const UINT32 *)((const BYTE *)s->src->cpu + s->first * 12);
+    UINT32 *dst = s->map; UINT64 k, changed = 0;
+    for (k = 0; k < s->rows; k++, src += 3, dst += 4)
+        if (dst[0] != src[0] || dst[1] != src[1] || dst[2] != src[2]) {
+            dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; changed++;
+        }
+    InterlockedExchangeAdd64(&g_shadow_cpu_bytes, (LONG64)(s->rows * 12));
+    if (changed) InterlockedExchangeAdd64(&g_shadow_cpu_changed, (LONG64)changed);
+}
+/* ExecuteCommandLists, caller's thread, before anything is queued. */
+static void mad_shadow_cpu_sync(struct mad_device *d) {
+    unsigned i;
+    EnterCriticalSection(&d->view_lock);
+    for (i = 0; i < d->nshadows; i++) if (d->shadows[i]->cpu && d->shadows[i]->src->cpu) mad_shadow_expand(d->shadows[i]);
+    LeaveCriticalSection(&d->view_lock);
+}
 static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad_resource *r, DXGI_FORMAT fmt, UINT64 first, UINT64 num) {
     struct mad_shadow *s; struct WMTBufferInfo bi; struct WMTTextureInfo ti;
     enum WMTPixelFormat pf; int is_depth = 0; DXGI_FORMAT wide; UINT32 one, *w; UINT64 k, avail;
@@ -7501,11 +7557,12 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
     avail = r->size > first * 12 ? (r->size - first * 12) / 12 : 0;
     if (!(s = calloc(1, sizeof *s))) return NULL;
     s->src = r; s->fmt = (UINT)fmt; s->first = first; s->num = num; s->rows = avail < num ? avail : num;
+    s->cpu = r->cpu && r->heap != D3D12_HEAP_TYPE_READBACK;   /* UPLOAD: only the CPU writes it */
     memset(&bi, 0, sizeof bi); bi.length = num * 16; bi.options = WMTResourceStorageModeShared;
     s->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
     if (!s->buf || !bi.memory.ptr) goto fail;
     s->gpu = bi.gpu_address;
-    w = (UINT32 *)bi.memory.ptr;
+    w = s->map = (UINT32 *)bi.memory.ptr;
     for (k = 0; k < num; k++) { w[4 * k] = w[4 * k + 1] = w[4 * k + 2] = 0; w[4 * k + 3] = one; }
     memset(&ti, 0, sizeof ti);
     ti.pixel_format = pf; ti.width = (uint32_t)num; ti.height = 1; ti.depth = 1; ti.array_length = 1;
@@ -7526,7 +7583,8 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
     }
     mad_resident(d, s->buf);   /* the views alias it (ml1126) */
     mad_vmap_put_locked(d, s->id, (UINT32)num, 0);
-    s->dirty = 1;
+    if (s->cpu) { mad_shadow_expand(s); InterlockedIncrement(&d->shadow_ncpu); }
+    else { s->dirty = 1; InterlockedIncrement(&d->shadow_pending); }
     d->shadows[d->nshadows++] = s;
     r->nshadow++;
     InterlockedExchange(&d->shadow_ever, 1);
@@ -7534,7 +7592,7 @@ static struct mad_shadow *mad_shadow_get_locked(struct mad_device *d, struct mad
     if (said++ < 16)
         d3d12_log("[madeira-d3d12] typed buffer view: fmt %u (RGB32) first %llu num %llu of '%s' (%llu bytes%s) -> RGBA32 shadow, %llu elements copied per refresh, w = %#x\n",
                   (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, r->name ? r->name : "?",
-                  (unsigned long long)r->size, r->cpu ? ", CPU-visible: refreshed at every list start" : "",
+                  (unsigned long long)r->size, s->cpu ? ", UPLOAD: expanded on the CPU at every ExecuteCommandLists" : "",
                   (unsigned long long)s->rows, one);
     return s;
 fail:
@@ -7555,6 +7613,8 @@ static void mad_shadow_free(struct mad_device *d, struct mad_resource *r) {
         if (s->src != r) { i++; continue; }
         d->shadows[i] = d->shadows[--d->nshadows];
         r->nshadow--;
+        if (s->cpu) InterlockedDecrement(&d->shadow_ncpu);
+        else if (InterlockedExchange(&s->dirty, 0)) InterlockedDecrement(&d->shadow_pending);
         mad_vmap_del_locked(d, s->id);
         for (k = 0; k < s->ndst; k++) if (s->dst[k]) NSObject_release(s->dst[k]);
         free(s->dst);
@@ -12768,7 +12828,7 @@ static void STDMETHODCALLTYPE list_ResourceBarrier(ID3D12GraphicsCommandList *Th
             UINT bs = (UINT)b[i].Transition.StateBefore, as = (UINT)b[i].Transition.StateAfter;
             struct mad_cmd *sc;
             if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION || (b[i].Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)) continue;
-            if (!r || !r->buffer || (as & W) || (bs && !(bs & W))) continue;
+            if (!r || !r->buffer || (as & W) || (bs && !(bs & W)) || (r->cpu && r->heap != D3D12_HEAP_TYPE_READBACK)) continue;
             if ((sc = mad_list_push(l, MC_SHADOW))) sc->u.shadow.res = r;
         }
     }
@@ -14363,6 +14423,7 @@ static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
 static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
+    InterlockedIncrement(&g_shadow_frames);   /* wine-lab port: per-frame RGB32 shadow figures */
     QueryPerformanceCounter(&t0);
     hr = swap_Present_pool(T, sync, flags);
     QueryPerformanceCounter(&t1);
