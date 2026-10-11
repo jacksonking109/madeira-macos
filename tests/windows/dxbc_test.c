@@ -737,6 +737,22 @@ static void case_pipeline_library(void) {
         if (ser && SUCCEEDED(hr)) {
             hr = ID3D12Device1_CreatePipelineLibrary(d1, ser, n, &IID_ID3D12PipelineLibrary, (void **)&lib2);
             CHECK(SUCCEEDED(hr) && lib2, "pipelinelib: library recreated from its own blob (%#lx)", hr);
+            if (lib2) {   /* wine-lab port: stored names survive serialization; a Load builds from the passed desc */
+                ID3D12PipelineState *re = NULL;
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC rd; ZeroMemory(&rd, sizeof rd);   /* a real one: it is built from */
+                rd.pRootSignature = rp_rs;
+                rd.VS.pShaderBytecode = ID3D10Blob_GetBufferPointer(rp_vs); rd.VS.BytecodeLength = ID3D10Blob_GetBufferSize(rp_vs);
+                rd.PS.pShaderBytecode = ID3D10Blob_GetBufferPointer(rp_ps); rd.PS.BytecodeLength = ID3D10Blob_GetBufferSize(rp_ps);
+                rd.NumRenderTargets = 1; rd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                rd.SampleDesc.Count = 1; rd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                test_pso_defaults(&rd, 0);
+                hr = ID3D12PipelineLibrary_LoadGraphicsPipeline(lib2, L"rp", &rd, &IID_ID3D12PipelineState, (void **)&re);
+                CHECK(SUCCEEDED(hr) && re, "pipelinelib: reloaded library loads a stored name (%#lx)", hr);
+                if (re) ID3D12PipelineState_Release(re);
+                re = NULL;
+                hr = ID3D12PipelineLibrary_LoadGraphicsPipeline(lib2, L"other", &pd, &IID_ID3D12PipelineState, (void **)&re);
+                CHECK(hr == E_INVALIDARG && !re, "pipelinelib: reloaded library still misses an unknown name (%#lx)", hr);
+            }
             ser[0] ^= 0xff;
             hr = ID3D12Device1_CreatePipelineLibrary(d1, ser, n, &IID_ID3D12PipelineLibrary, (void **)&lib3);
             CHECK(hr == D3D12_ERROR_DRIVER_VERSION_MISMATCH && !lib3,

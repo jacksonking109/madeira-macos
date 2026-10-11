@@ -69,7 +69,7 @@ running, copy each file to a temporary name in the same directory (sign the .so 
 installed one, so the running process keeps its mapped copy intact.
 
 Tests (from out/, after `. ~/wine-lab/env11.sh`): d3d12-m2-x64.exe (expect 2 known failures: the stale fence-cycles
-check, and "unclaimed feature level 12_1" since madeira.cfg claims 12_1); d3d12-dxbc-x64.exe (SM 5.0 DXBC through
+check, and "unclaimed feature level 12_1" since madeira.cfg claims 12_1); d3d12-dxbc-x64.exe (68 checks; SM 5.0 DXBC through
 airconv: root constants/CBV, SRV table + static sampler, vertex buffer input layout;
 plus tier-0 render passes, GetCachedBlob/CachedPSO, the pipeline library, and a bound render target the pipeline does
 not write keeping its contents); d3d12-bindless-x64.exe (tests/windows/bindless_test.c, 0 failures: SM 6.6

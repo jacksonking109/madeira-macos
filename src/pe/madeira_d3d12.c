@@ -11515,14 +11515,18 @@ static void mad_dtess_convert(struct mad_device *d, struct mad_rootsig *rs, stru
  * cache" signal engines handle, and our own blob is accepted and ignored.
  * Pipeline libraries (below) serialize the same way with their own magic. */
 #define MAD_PSO_CACHE_MAGIC "MDRAPSO1"
-#define MAD_PLIB_MAGIC      "MDRAPLB1"
+#define MAD_PLIB_MAGIC      "MDRAPLB2"
+/* wine-lab port: the identity is a format version, not this build's date: a rebuild must not make a game
+ * throw away its pipeline cache (TLOU Part I rebuilt every shader on each launch). Pipelines are always
+ * recreated from the game's own description, and converted shaders are keyed by their own cache. */
+#define MAD_CACHE_FORMAT "madeira-d3d12 pipeline cache format 2"
 static SIZE_T mad_cache_ident(const char magic[8], BYTE *out) {   /* out NULL: size only */
-    static const char build[] = MADEIRA_D3D12_BUILD;
+    static const char build[] = MAD_CACHE_FORMAT;
     if (out) { memcpy(out, magic, 8); memcpy(out + 8, build, sizeof build); }
     return 8 + sizeof build;
 }
 static int mad_cache_ident_matches(const char magic[8], const void *blob, SIZE_T n) {
-    BYTE want[8 + sizeof MADEIRA_D3D12_BUILD];
+    BYTE want[8 + sizeof MAD_CACHE_FORMAT];
     SIZE_T wn = mad_cache_ident(magic, want);
     return blob && n == wn && !memcmp(blob, want, wn);
 }
@@ -13703,7 +13707,7 @@ static HRESULT STDMETHODCALLTYPE rootsig_GetDevice(ID3D12RootSignature *This, RE
 /* ---- wine-lab port: GetCachedBlob, pipeline libraries ------------------------ */
 static HRESULT mad_make_blob(const void *bytes, SIZE_T n, ID3D10Blob **out);
 static HRESULT STDMETHODCALLTYPE pso_GetCachedBlob(ID3D12PipelineState *This, ID3DBlob **blob) {
-    BYTE id[8 + sizeof MADEIRA_D3D12_BUILD];
+    BYTE id[8 + sizeof MAD_CACHE_FORMAT];
     (void)This;
     if (!blob) return E_INVALIDARG;
     *blob = NULL;
@@ -13711,10 +13715,11 @@ static HRESULT STDMETHODCALLTYPE pso_GetCachedBlob(ID3D12PipelineState *This, ID
 }
 
 /* ID3D12PipelineLibrary1. Real libraries persist compiled pipelines; this one
- * keeps (name -> pipeline) for the process only and serializes to its identity
- * alone, so a library reloaded from disk is empty: every Load answers
- * E_INVALIDARG ("not found") and the engine creates and stores again, which is
- * the path it already takes on a cold cache. A blob from another build or
+ * keeps (name -> pipeline) for the process; serialized, it is its identity plus
+ * the stored NAMES (wine-lab port). A name reloaded from disk has no pipeline
+ * yet: its first Load builds one from the description the Load passes (the
+ * converted shaders come from the DXIL cache), so a warm game cache stays warm
+ * instead of the engine recompiling everything. A blob of another format or
  * driver is refused with D3D12_ERROR_DRIVER_VERSION_MISMATCH. Free-threaded,
  * as D3D12 requires of a library. A hit returns the stored pipeline itself. */
 struct mad_plib_entry { WCHAR *name; ID3D12PipelineState *pso; };
@@ -13741,7 +13746,7 @@ static ULONG STDMETHODCALLTYPE plib_Release(ID3D12PipelineLibrary1 *This) {
     if (r == 0) {
         unsigned i;
         mad_pd_purge(This);
-        for (i = 0; i < l->n; i++) { free(l->e[i].name); ID3D12PipelineState_Release(l->e[i].pso); }
+        for (i = 0; i < l->n; i++) { free(l->e[i].name); if (l->e[i].pso) ID3D12PipelineState_Release(l->e[i].pso); }
         free(l->e); free(l);
     }
     return (ULONG)r;
@@ -13763,45 +13768,90 @@ static HRESULT STDMETHODCALLTYPE plib_StorePipeline(ID3D12PipelineLibrary1 *This
     HRESULT hr = S_OK;
     if (!name || !pso) return E_INVALIDARG;
     AcquireSRWLockExclusive(&l->lock);
-    if (mad_plib_find(l, name)) hr = E_INVALIDARG;   /* names are unique in a library */
+    struct mad_plib_entry *e = mad_plib_find(l, name);
+    if (e && !e->pso) { ID3D12PipelineState_AddRef(pso); e->pso = pso; }   /* a reloaded name, stored again */
+    else if (e) hr = E_INVALIDARG;   /* names are unique in a library */
     else if (!mad_grow((void **)&l->e, &l->cap, l->n + 1, sizeof *l->e) || !(l->e[l->n].name = _wcsdup(name))) hr = E_OUTOFMEMORY;
     else { ID3D12PipelineState_AddRef(pso); l->e[l->n++].pso = pso; }
     ReleaseSRWLockExclusive(&l->lock);
     return hr;
 }
-static HRESULT mad_plib_load(struct mad_plib *l, const WCHAR *name, REFIID riid, void **out) {
+/* kind: 0 graphics desc, 1 compute desc, 2 pipeline state stream */
+static HRESULT mad_plib_load(struct mad_plib *l, const WCHAR *name, int kind, const void *desc, REFIID riid, void **out) {
     struct mad_plib_entry *e;
+    ID3D12PipelineState *made = NULL;
     HRESULT hr = E_INVALIDARG;   /* "not found", the documented answer */
+    int reloaded = 0;
     if (!out) return E_POINTER;
     *out = NULL;
     if (!name) return E_INVALIDARG;
     AcquireSRWLockShared(&l->lock);
-    if ((e = mad_plib_find(l, name))) hr = ID3D12PipelineState_QueryInterface(e->pso, riid, out);
+    if ((e = mad_plib_find(l, name))) {
+        if (e->pso) hr = ID3D12PipelineState_QueryInterface(e->pso, riid, out);
+        else reloaded = 1;
+    }
     ReleaseSRWLockShared(&l->lock);
+    if (!reloaded) return hr;
+    /* wine-lab port: a name from the serialized library -- build it from the description the Load passes */
+    if (kind == 0) hr = device_CreateGraphicsPipelineState((ID3D12Device *)l->device, desc, &IID_ID3D12PipelineState, (void **)&made);
+    else if (kind == 1) hr = device_CreateComputePipelineState((ID3D12Device *)l->device, desc, &IID_ID3D12PipelineState, (void **)&made);
+    else hr = device_CreatePipelineState((ID3D12Device10 *)l->device, desc, &IID_ID3D12PipelineState, (void **)&made);
+    if (FAILED(hr)) {
+        static unsigned said;
+        if (said++ < 8) d3d12_log("[madeira-d3d12] PipelineLibrary: building reloaded name failed (kind %d, %#lx)\n", kind, (long)hr);
+        return hr;
+    }
+    AcquireSRWLockExclusive(&l->lock);
+    if ((e = mad_plib_find(l, name)) && !e->pso) { e->pso = made; made = NULL; }   /* else another thread won */
+    hr = e && e->pso ? ID3D12PipelineState_QueryInterface(e->pso, riid, out) : E_INVALIDARG;
+    ReleaseSRWLockExclusive(&l->lock);
+    if (made) ID3D12PipelineState_Release(made);
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE plib_LoadGraphicsPipeline(ID3D12PipelineLibrary1 *This, const WCHAR *name,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     if (!desc) return E_INVALIDARG;
-    return mad_plib_load((struct mad_plib *)This, name, riid, out);
+    return mad_plib_load((struct mad_plib *)This, name, 0, desc, riid, out);
 }
 static HRESULT STDMETHODCALLTYPE plib_LoadComputePipeline(ID3D12PipelineLibrary1 *This, const WCHAR *name,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     if (!desc) return E_INVALIDARG;
-    return mad_plib_load((struct mad_plib *)This, name, riid, out);
+    return mad_plib_load((struct mad_plib *)This, name, 1, desc, riid, out);
 }
 static HRESULT STDMETHODCALLTYPE plib_LoadPipeline(ID3D12PipelineLibrary1 *This, const WCHAR *name,
         const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **out) {
     if (!desc) return E_INVALIDARG;
-    return mad_plib_load((struct mad_plib *)This, name, riid, out);
+    return mad_plib_load((struct mad_plib *)This, name, 2, desc, riid, out);
+}
+/* Serialized form: identity, UINT32 count, then per name UINT32 length (WCHARs, no terminator) + the WCHARs. */
+static SIZE_T mad_plib_size_locked(struct mad_plib *l) {
+    SIZE_T n = mad_cache_ident(MAD_PLIB_MAGIC, NULL) + 4;
+    unsigned i;
+    for (i = 0; i < l->n; i++) n += 4 + wcslen(l->e[i].name) * sizeof(WCHAR);
+    return n;
 }
 static SIZE_T STDMETHODCALLTYPE plib_GetSerializedSize(ID3D12PipelineLibrary1 *This) {
-    (void)This; return mad_cache_ident(MAD_PLIB_MAGIC, NULL);
+    struct mad_plib *l = (struct mad_plib *)This;
+    SIZE_T n;
+    AcquireSRWLockShared(&l->lock); n = mad_plib_size_locked(l); ReleaseSRWLockShared(&l->lock);
+    return n;
 }
 static HRESULT STDMETHODCALLTYPE plib_Serialize(ID3D12PipelineLibrary1 *This, void *data, SIZE_T size) {
-    (void)This;
-    if (!data || size < mad_cache_ident(MAD_PLIB_MAGIC, NULL)) return E_INVALIDARG;
-    mad_cache_ident(MAD_PLIB_MAGIC, data);
+    struct mad_plib *l = (struct mad_plib *)This;
+    BYTE *p = data;
+    unsigned i;
+    UINT32 v;
+    if (!data) return E_INVALIDARG;
+    AcquireSRWLockShared(&l->lock);
+    if (size < mad_plib_size_locked(l)) { ReleaseSRWLockShared(&l->lock); return E_INVALIDARG; }
+    p += mad_cache_ident(MAD_PLIB_MAGIC, p);
+    v = l->n; memcpy(p, &v, 4); p += 4;
+    for (i = 0; i < l->n; i++) {
+        v = (UINT32)wcslen(l->e[i].name);
+        memcpy(p, &v, 4); p += 4;
+        memcpy(p, l->e[i].name, v * sizeof(WCHAR)); p += v * sizeof(WCHAR);
+    }
+    ReleaseSRWLockShared(&l->lock);
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE device_CreatePipelineLibrary(ID3D12Device10 *This, const void *blob, SIZE_T blob_size,
@@ -13810,7 +13860,8 @@ static HRESULT STDMETHODCALLTYPE device_CreatePipelineLibrary(ID3D12Device10 *Th
     HRESULT hr;
     static unsigned said;
     if (said++ < 8) d3d12_log("[madeira-d3d12] CreatePipelineLibrary: %lu-byte blob\n", (unsigned long)blob_size);
-    if (blob_size && !mad_cache_ident_matches(MAD_PLIB_MAGIC, blob, blob_size)) {
+    SIZE_T idn = mad_cache_ident(MAD_PLIB_MAGIC, NULL);
+    if (blob_size && (blob_size < idn + 4 || !mad_cache_ident_matches(MAD_PLIB_MAGIC, blob, idn))) {
         if (out) *out = NULL;
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
     }
@@ -13820,6 +13871,20 @@ static HRESULT STDMETHODCALLTYPE device_CreatePipelineLibrary(ID3D12Device10 *Th
     l->vtbl = &g_plib_vtbl; l->refs = 1; l->iid = &IID_ID3D12PipelineLibrary; l->name = "PipelineLibrary";
     l->device = (struct mad_device *)This;
     InitializeSRWLock(&l->lock);
+    if (blob_size) {   /* wine-lab port: the stored names, each built at its first Load */
+        const BYTE *p = (const BYTE *)blob + idn, *end = (const BYTE *)blob + blob_size;
+        UINT32 count, len, i;
+        memcpy(&count, p, 4); p += 4;
+        for (i = 0; i < count && end - p >= 4; i++) {
+            WCHAR *w;
+            memcpy(&len, p, 4); p += 4;
+            if ((SIZE_T)(end - p) < (SIZE_T)len * sizeof(WCHAR)) break;
+            if (!mad_grow((void **)&l->e, &l->cap, l->n + 1, sizeof *l->e) || !(w = calloc(len + 1, sizeof(WCHAR)))) break;
+            memcpy(w, p, len * sizeof(WCHAR)); p += len * sizeof(WCHAR);
+            l->e[l->n].name = w; l->e[l->n].pso = NULL; l->n++;
+        }
+        if (said <= 8) d3d12_log("[madeira-d3d12] CreatePipelineLibrary: %u stored pipeline names reloaded\n", l->n);
+    }
     hr = plib_QI((ID3D12PipelineLibrary1 *)l, riid, out);
     plib_Release((ID3D12PipelineLibrary1 *)l);
     return hr;
