@@ -80,7 +80,9 @@ with pRootSignature = NULL using the root signature embedded in its shader; 59 c
 bindless.hlsl, regeneration commands at its top);
 d3d12-atomic64-x64.exe (tests/windows/atomic64_test.c, 0 failures: 64-bit InterlockedMax with the old value used on a
 RWTexture2D, raw, structured and typed buffers, exact per pixel; other texture shapes convert; a texture
-compare-exchange with the old value used is refused; precompiled DXIL from atomic64.hlsl); d3d12-uavclear-x64.exe
+compare-exchange with the old value used is refused; 64 x 256 compute threads InterlockedMin (result unused) on 4
+addresses of raw and structured buffers give consistent pairs and the unsigned 64-bit minimum, also for the
+asuint(distance) | id packing with ties; 36 checks; precompiled DXIL from atomic64.hlsl); d3d12-uavclear-x64.exe
 (tests/windows/uavclear_test.c, 0 failures: texture UAV clears read back per texel, Uint clears of R16_FLOAT,
 R16_TYPELESS-as-R16_FLOAT and R32_FLOAT views write the raw bits, Float clears of R16_UINT and R32_SINT views convert,
 a descriptor holding another resource's view clears the named resource in its own format, and buffer UAV clears: typed

@@ -7,6 +7,9 @@
 //     dxc -T ps_6_6 -E $e -Vn a64_${e}_dxil -Fh /tmp/a64_$e.h atomic64.hlsl; done
 //   for e in vs_main ps_tex ps_raw ps_struct ps_typed ps_tex3d ps_tex2darray ps_tex1darray ps_cmpxchg; do
 //     sed '/^#if 0/,/^#endif/d' /tmp/a64_$e.h | tr -d '\r' | sed '/^$/d'; echo; done
+//   for e in cs_min_raw cs_min_struct cs_min_float; do
+//     dxc -T cs_6_6 -E $e -Vn a64_${e}_dxil -Fh /tmp/a64_$e.h atomic64.hlsl
+//     sed '/^#if 0/,/^#endif/d' /tmp/a64_$e.h | tr -d '\r' | sed '/^$/d'; echo; done
 // and replace the arrays in atomic64_dxil.h with that output (the sed drops dxc's
 // disassembly listing).
 //
@@ -15,7 +18,7 @@
 // R32G32_UINT target. A fullscreen triangle gives each pixel exactly one
 // fragment, so both the returned value and the element left behind are exact.
 // The Metal Shader Converter refuses every one of these as written (the old
-// value is used); the runtime's rewrite (src/unix/madeira_atomic64.cpp) makes
+// value is used); the runtime's rewrite (src/unix/madeira_dxil_rewrite.cpp) makes
 // them convert, except ps_cmpxchg, which must still be refused.
 
 struct V { float4 pos : SV_Position; };
@@ -126,5 +129,47 @@ uint2 ps_cmpxchg(V i) : SV_Target
     uint64_t o;
     InterlockedCompareExchange(tex[p], init_value(p), new_value(p), o);
     return split(o);
+}
+
+// Contention: 64-bit InterlockedMin, result unused (the nearest-hit pattern of
+// TLOU Part I's Cs_CheckRayPolygonHit), 64 x 256 threads on MIN_SLOTS
+// addresses. Each value is a pair whose low word is a function of the high
+// one, so a torn result (words from different writers) shows; the high words
+// span the whole 32-bit range, and the low words alone would order them
+// differently, so a signed or one-word comparison shows too. No loops.
+#define MIN_SLOTS 4
+RWByteAddressBuffer          minraw : register(u0, space1);
+RWStructuredBuffer<uint64_t> minsb  : register(u1, space1);
+
+uint hash32(uint x)   // lowbias32
+{
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+uint64_t min_pair(uint t)
+{
+    uint hi = hash32(t);
+    return ((uint64_t)hi << 32) | ((hi * 2654435761u) ^ 0xA5A5A5A5u);
+}
+
+[numthreads(64, 1, 1)]
+void cs_min_raw(uint t : SV_DispatchThreadID)
+{
+    minraw.InterlockedMin64((t % MIN_SLOTS) * 8, min_pair(t));
+}
+
+[numthreads(64, 1, 1)]
+void cs_min_struct(uint t : SV_DispatchThreadID)
+{
+    InterlockedMin(minsb[t % MIN_SLOTS], min_pair(t));
+}
+
+// The float-distance packing: hi = asuint(positive distance), lo = id. Only
+// 256 distances, so ~16 threads of a slot tie on each and the id decides.
+[numthreads(64, 1, 1)]
+void cs_min_float(uint t : SV_DispatchThreadID)
+{
+    float d = 0.25f + (float)(hash32(t) & 0xFFu) * (1.0f / 4096.0f);
+    minraw.InterlockedMin64((t % MIN_SLOTS) * 8, ((uint64_t)asuint(d) << 32) | t);
 }
 #endif

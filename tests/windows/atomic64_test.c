@@ -2,7 +2,7 @@
  *
  *  Metal's 64-bit atomics return nothing, and the Metal Shader Converter
  *  refuses a DXIL 64-bit atomic whose result is used. The runtime rewrites such
- *  an atomic (src/unix/madeira_atomic64.cpp): a plain load of the element gives
+ *  an atomic (src/unix/madeira_dxil_rewrite.cpp): a plain load of the element gives
  *  the old value, then the atomic runs with its result unused. The Last of Us
  *  Part I's OIT k-buffer insert (InterlockedMax on RWTexture2D<uint64_t>) halts
  *  the game without it.
@@ -28,6 +28,12 @@
  *       (conversion only)
  *    6  InterlockedCompareExchange on RWTexture2D<uint64_t> with the old value
  *       used: refused at pipeline creation (the converter crashes on it)
+ *    7  contention: 64 x 256 compute threads InterlockedMin (result unused) on
+ *       4 addresses of a RWByteAddressBuffer and a RWStructuredBuffer<uint64_t>,
+ *       32 rounds each: every element must be a consistent (hi, lo) pair and
+ *       the true unsigned 64-bit minimum (a torn, signed or one-word compare
+ *       shows); and the float-distance packing hi = asuint(t), lo = id, with
+ *       256 distances so equal distances are decided by the id
  *
  *  Exit code = number of failed checks.
  */
@@ -330,6 +336,99 @@ static void case_draw(int num, const char *what, const void *ps, SIZE_T nps, ID3
     ID3D12PipelineState_Release(pso);
 }
 
+/* ------------------------------------------------------- case 7: contention */
+
+enum { MIN_SLOTS = 4, MIN_GROUPS = 256, MIN_THREADS = MIN_GROUPS * 64, MIN_ROUNDS = 32 };
+
+/* atomic64.hlsl's hash32 and min_pair, and cs_min_float's value */
+static UINT hash32(UINT x) {
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+static UINT64 min_pair(UINT t) {
+    UINT hi = hash32(t);
+    return ((UINT64)hi << 32) | ((hi * 2654435761u) ^ 0xA5A5A5A5u);
+}
+static UINT64 min_float_pair(UINT t) {
+    float d = 0.25f + (float)(hash32(t) & 0xFFu) * (1.0f / 4096.0f);   /* exact: no rounding to differ */
+    UINT bits;
+    memcpy(&bits, &d, 4);
+    return ((UINT64)bits << 32) | t;
+}
+
+/* Root UAVs u0 and u1 in space 1. */
+static ID3D12RootSignature *make_cs_rs(void) {
+    D3D12_ROOT_PARAMETER1 p[2]; ZeroMemory(p, sizeof p);
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[0].Descriptor.RegisterSpace = 1;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; p[1].Descriptor.ShaderRegister = 1; p[1].Descriptor.RegisterSpace = 1;
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC v; ZeroMemory(&v, sizeof v);
+    v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    v.Desc_1_1.NumParameters = 2; v.Desc_1_1.pParameters = p;
+    ID3DBlob *blob = NULL, *err = NULL;
+    ID3D12RootSignature *r = NULL;
+    HRESULT hr = p_serialize(&v, &blob, &err);
+    if (err) ID3D10Blob_Release(err);
+    if (SUCCEEDED(hr) && blob)
+        hr = ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
+                                              &IID_ID3D12RootSignature, (void **)&r);
+    if (blob) ID3D10Blob_Release(blob);
+    CHECK(SUCCEEDED(hr) && r, "compute root signature (root UAVs u0, u1 space 1) created (%#lx)", hr);
+    return r;
+}
+
+static void case_min(ID3D12RootSignature *crs, const char *what, const void *cs, SIZE_T ncs,
+                     ID3D12Resource *res, UINT64 (*pair)(UINT)) {
+    ID3D12PipelineState *pso = NULL;
+    UINT64 want[MIN_SLOTS], got[MIN_SLOTS];
+    UINT t, round, k, torn = 0, wrong = 0;
+    HRESULT hr;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cd; ZeroMemory(&cd, sizeof cd);
+    cd.pRootSignature = crs;
+    cd.CS.pShaderBytecode = cs; cd.CS.BytecodeLength = ncs;
+    hr = ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso);
+    CHECK(SUCCEEDED(hr) && pso, "%s: compute PSO created (%#lx)", what, hr);
+    if (!pso) return;
+
+    for (k = 0; k < MIN_SLOTS; k++) want[k] = ~(UINT64)0;
+    for (t = 0; t < MIN_THREADS; t++) { UINT64 v = pair(t); if (v < want[t % MIN_SLOTS]) want[t % MIN_SLOTS] = v; }
+
+    for (round = 0; round < MIN_ROUNDS; round++) {
+        UINT64 *p = NULL;
+        ID3D12Resource_Map(up, 0, NULL, (void **)&p);
+        if (!p) break;
+        for (k = 0; k < MIN_SLOTS; k++) p[k] = ~(UINT64)0;
+        ID3D12Resource_Unmap(up, 0, NULL);
+        barrier(res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, res, 0, up, 0, MIN_SLOTS * 8);
+        barrier(res, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        ID3D12GraphicsCommandList_SetComputeRootSignature(list, crs);
+        ID3D12GraphicsCommandList_SetPipelineState(list, pso);
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0, ID3D12Resource_GetGPUVirtualAddress(raw));
+        ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 1, ID3D12Resource_GetGPUVirtualAddress(sbuf));
+        ID3D12GraphicsCommandList_Dispatch(list, MIN_GROUPS, 1, 1);
+        barrier(res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, res, 0, MIN_SLOTS * 8);
+        barrier(res, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (!submit_and_wait() || !read_back(got, 0, MIN_SLOTS)) break;
+        for (k = 0; k < MIN_SLOTS; k++) {
+            /* consistent: the pair a real thread of this slot offered */
+            UINT owner = pair == min_pair ? 0 : (UINT)got[k];
+            BOOL whole = pair == min_pair ? ((UINT)got[k] == (((UINT)(got[k] >> 32) * 2654435761u) ^ 0xA5A5A5A5u))
+                                          : (owner < MIN_THREADS && owner % MIN_SLOTS == k && pair(owner) == got[k]);
+            if (!whole && !torn++)
+                printf("        round %u slot %u: %#llx is not a pair any thread offered (torn)\n", round, k,
+                       (unsigned long long)got[k]);
+            if (got[k] != want[k] && !wrong++)
+                printf("        round %u slot %u: got %#llx, expected the minimum %#llx\n", round, k,
+                       (unsigned long long)got[k], (unsigned long long)want[k]);
+        }
+    }
+    CHECK(round == MIN_ROUNDS, "%s: %u rounds of %u threads on %u addresses ran", what, round, MIN_THREADS, MIN_SLOTS);
+    CHECK(!torn, "%s: every result a consistent pair (%u torn)", what, torn);
+    CHECK(!wrong, "%s: every result the unsigned 64-bit minimum (%u wrong)", what, wrong);
+    ID3D12PipelineState_Release(pso);
+}
+
 /* --------------------------------------------------------------------- main */
 
 int main(void) {
@@ -417,6 +516,20 @@ int main(void) {
         hr = make_pso(a64_ps_cmpxchg_dxil, sizeof a64_ps_cmpxchg_dxil, &pso);
         CHECK(FAILED(hr) && !pso, "RWTexture2D<uint64_t> InterlockedCompareExchange: refused at pipeline creation (%#lx)", hr);
         if (pso) ID3D12PipelineState_Release(pso);
+    }
+
+    printf("\n[7] 64-bit InterlockedMin under contention, result unused\n");
+    {
+        ID3D12RootSignature *crs = make_cs_rs();
+        if (crs) {
+            case_min(crs, "RWByteAddressBuffer InterlockedMin64", a64_cs_min_raw_dxil, sizeof a64_cs_min_raw_dxil,
+                     raw, min_pair);
+            case_min(crs, "RWStructuredBuffer<uint64_t> InterlockedMin", a64_cs_min_struct_dxil,
+                     sizeof a64_cs_min_struct_dxil, sbuf, min_pair);
+            case_min(crs, "RWByteAddressBuffer InterlockedMin64, asuint(distance) | id", a64_cs_min_float_dxil,
+                     sizeof a64_cs_min_float_dxil, raw, min_float_pair);
+            ID3D12RootSignature_Release(crs);
+        }
     }
 
     ID3D12RootSignature_Release(rs);
