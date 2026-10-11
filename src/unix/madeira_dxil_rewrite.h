@@ -16,7 +16,8 @@ extern "C" {
 #endif
 
 struct madeira_dxil_rewrite_opts {
-    int atomic64;   /* 64-bit atomics whose old value is read get it from a load */
+    int atomic64;        /* 64-bit atomics whose old value is read get it from a load */
+    uint32_t loop_cap;   /* loop watchdog: leave every loop after this many passes per entry; 0 = off */
 };
 
 struct madeira_dxil_rewrite_info {
@@ -24,6 +25,8 @@ struct madeira_dxil_rewrite_info {
     unsigned a64_left;        /* 64-bit atomics left as they were: the converter still refuses them */
     int a64_refuse;           /* the converter would crash on the shader: refuse it unconverted */
     char a64_note[192];       /* why some were left, or why the shader is refused */
+    unsigned loops_guarded;   /* loops given an iteration cap */
+    unsigned loops_skipped;   /* loops without an exiting branch every iteration passes */
 };
 
 /* Returns 1 and a malloc'd container when something was rewritten, 0 when
@@ -35,6 +38,9 @@ int madeira_dxil_rewrite(const void *bc, size_t len, const struct madeira_dxil_r
 /* Cheap container checks, no bitcode parse. The runtime keys its DXIL cache on
  * these answers, so a rewrite never applies where they say it cannot. */
 int madeira_atomic64_candidate(const void *bc, size_t len);
+/* The DXIL program's shader kind (0 pixel, 1 vertex, ..., 5 compute; the
+ * high half of the DXIL part's program version), or -1. */
+int madeira_dxil_shader_kind(const void *bc, size_t len);
 
 #ifdef __cplusplus
 }

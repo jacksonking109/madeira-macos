@@ -1461,6 +1461,32 @@ static int mad_atomic64_enabled(void)
     return enabled;
 }
 
+/* wine-lab port: the loop watchdog (madeira_dxil_rewrite.cpp) caps every loop
+ * of a compute shader -- and of a pixel shader with loop-watchdog-ps = 1 -- at
+ * loop-watchdog-cap passes per entry, so a kernel stuck in a loop cannot hold
+ * the GPU until the Mac's watchdog reboots it. madeira.cfg loop-watchdog = 0
+ * turns it off. MAD_LWD_VERSION and the cap go into the DXIL cache key of
+ * every shader it guards; bump the version when the rewrite's output changes.
+ * Returns the cap for a shader of this DXIL kind, or 0. */
+#define MAD_LWD_VERSION 1u
+static uint32_t mad_loop_watchdog_cap(int kind)
+{
+    static int cs = -1, ps;
+    static uint32_t cap;
+    if (cs < 0) {
+        long long c = madeira_cfg_int("loop-watchdog-cap", 1 << 20);
+        cap = c < 1 ? 1u : c > 0x7fffffff ? 0x7fffffffu : (uint32_t)c;
+        ps = madeira_cfg_int("loop-watchdog-ps", 0) ? 1 : 0;
+        cs = madeira_cfg_int("loop-watchdog", 1) ? 1 : 0;   /* last: another thread may read the others once it is set */
+        fprintf(stderr, "[madeira-ir] loop watchdog: compute %s, pixel %s, cap %u passes per loop entry "
+                        "(madeira.cfg loop-watchdog, loop-watchdog-ps, loop-watchdog-cap)\n",
+                cs ? "on" : "off", ps ? "on" : "off", cap);
+    }
+    if (kind == 5) return cs ? cap : 0;
+    if (kind == 0) return ps ? cap : 0;
+    return 0;
+}
+
 /* 1 the first time a shader (by content hash) is reported, so a shader
  * converted for several root signatures logs once. */
 static int mad_rewrite_first_report(uint64_t h)
@@ -1627,6 +1653,8 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
      * key must say whether the rewrite can have shaped the entry. */
     const int a64 = mad_atomic64_enabled() &&
                     madeira_atomic64_candidate((const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
+    const uint32_t lwd_cap = mad_loop_watchdog_cap(madeira_dxil_shader_kind((const void *)(uintptr_t)a->dxil,
+                                                                            (size_t)a->dxil_len));
 
     /* ml1990: a conversion already done -- by this caller's too-small first
      * call, or by any earlier run -- is handed back without the compiler. */
@@ -1642,6 +1670,8 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         env.ags_rewrite = (uint32_t)mad_ags_enabled();
         env.compat_flags = mad_ir_compat_flags();
         env.atomic64 = a64 ? MAD_A64_VERSION : 0;
+        env.loop_watchdog = lwd_cap ? MAD_LWD_VERSION : 0;
+        env.loop_cap = lwd_cap;
         mad_dxc_key(a, &env, &dxc_key, &dxc_check);
         if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
         if (!hit && dxc_disk) {
@@ -1768,24 +1798,29 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         /* wine-lab port: DXIL rewrites (madeira_dxil_rewrite.cpp). Metal's 64-bit
          * atomics return nothing, so the converter refuses one whose old value
          * is read (code 7); the rewrite reads the old value with a plain load
-         * before the atomic instead. */
-        if (a64) {
+         * before the atomic instead. The loop watchdog caps loops. */
+        if (a64 || lwd_cap) {
             struct madeira_dxil_rewrite_opts o;
             struct madeira_dxil_rewrite_info inf;
             size_t rw_len = 0;
             int r;
             memset(&o, 0, sizeof o);
             o.atomic64 = a64;
+            o.loop_cap = lwd_cap;
             r = madeira_dxil_rewrite(src, src_len, &o, &rw_buf, &rw_len, &inf);
-            if (r != 0 || inf.a64_left || inf.a64_refuse) {
+            if (r != 0 || inf.a64_left || inf.a64_refuse || inf.loops_skipped) {
                 uint64_t h = 1469598103934665603ull;   /* the ml1149 log's name for the shader */
                 mad_sc_hash_add(&h, (const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
                 if (mad_rewrite_first_report(h)) {
+                    if (inf.loops_guarded || inf.loops_skipped)
+                        dprintf(2, "[madeira-ir] loop watchdog %016llx: %u loop(s) capped at %u passes per entry, "
+                                   "%u left unguarded (no exiting branch that every iteration passes)\n",
+                                (unsigned long long)h, inf.loops_guarded, lwd_cap, inf.loops_skipped);
                     if (inf.a64_rewritten)
                         dprintf(2, "[madeira-ir] atomic64 %016llx: %u 64-bit atomics given a non-atomic old-value read "
                                    "(race: another invocation between the read and the atomic can be missed)%s%s\n",
                                 (unsigned long long)h, inf.a64_rewritten, inf.a64_note[0] ? "; " : "", inf.a64_note);
-                    else
+                    else if (inf.a64_note[0])
                         dprintf(2, "[madeira-ir] atomic64 %016llx: %s%s\n", (unsigned long long)h, inf.a64_note,
                                 inf.a64_left ? " -- converting the original, which the converter will refuse" : "");
                 }
@@ -2095,6 +2130,11 @@ extern "C" int madeira_atomic64_candidate(const void *bc, size_t len)
 {
     (void)bc; (void)len;
     return 0;
+}
+extern "C" int madeira_dxil_shader_kind(const void *bc, size_t len)
+{
+    (void)bc; (void)len;
+    return -1;
 }
 extern "C" int madeira_dxil_rewrite(const void *bc, size_t len, const struct madeira_dxil_rewrite_opts *opts,
                                     void **out, size_t *out_len, struct madeira_dxil_rewrite_info *info)

@@ -16,8 +16,8 @@
  * on, because only then are they read -- the input topology and the input
  * layout the stage-in function is synthesised from. The caller adds the
  * environment: the converter dylib's identity, this build's stamp, the header
- * version, whether the AGS rewrite runs and, for a shader it may apply to, the
- * 64-bit atomic rewrite's version.
+ * version, whether the AGS rewrite runs and, for a shader they may apply to,
+ * the 64-bit atomic rewrite's version and the loop watchdog's version and cap.
  *
  * Deliberately NOT keyed: vs_bytecode (ml1031) and the ps_* fields (ml1023).
  * Only the DXBC backend reads them; the DXIL branch never does. Keying on them
@@ -87,7 +87,10 @@ struct mad_dxc_env {
     uint32_t ags_rewrite;       /* ml1149 rewrite enabled */
     uint32_t compat_flags;      /* compatibility flags handed to the compiler */
     uint32_t atomic64;          /* wine-lab port: the 64-bit atomic rewrite's version when it may
-                                   apply to this shader, else 0 (madeira_atomic64.cpp) */
+                                   apply to this shader, else 0 (madeira_dxil_rewrite.cpp) */
+    uint32_t loop_watchdog;     /* wine-lab port: the loop watchdog's version when it guards this
+                                   shader's loops, else 0 */
+    uint32_t loop_cap;          /* its cap; only keyed with loop_watchdog */
 };
 
 static inline void mad_dxc_key(const struct madeira_ir_convert_args *a,
@@ -109,6 +112,9 @@ static inline void mad_dxc_key(const struct madeira_ir_convert_args *a,
     /* Hashed only when set, so the shaders the rewrite never touches keep the
      * keys they had before it existed. */
     if (env->atomic64) { mad_dxc_hadd(&s, "a64", 3); mad_dxc_hu32(&s, env->atomic64); }
+    if (env->loop_watchdog) {
+        mad_dxc_hadd(&s, "lwd", 3); mad_dxc_hu32(&s, env->loop_watchdog); mad_dxc_hu32(&s, env->loop_cap);
+    }
 
     mad_dxc_hu64(&s, a->dxil_len);
     if (a->dxil && a->dxil_len) mad_dxc_hadd(&s, (const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);

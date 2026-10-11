@@ -42,7 +42,25 @@
  * buffer) with the old value used, MSC 4.0b2 CRASHES (a null dereference in
  * metallib::LazyLinker::CanLinkSymbols, every GPU family and flag set tried,
  * on tests/windows/atomic64.hlsl ps_cmpxchg) -- a fault inside the game's
- * process. Such a shader is reported so the runtime refuses it unconverted. */
+ * process. Such a shader is reported so the runtime refuses it unconverted.
+ *
+ * ---- loop watchdog ----
+ *
+ * Metal never times a command buffer out: a kernel stuck in a loop keeps the
+ * GPU until the WindowServer watchdog gives up and the Mac reboots. The Last
+ * of Us Part I's CS_ComputeVolProbeBufferWriteCache walks a BVH with a local
+ * stack (`while (stack > 0)`) and, fed bad node data, never leaves it.
+ *
+ * For every natural loop (LoopInfo) the header gets an i32 count of its
+ * passes since the loop was entered, and once the count reaches the cap the
+ * loop leaves through one of its OWN exits: an exiting block whose conditional
+ * branch every iteration passes (it dominates every latch) has its condition
+ * forced towards the exit. No edge is added, so every value used after the
+ * loop still dominates its uses and the exit block's phis are untouched; the
+ * cost is a phi, an add, a compare and an or/and per iteration. A loop that
+ * has no such branch (only switch exits, exits inside conditionals, or none)
+ * is left alone and counted as skipped. The cap is per entry: a nested loop
+ * may run cap times for each pass of the loop around it. */
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -50,10 +68,12 @@
 #include <string>
 #include <vector>
 
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
@@ -269,7 +289,81 @@ static void rewrite_module(Module &m, counts_t &n)
     }
 }
 
+/* The container's DXIL part, or false. */
+static bool find_dxil(const uint8_t *d, size_t len, const uint8_t **dxil, uint32_t *size, uint32_t *part)
+{
+    if (!d || len < 32 || memcmp(d, "DXBC", 4)) return false;
+    uint32_t nparts = rd32(d + 28);
+    if (32 + 4ull * nparts > len) return false;
+    for (uint32_t i = 0; i < nparts; i++) {
+        uint32_t off = rd32(d + 32 + 4 * i);
+        if (off + 8ull > len) return false;
+        uint32_t sz = rd32(d + off + 4);
+        if (off + 8ull + sz > len) return false;
+        if (!memcmp(d + off, "DXIL", 4)) { *dxil = d + off + 8; *size = sz; *part = i; return true; }
+    }
+    return false;
+}
+
+/* ---- loop watchdog ---- */
+
+static void guard_loops(Module &m, uint32_t cap, unsigned *guarded, unsigned *skipped)
+{
+    Type *i32 = Type::getInt32Ty(m.getContext());
+    for (Function &f : m) {
+        if (f.isDeclaration()) continue;
+        DominatorTree dt(f);
+        LoopInfo li(dt);
+        for (Loop *l : li.getLoopsInPreorder()) {
+            BasicBlock *hdr = l->getHeader();
+            SmallVector<BasicBlock *, 4> latches, exiting;
+            l->getLoopLatches(latches);
+            l->getExitingBlocks(exiting);
+
+            /* An exit every iteration reaches: a conditional branch with one
+             * successor outside, in a block that dominates every latch. */
+            BranchInst *xbr = nullptr;
+            bool exit_on_true = false;
+            for (BasicBlock *x : exiting) {
+                auto *br = dyn_cast<BranchInst>(x->getTerminator());
+                if (!br || !br->isConditional()) continue;
+                bool t_out = !l->contains(br->getSuccessor(0)), f_out = !l->contains(br->getSuccessor(1));
+                if (t_out == f_out) continue;
+                bool every = !latches.empty();
+                for (BasicBlock *lb : latches) every &= dt.dominates(x, lb);
+                if (!every) continue;
+                xbr = br; exit_on_true = t_out;
+                break;
+            }
+            if (!xbr) { (*skipped)++; continue; }
+
+            /* passes = phi [0 from outside, passes + 1 around the back edges] */
+            IRBuilder<> b(hdr, hdr->begin());
+            PHINode *passes = b.CreatePHI(i32, 2, "wd.passes");
+            b.SetInsertPoint(hdr, hdr->getFirstInsertionPt());
+            Value *next = b.CreateAdd(passes, ConstantInt::get(i32, 1), "wd.next");
+            Value *over = b.CreateICmpUGE(next, ConstantInt::get(i32, cap), "wd.over");
+            for (BasicBlock *pred : predecessors(hdr))
+                passes->addIncoming(l->contains(pred) ? next : ConstantInt::get(i32, 0), pred);
+
+            b.SetInsertPoint(xbr);
+            Value *c = xbr->getCondition();
+            xbr->setCondition(exit_on_true ? b.CreateOr(c, over, "wd.exit")
+                                           : b.CreateAnd(c, b.CreateNot(over, "wd.under"), "wd.stay"));
+            (*guarded)++;
+        }
+    }
+}
+
 }  // namespace
+
+extern "C" int madeira_dxil_shader_kind(const void *bc, size_t len)
+{
+    const uint8_t *dxil = nullptr;
+    uint32_t size = 0, part = 0;
+    if (!find_dxil((const uint8_t *)bc, len, &dxil, &size, &part) || size < 4) return -1;
+    return (int)(rd32(dxil) >> 16);
+}
 
 /* Cheap gate, no bitcode parse: a DXIL container whose SFI0 feature flags allow
  * a 64-bit atomic at all (any one implies Int64Ops), or that has no SFI0. The
@@ -294,22 +388,6 @@ extern "C" int madeira_atomic64_candidate(const void *bc, size_t len)
     return dxil && (!sfi0 || (flags & (kSfi0Int64Ops | kSfi0AtomicInt64Typed | kSfi0AtomicInt64Shared | kSfi0AtomicInt64Heap)));
 }
 
-/* The container's DXIL part, or false. */
-static bool find_dxil(const uint8_t *d, size_t len, const uint8_t **dxil, uint32_t *size, uint32_t *part)
-{
-    if (!d || len < 32 || memcmp(d, "DXBC", 4)) return false;
-    uint32_t nparts = rd32(d + 28);
-    if (32 + 4ull * nparts > len) return false;
-    for (uint32_t i = 0; i < nparts; i++) {
-        uint32_t off = rd32(d + 32 + 4 * i);
-        if (off + 8ull > len) return false;
-        uint32_t sz = rd32(d + off + 4);
-        if (off + 8ull + sz > len) return false;
-        if (!memcmp(d + off, "DXIL", 4)) { *dxil = d + off + 8; *size = sz; *part = i; return true; }
-    }
-    return false;
-}
-
 extern "C" int madeira_dxil_rewrite(const void *bc, size_t len, const struct madeira_dxil_rewrite_opts *opts,
                                     void **out, size_t *out_len, struct madeira_dxil_rewrite_info *info)
 {
@@ -318,7 +396,7 @@ extern "C" int madeira_dxil_rewrite(const void *bc, size_t len, const struct mad
     uint32_t dxil_size = 0, dxil_part = 0;
     *out = nullptr; *out_len = 0;
     memset(info, 0, sizeof *info);
-    if (!opts->atomic64) return 0;
+    if (!opts->atomic64 && !opts->loop_cap) return 0;
     if (!find_dxil(d, len, &dxil, &dxil_size, &dxil_part) || dxil_size < 24) return 0;
     uint32_t nparts = rd32(d + 28);
     uint32_t bc_off = rd32(dxil + 16), bc_size = rd32(dxil + 20);
@@ -351,6 +429,10 @@ extern "C" int madeira_dxil_rewrite(const void *bc, size_t len, const struct mad
         info->a64_rewritten = n.rewritten;
         info->a64_left = n.other;
         changed |= n.rewritten != 0;
+    }
+    if (opts->loop_cap) {
+        guard_loops(**mod, opts->loop_cap, &info->loops_guarded, &info->loops_skipped);
+        changed |= info->loops_guarded != 0;
     }
     if (!changed) return 0;
 

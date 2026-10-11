@@ -13,7 +13,7 @@
  *   cd ~/wine-lab/d3d12-port; LL=~/wine-lab/deps/llvm15-x86_64
  *   clang++ -arch x86_64 -O1 -std=c++17 -fno-rtti -I$LL/include -Ithird_party/metal-shader-converter/include \
  *       -Isrc/unix -Itests/windows tests/native/atomic64_rewrite_test.cpp src/unix/madeira_dxil_rewrite.cpp \
- *       $($LL/bin/llvm-config --libfiles bitreader bitwriter core) -lz -lcurses \
+ *       $($LL/bin/llvm-config --libfiles bitreader bitwriter core analysis) -lz -lcurses \
  *       -L ~/wine-lab/wine11/lib/wine/x86_64-unix -lmetalirconverter \
  *       -Wl,-rpath,$HOME/wine-lab/wine11/lib/wine/x86_64-unix -o out/atomic64_rewrite_test
  *   out/atomic64_rewrite_test ~/wine-lab/d3d12-config/failed-shaders-tlou1-2026-10-09/shader_0{2,3,4}_code7.bin

@@ -10,8 +10,8 @@ PE side (needs llvm-mingw, DXMT's winemetal import lib, Wine's winecrt0/ntdll fr
     $B/tools/winebuild/winebuild --builtin out/d3d12.dll
 
 Unix side (DXIL via Apple's Metal Shader Converter; shader-model 5.x DXBC via DXMT's airconv, linked in statically
-with LLVM 15, which also runs the DXIL 64-bit atomic rewrite, src/unix/madeira_dxil_rewrite.cpp; AGS rewriting stays
-compiled out). Needs dxmt-src on branch wine-lab-local (or d3d12-airconv), which adds the airconv APIs this runtime
+with LLVM 15, which also runs the DXIL rewrites of src/unix/madeira_dxil_rewrite.cpp (64-bit atomics, loop watchdog);
+AGS rewriting stays compiled out). Needs dxmt-src on branch wine-lab-local (or d3d12-airconv), which adds the airconv APIs this runtime
 uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1 constant-buffer operands, built by
 ~/wine-lab/build-dxmt.sh into dxmt-src/build-full (libairconv.a, libDXBCParserNative.a):
 
@@ -41,7 +41,7 @@ uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1 constant-bu
 (zsh: the flag lists are arrays; `${^LLVM_LIBS}` expands one path per component. LLVM's static libraries are full
 paths on purpose: `-L$LL/lib` would also make the linker pick LLVM's own libc++.dylib.) To build without LLVM, add
 -DMADEIRA_NO_AIRCONV to D, drop madeira_sm5_ia.o, madeira_dxil_rewrite.o, $AIRCONV and $EXP; DXBC shaders are then
-refused, and so are DXIL 64-bit atomics whose old value is read.
+refused, and so are DXIL 64-bit atomics whose old value is read; loops are not guarded.
 
 64-bit atomics whose old value is read: the converter refuses them (code 7); madeira_dxil_rewrite.cpp reads the old value
 with a plain load (and a device memory fence for textures and typed buffers) before the atomic, whose result is then
@@ -49,6 +49,15 @@ unused. Not atomic with the update: an invocation between the load and the atomi
 dxil-atomic64-emulation = 0 turns it off. Its output is keyed in the DXIL cache by MAD_A64_VERSION (madeira_ir_unix.mm),
 which a change to madeira_dxil_rewrite.cpp must bump (that file is not part of the build stamp). Host test, the three saved
 TLOU Part I shaders included: see the header of tests/native/atomic64_rewrite_test.cpp.
+
+Loop watchdog: Metal never times out a command buffer, so a compute kernel stuck in a loop holds the GPU until the
+WindowServer watchdog reboots the Mac (TLOU Part I's CS_ComputeVolProbeBufferWriteCache BVH walk). Every natural loop of
+a compute shader gets a pass counter at its header; at loop-watchdog-cap passes per loop entry (default 1048576) the
+loop leaves through one of its own exits, an exiting branch that every iteration passes, whose condition is forced
+(no new edges, so the IR stays valid; a phi, an add, a compare and an or/and per pass). Loops without such a branch
+are left alone and logged. madeira.cfg loop-watchdog = 0 turns it off, loop-watchdog-ps = 1 also guards pixel shaders.
+MAD_LWD_VERSION and the cap are keyed in the DXIL cache of the shaders it guards. The rewrite costs ~0.3-1 ms per
+compute shader (parse + write, Rosetta), only on a cache miss.
 
 libmetalirconverter.dylib (MSC 4.0 beta 2, x86_64 slice) goes next to d3d12.so, or set MADEIRA_MSC_DYLIB.
 
