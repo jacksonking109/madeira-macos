@@ -43,6 +43,9 @@
  *       Buffer<float4> read site as the RGB32 views, returns (x, 0, 0, 1);
  *       GetDimensions gives NumElements for both kinds
  *   12  the same through SM 6.6 ResourceDescriptorHeap indexing
+ *   13  typed UAV writes, an atomic, GetDimensions and a typed UAV load next to
+ *       an RGB32 SRV read in one kernel (rgb32_uav.hlsl): the RGB32 read stays
+ *       on the shader path and no pipeline reports an untraceable read
  *
  *  With madeira.cfg rgb32-shader = 1 (the default) RGB32 views are read in the
  *  shader from their own memory (src/unix/madeira_air_rewrite.cpp): cases 9 and
@@ -77,11 +80,11 @@ enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FI
 enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_COUNT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_UAV0, S_UAV1, S_COUNT };
 enum { NG = 1 << 20, NCOPY = 40, CPYN = 1200 };   /* case 9: big buffer elements, copies, elements per copy */
 static UINT big_first(UINT k) { return k * 12007u + 5u; }
 static UINT big_num(UINT k) { return 100u + 13u * k; }
-struct shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes, rgb32_shader, shader_views, unsafe, big_frames; };
+struct shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes, rgb32_shader, shader_views, unsafe, big_frames, untraced_pipes; };
 typedef void (*pfn_shadow_stats)(struct shadow_stats *);
 static pfn_shadow_stats p_stats;
 #define OUT_REGION ((UINT64)NF * 16)   /* one dispatch's output */
@@ -98,8 +101,9 @@ static ID3D12DescriptorHeap *heap;
 static UINT                inc;
 static ID3D12Resource     *stage, *fbuf, *ubuf, *ibuf, *nbuf, *pbuf, *ring, *outbuf, *rb, *gbuf, *gstage;
 #define NREGIONS (2 * NSLOT)   /* also >= the 5 regions of case 11 */
-static ID3D12RootSignature *rs, *rs_heap;
-static ID3D12PipelineState *pso, *pso_heap;
+static ID3D12RootSignature *rs, *rs_heap, *rs_uav;
+static ID3D12PipelineState *pso, *pso_heap, *pso_uav;
+static ID3D12Resource *uavbuf, *cntbuf;
 static int shader_mode;   /* rgb32-shader, from MadeiraD3D12ShadowStats */
 
 /* staging layout (UPLOAD): data A, B (floats, NF each), U, I (NI), C (NN) */
@@ -535,6 +539,50 @@ static void r32_and_heap(void) {
     } else CHECK(0, "case 12 submitted");
 }
 
+static void uav_next_to_rgb32(void) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC u; D3D12_CPU_DESCRIPTOR_HANDLE h; D3D12_GPU_DESCRIPTOR_HANDLE g;
+    const UINT c[4] = { NI, S_F, 0, 0 };
+    const UINT *o = NULL; UINT t, bad = 0, badw = 0;
+    struct shadow_stats st;
+    printf("\n[13] typed UAV writes, an atomic and a typed UAV load next to an RGB32 read\n");
+    if (!pso_uav || !uavbuf || !cntbuf) { CHECK(0, "typed-UAV PSO and buffers created"); return; }
+    heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(heap, &h);
+    ZeroMemory(&u, sizeof u);
+    u.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    u.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; u.Buffer.NumElements = NI;
+    h.ptr += (SIZE_T)S_UAV0 * inc; ID3D12Device_CreateUnorderedAccessView(dev, uavbuf, NULL, &u, h);
+    u.Format = DXGI_FORMAT_R32_UINT; u.Buffer.NumElements = 64;
+    h.ptr += inc; ID3D12Device_CreateUnorderedAccessView(dev, cntbuf, NULL, &u, h);
+    heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(heap, &g);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &heap);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs_uav);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pso_uav);
+    ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 0, 4, c, 0);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 1, g);
+    g.ptr += (UINT64)S_UAV0 * inc;
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 2, g);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 3, ID3D12Resource_GetGPUVirtualAddress(outbuf));
+    ID3D12GraphicsCommandList_Dispatch(list, (NI + 63) / 64, 1, 1);
+    if (!finish(1)) { CHECK(0, "case 13 submitted"); return; }
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&o);
+    if (!o) { CHECK(0, "readback mapped"); return; }
+    for (t = 0; t < NI; t++) {
+        UINT v[4], k;
+        for (k = 0; k < 3; k++) { float f = 2.0f * fval(t, k, -7.0f); memcpy(&v[k], &f, 4); }
+        v[3] = 0x40000000u;   /* 2.0f: w = 1 from the RGB32 view, doubled */
+        if (memcmp(&o[4 * t], v, 16) && !bad++)
+            printf("        element %u: got (%#x %#x %#x %#x), expected (%#x %#x %#x %#x)\n", t, o[4 * t], o[4 * t + 1], o[4 * t + 2], o[4 * t + 3], v[0], v[1], v[2], v[3]);
+        if ((o[4 * (NI + t)] != NI || o[4 * (NI + t) + 1] != 1) && !badw++)
+            printf("        thread %u: GetDimensions %u, atomic old in range %u\n", t, o[4 * (NI + t)], o[4 * (NI + t) + 1]);
+    }
+    ID3D12Resource_Unmap(rb, 0, NULL);
+    CHECK(!bad, "RGB32 read, doubled through a typed UAV write and load: %u elements exact (%u wrong)", NI, bad);
+    CHECK(!badw, "typed UAV GetDimensions and atomic untouched (%u threads wrong)", badw);
+    st = stats2();
+    if (shader_mode) CHECK(!st.untraced_pipes && !st.unsafe && !st.live, "rgb32-shader: no pipeline has an untraceable typed SRV access (%llu), no shadow (%llu live)",
+                           (unsigned long long)st.untraced_pipes, (unsigned long long)st.live);
+}
+
 static void cases(void) {
     struct expect A = { K_FLOAT, 0.25f, 0 }, Aoff = { K_FLOAT, 0.25f, OFF }, B = { K_FLOAT, -7.0f, 0 }, Boff = { K_FLOAT, -7.0f, OFF };
     struct expect U = { K_UINT, 0, 0 }, I = { K_SINT, 0, 0 }, C = { K_FLOAT, 1000.0f, 0 }, Blate = { K_FLOAT, -7.0f, LATE_FIRST };
@@ -603,6 +651,7 @@ static void cases(void) {
     refresh_cost();
     dedupe_and_big();
     r32_and_heap();
+    uav_next_to_rgb32();
     if (shader_mode) {
         struct shadow_stats st = stats2();
         CHECK(!st.live && !st.copied && !st.unsafe, "rgb32-shader: the whole run made no shadow and copied nothing (%llu live, %llu bytes; %llu views read in the shader)",
@@ -689,6 +738,32 @@ int main(void) {
         }
         CHECK(rs_heap && pso_heap, "SM 6.6 heap-indexing root signature and PSO created");
     }
+    {   /* case 13: constants, SRV table (t0 space0, unbounded), UAV table (u1, u2), root UAV u0 */
+        D3D12_DESCRIPTOR_RANGE1 r[2]; D3D12_ROOT_PARAMETER1 p[4]; D3D12_VERSIONED_ROOT_SIGNATURE_DESC v; ID3DBlob *blob = NULL, *err = NULL;
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cd;
+        ZeroMemory(r, sizeof r); ZeroMemory(p, sizeof p); ZeroMemory(&v, sizeof v); ZeroMemory(&cd, sizeof cd);
+        r[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; r[0].NumDescriptors = UINT_MAX; r[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+        r[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r[1].NumDescriptors = 2; r[1].BaseShaderRegister = 1;
+        r[1].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; p[0].Constants.Num32BitValues = 4;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[1].DescriptorTable.NumDescriptorRanges = 1; p[1].DescriptorTable.pDescriptorRanges = &r[0];
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; p[2].DescriptorTable.NumDescriptorRanges = 1; p[2].DescriptorTable.pDescriptorRanges = &r[1];
+        p[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        v.Version = D3D_ROOT_SIGNATURE_VERSION_1_1; v.Desc_1_1.NumParameters = 4; v.Desc_1_1.pParameters = p;
+        hr = p_serialize(&v, &blob, &err);
+        if (err) ID3D10Blob_Release(err);
+        if (SUCCEEDED(hr) && blob)
+            ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(blob), ID3D10Blob_GetBufferSize(blob),
+                                             &IID_ID3D12RootSignature, (void **)&rs_uav);
+        if (blob) ID3D10Blob_Release(blob);
+        if (rs_uav) {
+            cd.pRootSignature = rs_uav; cd.CS.pShaderBytecode = rgb_uav_dxil; cd.CS.BytecodeLength = sizeof rgb_uav_dxil;
+            ID3D12Device_CreateComputePipelineState(dev, &cd, &IID_ID3D12PipelineState, (void **)&pso_uav);
+        }
+        uavbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, (UINT64)NI * 16, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cntbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, 256, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        CHECK(rs_uav && pso_uav, "typed-UAV root signature and PSO created");
+    }
     { struct shadow_stats st = stats2(); shader_mode = (int)st.rgb32_shader;
       printf("        rgb32-shader = %d: RGB32 views are %s\n", shader_mode, shader_mode ? "read in the shader" : "served from shadows"); }
 
@@ -706,6 +781,10 @@ int main(void) {
     cases();
 
 done:
+    if (pso_uav) ID3D12PipelineState_Release(pso_uav);
+    if (rs_uav) ID3D12RootSignature_Release(rs_uav);
+    if (uavbuf) ID3D12Resource_Release(uavbuf);
+    if (cntbuf) ID3D12Resource_Release(cntbuf);
     if (pso_heap) ID3D12PipelineState_Release(pso_heap);
     if (rs_heap) ID3D12RootSignature_Release(rs_heap);
     if (pso) ID3D12PipelineState_Release(pso);
