@@ -33,6 +33,12 @@
  *       must copy exactly the bytes those copies wrote that views cover (the
  *       runtime's MadeiraD3D12ShadowStats), not every view each time; two
  *       UAV -> SRV barriers with no work between refresh the views once
+ *   10  a SINT view of a range that already has a UINT view shares its shadow
+ *       (no new memory) and reads the same bits; two shader-write barriers
+ *       with a dispatch between, in one frame, refresh the big (12 MB) view
+ *       once and the small views twice; the next frame refreshes it again
+ *       (frames are ExecuteCommandLists calls here: the test never presents).
+ *       With madeira.cfg rgb32-big-exact = 1 the big view is refreshed twice.
  *
  *  Exit code = number of failed checks. Every dispatch is finite.
  */
@@ -62,11 +68,12 @@ enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FI
 enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_COUNT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_COUNT };
 enum { NG = 1 << 20, NCOPY = 40, CPYN = 1200 };   /* case 9: big buffer elements, copies, elements per copy */
 static UINT big_first(UINT k) { return k * 12007u + 5u; }
 static UINT big_num(UINT k) { return 100u + 13u * k; }
-typedef void (*pfn_shadow_stats)(UINT64 *, UINT64 *, UINT64 *);
+struct shadow_stats { UINT64 copied, viewed, skips, big_skips, live, live_bytes, big_exact, big_bytes; };
+typedef void (*pfn_shadow_stats)(struct shadow_stats *);
 static pfn_shadow_stats p_stats;
 #define OUT_REGION ((UINT64)NF * 16)   /* one dispatch's output */
 #define ONE_F 0x3f800000u
@@ -330,7 +337,13 @@ out:
     for (k = 0; k < NSLOT; k++) { if (fl[k]) ID3D12GraphicsCommandList_Release(fl[k]); if (fa[k]) ID3D12CommandAllocator_Release(fa[k]); }
 }
 
-static void stats(UINT64 *c, UINT64 *v, UINT64 *k) { *c = *v = *k = 0; if (p_stats) p_stats(c, v, k); }
+static void stats(UINT64 *c, UINT64 *v, UINT64 *k) {
+    struct shadow_stats st; memset(&st, 0, sizeof st);
+    if (p_stats) p_stats(&st);
+    *c = st.copied; *v = st.viewed; *k = st.skips;
+}
+static struct shadow_stats stats2(void) { struct shadow_stats st; memset(&st, 0, sizeof st); if (p_stats) p_stats(&st); return st; }
+static UINT64 g_all_views, g_whole_bytes;   /* case 9 -> 10 */
 static void refresh_cost(void) {
     struct expect G1 = { K_FLOAT, 5.0f, 0 };
     UINT64 c0, v0, k0, c1, v1, k1, want_c = 0, want_v = 0, all = 0;
@@ -343,6 +356,7 @@ static void refresh_cost(void) {
     ID3D12Resource_Unmap(gstage, 0, NULL);
     for (k = 0; k < NBIGV; k++) { make_view(S_BIG0 + k, gbuf, DXGI_FORMAT_R32G32B32_FLOAT, big_first(k), big_num(k)); all += big_num(k) * 12ull; }
     make_view(S_WHOLE, gbuf, DXGI_FORMAT_R32G32B32_FLOAT, 0, NG); all += NG * 12ull;
+    g_all_views = all; g_whole_bytes = NG * 12ull;
 
     /* whole contents (seed 5), read */
     ID3D12GraphicsCommandList_CopyBufferRegion(list, gbuf, 0, gstage, 0, (UINT64)NG * 12);
@@ -389,6 +403,54 @@ static void refresh_cost(void) {
     stats(&c1, &v1, &k1);
     CHECK(c1 - c0 == all && k1 - k0 == 1, "UAV -> SRV twice with no work between: every view refreshed once (%llu of %llu bytes, %llu skipped)",
           (unsigned long long)(c1 - c0), (unsigned long long)all, (unsigned long long)(k1 - k0));
+}
+
+static void uav_cycle(void) {
+    barrier(gbuf, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    barrier(gbuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    read_view_at(K_FLOAT, S_BIG0, 0, big_num(0), 0);
+}
+static void dedupe_and_big(void) {
+    struct expect Ubits = { K_UINT, 0, 0 };
+    struct shadow_stats a, b;
+    UINT64 small, big_n;
+    printf("\n[10] UINT/SINT shadow sharing; big views refreshed once a frame after shader writes\n");
+    if (!p_stats || !g_all_views) { CHECK(0, "MadeiraD3D12ShadowStats exported and case 9 ran"); return; }
+    a = stats2();
+    make_view(S_USI, ubuf, DXGI_FORMAT_R32G32B32_SINT, 0, NI);
+    b = stats2();
+    CHECK(b.live == a.live && b.live_bytes == a.live_bytes, "a SINT view of a UINT view's range made no new shadow (%llu -> %llu live, %llu -> %llu bytes)",
+          (unsigned long long)a.live, (unsigned long long)b.live, (unsigned long long)a.live_bytes, (unsigned long long)b.live_bytes);
+    read_view(K_SINT, S_USI, NI, 0);
+    if (finish(1)) verify("SINT view over the UINT data: same bits", 0, NI, &Ubits); else CHECK(0, "case 10a submitted");
+
+    small = g_all_views - g_whole_bytes;
+    big_n = g_whole_bytes >= b.big_bytes ? 1 : 0;
+    printf("        big views from %llu bytes (%s); the whole view is %s\n", (unsigned long long)b.big_bytes,
+           b.big_exact ? "rgb32-big-exact = 1" : "once a frame", big_n ? "big" : "NOT big: the check expects every view refreshed every time");
+    a = stats2();
+    uav_cycle(); uav_cycle();   /* one frame: shader writes, read, shader writes, read */
+    if (!finish(1)) { CHECK(0, "case 10b submitted"); return; }
+    b = stats2();
+    {
+        UINT64 want = 2 * small + ((b.big_exact || !big_n) ? 2 : 1) * g_whole_bytes;
+        UINT64 want_skips = (b.big_exact || !big_n) ? 0 : 1;
+        CHECK(b.copied - a.copied == want && b.big_skips - a.big_skips == want_skips,
+              "two shader-write barriers in one frame: %llu bytes copied (%llu expected), big view held back %llu times (%llu expected)",
+              (unsigned long long)(b.copied - a.copied), (unsigned long long)want,
+              (unsigned long long)(b.big_skips - a.big_skips), (unsigned long long)want_skips);
+    }
+    a = stats2();
+    uav_cycle();   /* the next frame */
+    if (!finish(1)) { CHECK(0, "case 10c submitted"); return; }
+    b = stats2();
+    CHECK(b.copied - a.copied == g_all_views && b.big_skips == a.big_skips,
+          "next frame: the big view refreshed again (%llu of %llu bytes copied)", (unsigned long long)(b.copied - a.copied), (unsigned long long)g_all_views);
+    {
+        struct expect Gw = { K_FLOAT, 5.0f, 13000 };   /* between case 9's copies at views 0 and 2 */
+        read_view_at(K_FLOAT, S_WHOLE, 13000, 4096, 0);
+        if (finish(1)) verify("whole view still right", 0, 4096, &Gw); else CHECK(0, "case 10d submitted");
+    }
 }
 
 static void cases(void) {
@@ -457,6 +519,7 @@ static void cases(void) {
 
     frames_in_flight();
     refresh_cost();
+    dedupe_and_big();
 }
 
 int main(void) {
