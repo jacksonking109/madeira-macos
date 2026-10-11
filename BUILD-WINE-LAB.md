@@ -99,7 +99,12 @@ old value is exact on raw, structured and 2 MB typed R32G32_UINT buffers; groups
 D3D12_OPTIONS9 claims them, which it no longer does by default; precompiled DXIL from readback.hlsl);
 d3d12-loopwd-x64.exe (tests/windows/loopwd_test.c, 0 failures, 11 checks: a compute kernel with a counted loop and a
 data-dependent loop, bounds from a buffer, exact for normal bounds and stopped at the default cap for 1 << 24 passes;
-always finite, 0.5 s on an M3 Pro with the watchdog off; precompiled DXIL from loopwd.hlsl).
+always finite, 0.5 s on an M3 Pro with the watchdog off; precompiled DXIL from loopwd.hlsl);
+d3d12-rgb32-x64.exe (tests/windows/rgb32_test.c, 0 failures, 17 checks: R32G32B32_FLOAT/_UINT/_SINT typed SRVs, which
+Metal has no texture-buffer format for, read as Buffer<float4/uint4/int4> from unbounded descriptor arrays, bit-exact
+with w = 1: CopyBufferRegion + barrier (40000 elements), FirstElement 37, a second copy + barrier in the same list, a
+view made after the data, a copy with no barrier read in the next list, an UPLOAD source the CPU rewrites; served from
+RGBA32 shadow buffers, see struct mad_shadow; precompiled DXIL from rgb32.hlsl).
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
