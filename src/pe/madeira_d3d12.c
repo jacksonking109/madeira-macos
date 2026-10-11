@@ -6268,6 +6268,22 @@ static LONG g_perf_lock; static int g_perf_enabled = -1;
 static double g_perf_gpu_sum, g_perf_gpu_union, g_perf_last_end, g_perf_first_start, g_perf_wait_s;
 static LONG g_perf_cbs, g_perf_presents; static LONGLONG g_perf_t0;
 
+/* wine-lab port: with flight-recorder = 1, each command buffer's GPU time is charged to the first pass or
+ * dispatch recorded in it, and the 5 s report lists the 12 costliest (batch-lists = 1 makes a command buffer
+ * one command list, which in most engines is one stage). */
+static struct { char what[96]; double s; unsigned n; } g_perf_top[64]; static unsigned g_perf_ntop;
+static void mad_perf_charge(obj_handle_t cb, double secs) {
+    LONG end = g_flight_pos, i; const char *what = NULL; unsigned k;
+    for (i = end > 1024 ? end - 1024 : 0; i < end; i++)
+        if (g_flight_ring[i & 1023].cb == cb) { what = g_flight_ring[i & 1023].what; break; }
+    if (!what) what = "(unrecorded)";
+    for (k = 0; k < g_perf_ntop; k++) if (!strcmp(g_perf_top[k].what, what)) break;
+    if (k == g_perf_ntop) {
+        if (g_perf_ntop == 64) return;
+        snprintf(g_perf_top[k].what, sizeof g_perf_top[k].what, "%s", what); g_perf_top[k].s = 0; g_perf_top[k].n = 0; g_perf_ntop++;
+    }
+    g_perf_top[k].s += secs; g_perf_top[k].n++;
+}
 static void mad_perf_lock(void) { while (InterlockedCompareExchange(&g_perf_lock, 1, 0)) YieldProcessor(); }
 static void mad_perf_unlock(void) { InterlockedExchange(&g_perf_lock, 0); }
 static void mad_perf_cb(obj_handle_t cb, double wait_s) {
@@ -6282,6 +6298,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     if (a.ret && t.end > t.start) {
         double s0 = t.start, e0 = t.end;
         g_perf_gpu_sum += e0 - s0;
+        if (g_flight > 0) mad_perf_charge(cb, e0 - s0);   /* wine-lab port */
         if (!g_perf_first_start) g_perf_first_start = s0;
         if (s0 < g_perf_last_end) s0 = g_perf_last_end;
         if (e0 > s0) g_perf_gpu_union += e0 - s0;
@@ -6302,6 +6319,16 @@ static void mad_perf_present(void) {
                   wall, g_perf_presents, g_perf_presents / wall, g_perf_cbs, g_perf_gpu_union * 1000, 100.0 * g_perf_gpu_union / wall,
                   g_perf_gpu_sum * 1000, g_perf_wait_s * 1000, 100.0 * g_perf_wait_s / wall,
                   g_perf_presents ? g_perf_gpu_union * 1000 / g_perf_presents : 0.0, g_perf_presents ? g_perf_wait_s * 1000 / g_perf_presents : 0.0);
+        if (g_perf_ntop && g_perf_presents) {   /* wine-lab port: costliest command buffers by their first pass */
+            unsigned a, b, m;
+            for (a = 0; a < g_perf_ntop && a < 12; a++) {
+                for (m = a, b = a + 1; b < g_perf_ntop; b++) if (g_perf_top[b].s > g_perf_top[m].s) m = b;
+                if (m != a) { char t[sizeof g_perf_top[0]]; memcpy(t, &g_perf_top[a], sizeof t); memcpy(&g_perf_top[a], &g_perf_top[m], sizeof t); memcpy(&g_perf_top[m], t, sizeof t); }
+                d3d12_log("[perf] gpu-top %2u: %6.2f ms/frame in %5.1f cbs/frame, starting with %s\n", a + 1,
+                          g_perf_top[a].s * 1000 / g_perf_presents, (double)g_perf_top[a].n / g_perf_presents, g_perf_top[a].what);
+            }
+            g_perf_ntop = 0;
+        }
         {   /* ml1116: encoder fence traffic per frame (mode 2 should cut waits well below updates) */
             static LONG lw, lu, lb; LONG cw = g_fence_waits, cu = g_fence_updates, cb = g_barrier_seen;
             d3d12_log("[perf] ml1119 caller thread per frame: ExecuteCommandLists %.2f ms, Present %.2f ms (frame %.1f ms)\n",
