@@ -58,6 +58,9 @@ static void mad_dump_blob(const char *name, const void *data, SIZE_T len) {
     CloseHandle(h);
 }
 static void mad_api_trace(void *ra, const char *what, HRESULT hr, const char *fmt, ...);   /* wine-lab port */
+static int mad_trace_size_hit(UINT64 bytes);                                                /* wine-lab port */
+static void mad_trace_size_log(void *ra, const char *fmt, ...);
+static double mad_nonzero_frac(const void *p, UINT64 len);
 static void d3d12_log(const char *fmt, ...) {
     /* ml909: every record handed to __wine_dbg_output MUST end in a newline
      * and be shorter than ntdll's 1020-byte line buffer. A record truncated
@@ -1056,7 +1059,10 @@ static ULONG mad_release(struct mad_obj *o) {
  * A completed value plus a list of waiters. The design requires immediate
  * completion, multiple waiters and late registration all to work: registering
  * for a value already reached must signal at once rather than wait forever. */
-#define MAD_FENCE_WAITERS 16
+/* wine-lab port: pending SetEventOnCompletion waits grow without a cap. The
+ * fixed 16 refused the 17th with a silent E_OUTOFMEMORY, and a caller that
+ * ignores the HRESULT then waits forever on an event nobody sets. */
+struct mad_fence_waiter { UINT64 value; HANDLE event; LONGLONG t_reg; };   /* ml1109: t_reg = registration time */
 struct mad_fence {
     ID3D12FenceVtbl *vtbl;
     LONG refs;
@@ -1073,10 +1079,43 @@ struct mad_fence {
     UINT64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
-    struct { UINT64 value; HANDLE event; LONGLONG t_reg; } waiters[MAD_FENCE_WAITERS];   /* ml1109: t_reg = registration time */
-    unsigned nwaiters;
+    struct mad_fence_waiter *waiters;   /* wine-lab port: grown on demand, freed with the fence */
+    unsigned nwaiters, cap_waiters;
 };
 
+/* wine-lab port: every live fence, so a stuck wait can be reported (ROTTR's
+ * menu creates mesh buffers whose upload never starts). */
+static struct mad_fence *g_fences[1024]; static unsigned g_nfences; static SRWLOCK g_fences_lock = SRWLOCK_INIT;
+static void mad_fence_register(struct mad_fence *f, int add) {
+    unsigned i;
+    AcquireSRWLockExclusive(&g_fences_lock);
+    if (add) { if (g_nfences < 1024) g_fences[g_nfences++] = f; }
+    else for (i = 0; i < g_nfences; i++) if (g_fences[i] == f) { g_fences[i] = g_fences[--g_nfences]; break; }
+    ReleaseSRWLockExclusive(&g_fences_lock);
+}
+/* Once a second from present: event waits pending for more than 3 s, with what
+ * the fence holds and what queues have been asked to signal it. */
+static void mad_fence_stuck_report(void) {
+    static LONG64 last; static LONG said; LARGE_INTEGER now, fq; unsigned i, k;
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
+    if (now.QuadPart - last < fq.QuadPart) return;
+    last = now.QuadPart;
+    AcquireSRWLockShared(&g_fences_lock);
+    for (i = 0; i < g_nfences && said < 300; i++) {
+        struct mad_fence *f = g_fences[i];
+        if (!TryEnterCriticalSection(&f->lock)) continue;
+        for (k = 0; k < f->nwaiters && said < 300; k++) {
+            double age = (double)(now.QuadPart - f->waiters[k].t_reg) / (double)fq.QuadPart;
+            if (age < 3.0) continue;
+            InterlockedIncrement(&said);
+            d3d12_log("[stuck-wait] fence %p: event %p waits for %llu for %.1f s; fence at %llu, queues asked to signal up to %lld (committed %lld), %u waiters\n",
+                      (void *)f, f->waiters[k].event, (unsigned long long)f->waiters[k].value, age, (unsigned long long)f->value,
+                      (long long)f->submitted, (long long)f->committed, f->nwaiters);
+        }
+        LeaveCriticalSection(&f->lock);
+    }
+    ReleaseSRWLockShared(&g_fences_lock);
+}
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
     f->value = v;
     WakeAllConditionVariable(&f->cv);
@@ -1108,7 +1147,7 @@ static ULONG STDMETHODCALLTYPE fence_AddRef(ID3D12Fence *This) { return mad_addr
 static ULONG STDMETHODCALLTYPE fence_Release(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
     LONG r = InterlockedDecrement(&f->refs);
-    if (r == 0) { mad_pd_purge(This);   /* ml1143 */ DeleteCriticalSection(&f->lock); d3d12_log("[madeira-d3d12] destroyed %s\n", f->name); free(f); }
+    if (r == 0) { mad_fence_register(f, 0); mad_pd_purge(This);   /* ml1143 */ DeleteCriticalSection(&f->lock); free(f->waiters); d3d12_log("[madeira-d3d12] destroyed %s\n", f->name); free(f); }
     return (ULONG)r;
 }
 /* ml1142: WHO SPINS ON GetCompletedValue. ph-empire07: 4.4 M calls/s from the
@@ -1168,16 +1207,31 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
          * can make progress. Re-checked in a loop because a condition variable
          * may wake spuriously and because an intervening signal may not have
          * reached our value yet. */
+        int said_slow = 0;   /* wine-lab port: say when a blocking wait runs long */
         while (f->value < value)
-            SleepConditionVariableCS(&f->cv, &f->lock, INFINITE);
-    } else if (f->nwaiters < MAD_FENCE_WAITERS) {
+            if (!SleepConditionVariableCS(&f->cv, &f->lock, 3000) && !said_slow && f->value < value) {
+                said_slow = 1;
+                d3d12_log("[stuck-wait] fence %p: BLOCKING wait (null event) for %llu still waiting after 3 s; fence at %llu, asked up to %lld (committed %lld)\n",
+                          (void *)f, (unsigned long long)value, (unsigned long long)f->value, (long long)f->submitted, (long long)f->committed);
+            }
+    } else {
+        if (f->nwaiters == f->cap_waiters) {
+            unsigned ncap = f->cap_waiters ? f->cap_waiters * 2 : 16;
+            struct mad_fence_waiter *nw = realloc(f->waiters, ncap * sizeof *nw);
+            if (!nw) { LeaveCriticalSection(&f->lock); return E_OUTOFMEMORY; }
+            f->waiters = nw; f->cap_waiters = ncap;
+            if (ncap > 16) {
+                static LONG said;
+                if (InterlockedIncrement(&said) <= 8)
+                    d3d12_log("[madeira-d3d12] fence %p: %u events waiting at once (the old cap of 16 refused the 17th)\n",
+                              (void *)f, f->nwaiters + 1);
+            }
+        }
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); f->waiters[f->nwaiters].t_reg = t.QuadPart; }   /* ml1109 */
         InterlockedIncrement(&g_perf_waits);
         f->waiters[f->nwaiters].value = value;
         f->waiters[f->nwaiters].event = event;
         f->nwaiters++;
-    } else {
-        hr = E_OUTOFMEMORY;
     }
     LeaveCriticalSection(&f->lock);
     return hr;
@@ -7778,6 +7832,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
     f->flags = flags;
     f->value = initial;
     InitializeCriticalSection(&f->lock);
+    mad_fence_register(f, 1);   /* wine-lab port: stuck-wait report (after the lock exists) */
     InitializeConditionVariable(&f->cv);
     HRESULT hr = fence_QI((ID3D12Fence *)f, riid, out);
     fence_Release((ID3D12Fence *)f);
@@ -9364,12 +9419,18 @@ static HRESULT STDMETHODCALLTYPE res_Map(ID3D12Resource *This, UINT sub,
     }
     InterlockedIncrement(&r->mapped);
     if (data) *data = r->cpu;
+    if (!r->texture && mad_trace_size_hit(r->size))   /* wine-lab port */
+        mad_trace_size_log(__builtin_return_address(0), "Map %p (%llu bytes, heap %u) -> cpu %p, non-zero %.3f", (void *)r,
+                           (unsigned long long)r->size, (unsigned)r->heap, r->cpu, mad_nonzero_frac(r->cpu, r->size));
     return S_OK;
 }
 static void STDMETHODCALLTYPE res_Unmap(ID3D12Resource *This, UINT sub, const D3D12_RANGE *written) {
     struct mad_resource *r = (struct mad_resource *)This;
     (void)sub; (void)written;
     if (r->mapped) InterlockedDecrement(&r->mapped);
+    if (!r->texture && r->cpu && mad_trace_size_hit(r->size))   /* wine-lab port */
+        mad_trace_size_log(__builtin_return_address(0), "Unmap %p (%llu bytes): non-zero %.3f", (void *)r,
+                           (unsigned long long)r->size, mad_nonzero_frac(r->cpu, r->size));
 }
 static D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE res_GetGPUVirtualAddress(ID3D12Resource *This) {
     struct mad_resource *r = (struct mad_resource *)This;
@@ -9727,6 +9788,10 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommittedResource(ID3D12Device *Th
     if (desc->Width >= (32u << 20) && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && said++ < 64)
         d3d12_log("[madeira-d3d12] committed: %llu MB flags %#x heap-type %u -> hr %#lx\n",
                   (unsigned long long)(desc->Width >> 20), (unsigned)desc->Flags, (unsigned)heap->Type, (unsigned long)hr);
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && mad_trace_size_hit(desc->Width))   /* wine-lab port */
+        mad_trace_size_log(__builtin_return_address(0), "committed %llu bytes heap %u flags %#x state %#x -> %p hr %#lx list#%u",
+                           (unsigned long long)desc->Width, (unsigned)heap->Type, (unsigned)desc->Flags, (unsigned)state,
+                           SUCCEEDED(hr) ? *out : NULL, (unsigned long)hr, g_list_seq);
     return hr;
 }
 
@@ -9858,6 +9923,10 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(ID3D12Device *This,
         d3d12_log("[madeira-d3d12] placed: %llu MB dim %u flags %#x in heap %p (%llu KB, flags %#x) at offset %llu -> hr %#lx\n",
                   (unsigned long long)(desc->Width >> 20), (unsigned)desc->Dimension, (unsigned)desc->Flags, (void *)h,
                   (unsigned long long)(h->desc.SizeInBytes / 1024), (unsigned)h->desc.Flags, (unsigned long long)offset, (unsigned long)hr);
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && mad_trace_size_hit(desc->Width))   /* wine-lab port */
+        mad_trace_size_log(__builtin_return_address(0), "placed %llu bytes in heap %p (type %u) +%llu state %#x -> %p hr %#lx list#%u",
+                           (unsigned long long)desc->Width, (void *)h, (unsigned)h->desc.Properties.Type, (unsigned long long)offset,
+                           (unsigned)state, SUCCEEDED(hr) ? *out : NULL, (unsigned long)hr, g_list_seq);
     return hr;
 }
 
@@ -13607,6 +13676,11 @@ static void STDMETHODCALLTYPE list_CopyBufferRegion(ID3D12GraphicsCommandList *T
     c = mad_list_push(l, MC_COPY_BB);
     if (!c) return;
     c->u.bb.dst = d; c->u.bb.doff = dst_off; c->u.bb.src = s; c->u.bb.soff = src_off; c->u.bb.len = len;
+    if (mad_trace_size_hit(d->size) || mad_trace_size_hit(s->size))   /* wine-lab port */
+        mad_trace_size_log(__builtin_return_address(0), "CopyBufferRegion list %p (type %u) dst %p (%llu bytes, heap %u) +%llu <- src %p (%llu bytes, heap %u) +%llu, %llu bytes; src non-zero now %.3f",
+                           (void *)l, (unsigned)l->type, (void *)d, (unsigned long long)d->size, (unsigned)d->heap, (unsigned long long)dst_off,
+                           (void *)s, (unsigned long long)s->size, (unsigned)s->heap, (unsigned long long)src_off, (unsigned long long)len,
+                           s->cpu ? mad_nonzero_frac((const char *)s->cpu + src_off, len) : -1.0);
 }
 static void STDMETHODCALLTYPE list_CopyTextureRegion(ID3D12GraphicsCommandList *This,
         const D3D12_TEXTURE_COPY_LOCATION *dst, UINT x, UINT y, UINT z,
@@ -14631,6 +14705,47 @@ static void mad_api_trace(void *ra, const char *what, HRESULT hr, const char *fm
     if (fmt) { va_start(ap, fmt); vsnprintf(extra, sizeof extra, fmt, ap); va_end(ap); }
     d3d12_log("[api] %s+%#llx %s -> %#lx %s\n", base, (unsigned long long)((char *)ra - (char *)m), what, (unsigned long)hr, extra);
 }
+
+/* wine-lab port: madeira.cfg trace-size = a comma list of byte sizes. Every
+ * buffer of a listed size is followed -- created, mapped, unmapped (with how
+ * much of it is non-zero), copied into or out of -- with the calling module,
+ * and without trace-api's cap. ROTTR's menu draws some meshes from buffers
+ * that are all zeros; this shows how the game meant to fill them. */
+static char g_trace_size[256]; static int g_trace_size_state = -1;
+static int mad_trace_size_hit(UINT64 bytes) {
+    const char *p; char num[24];
+    if (g_trace_size_state < 0) {
+        mad_cfg_str_pe("trace-size", g_trace_size, sizeof g_trace_size);
+        g_trace_size_state = g_trace_size[0] ? 1 : 0;
+        if (g_trace_size_state) d3d12_log("[trace-size] following buffers of %s bytes\n", g_trace_size);
+    }
+    if (!g_trace_size_state || !bytes) return 0;
+    snprintf(num, sizeof num, "%llu", (unsigned long long)bytes);
+    for (p = g_trace_size; (p = strstr(p, num)); p++) {
+        char after = p[strlen(num)];
+        if ((p == g_trace_size || p[-1] == ',' || p[-1] == ' ') && (!after || after == ',' || after == ' ')) return 1;
+    }
+    return 0;
+}
+static void mad_trace_size_log(void *ra, const char *fmt, ...) {
+    static LONG said;
+    char mod[MAX_PATH] = "?", msg[400];
+    const char *base;
+    HMODULE m = NULL;
+    va_list ap;
+    if (InterlockedIncrement(&said) > 4000) return;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ra, &m) && m)
+        GetModuleFileNameA(m, mod, sizeof mod);
+    base = strrchr(mod, '\\'); base = base ? base + 1 : mod;
+    va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
+    d3d12_log("[trace-size] %s+%#llx %s\n", base, (unsigned long long)((char *)ra - (char *)m), msg);
+}
+static double mad_nonzero_frac(const void *p, UINT64 len) {
+    const unsigned char *b = p; UINT64 i, n = 0;
+    if (!p || !len) return -1.0;
+    for (i = 0; i < len; i++) n += b[i] != 0;
+    return (double)n / (double)len;
+}
 static HRESULT STDMETHODCALLTYPE tr_CreateRootSignature(ID3D12Device *This, UINT node, const void *blob, SIZE_T size, REFIID riid, void **out) {
     HRESULT hr = device_CreateRootSignature(This, node, blob, size, riid, out);
     mad_api_trace(__builtin_return_address(0), "CreateRootSignature", hr, "%lu bytes -> %p", (unsigned long)size, out ? *out : NULL);
@@ -15379,6 +15494,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     if (idx >= s->nbuf) return;
     src = s->buffers[idx];
     mad_mheap_reclaim(s->dev, 0);   /* ml1148: once a frame, heaps whose GPU work is long done */
+    mad_fence_stuck_report();       /* wine-lab port */
     { LONG64 tf = mad_qpc();   /* ml1128 */
     mad_device_flush_all(s->queue->device);          /* ml884: the frame's batch precedes the present */
     InterlockedExchangeAdd64(&g_xp.t_flush, mad_qpc() - tf); }
