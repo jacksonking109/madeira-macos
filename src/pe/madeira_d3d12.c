@@ -1443,6 +1443,8 @@ struct mad_queue {
     const IID *iid;
     const char *name;
     D3D12_COMMAND_LIST_TYPE type;
+    INT priority;                       /* wine-lab port: echoed by GetDesc */
+    D3D12_COMMAND_QUEUE_FLAGS flags;
     UINT64 executed;
     UINT64 rejected;
     struct mad_device *device;
@@ -7695,6 +7697,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandQueue(ID3D12Device *This,
     struct mad_queue *q = calloc(1, sizeof *q);
     if (!q) return E_OUTOFMEMORY;
     q->type = desc->Type;
+    q->priority = desc->Priority; q->flags = desc->Flags;
     q->vtbl = &g_queue_vtbl; q->refs = 1; q->iid = &IID_ID3D12CommandQueue; q->name = "CommandQueue";
     InitializeCriticalSection(&q->submit_lock);   /* ml1021 */
     if (mad_async_on()) {   /* ml1120 */
@@ -9098,6 +9101,13 @@ static D3D12_COMMAND_QUEUE_DESC * STDMETHODCALLTYPE queue_GetDesc(ID3D12CommandQ
     (void)This;
     memset(ret, 0, sizeof *ret);
     ret->Type = ((struct mad_queue *)This)->type;
+    /* wine-lab port: one GPU node, and D3D12 reports a queue created with
+     * NodeMask 0 as node 1. HBAO+ (GFSDK_SSAO_D3D12, ROTTR) compares this
+     * against its own one-bit mask at the top of every RenderAO and returned
+     * INVALID_NODE_MASK on our 0 -- no AO pass ever ran, lighting went black. */
+    ret->NodeMask = 1;
+    ret->Priority = ((struct mad_queue *)This)->priority;
+    ret->Flags = ((struct mad_queue *)This)->flags;
     return ret;
 }
 
@@ -9782,6 +9792,9 @@ static HRESULT STDMETHODCALLTYPE memheap_GetDevice(ID3D12Heap *This, REFIID riid
 }
 static D3D12_HEAP_DESC * STDMETHODCALLTYPE memheap_GetDesc(ID3D12Heap *This, D3D12_HEAP_DESC *ret) {
     *ret = ((struct mad_memheap *)This)->desc;
+    /* wine-lab port: node masks read back normalised (0 -> node 1), as D3D12 does */
+    if (!ret->Properties.CreationNodeMask) ret->Properties.CreationNodeMask = 1;
+    if (!ret->Properties.VisibleNodeMask) ret->Properties.VisibleNodeMask = 1;
     return ret;
 }
 
@@ -9880,6 +9893,7 @@ static ULONG STDMETHODCALLTYPE heap_Release(ID3D12DescriptorHeap *T) {
  * header exactly is the whole reason the vtables are generated from it. */
 static D3D12_DESCRIPTOR_HEAP_DESC * STDMETHODCALLTYPE heap_GetDesc(ID3D12DescriptorHeap *T, D3D12_DESCRIPTOR_HEAP_DESC *ret) {
     *ret = ((struct mad_heap *)T)->desc;
+    if (!ret->NodeMask) ret->NodeMask = 1;   /* wine-lab port: normalised, as D3D12 does */
     return ret;
 }
 
