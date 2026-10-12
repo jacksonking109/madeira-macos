@@ -57,6 +57,7 @@ static void mad_dump_blob(const char *name, const void *data, SIZE_T len) {
     WriteFile(h, data, (DWORD)len, &wr, NULL);
     CloseHandle(h);
 }
+static void mad_api_trace(void *ra, const char *what, HRESULT hr, const char *fmt, ...);   /* wine-lab port */
 static void d3d12_log(const char *fmt, ...) {
     /* ml909: every record handed to __wine_dbg_output MUST end in a newline
      * and be shorter than ntdll's 1020-byte line buffer. A record truncated
@@ -9348,6 +9349,7 @@ static HRESULT STDMETHODCALLTYPE res_Map(ID3D12Resource *This, UINT sub,
                       r->texture ? "TEXTURE" : "buffer", sub, r->name ? r->name : "?",
                       (unsigned)r->width, (unsigned)r->height);
         if (data) *data = NULL;
+        mad_api_trace(__builtin_return_address(0), "Resource::Map", E_INVALIDARG, "sub %u %s", sub, r->texture ? "texture" : "buffer");
         return E_INVALIDARG;
     }
     InterlockedIncrement(&r->mapped);
@@ -14594,6 +14596,106 @@ static HRESULT STDMETHODCALLTYPE device_CreatePipelineLibrary(ID3D12Device10 *Th
     return hr;
 }
 
+/* ---- wine-lab port: API call tracing by caller module ---------------------
+ * Every FAILED create / feature query is logged with the module and offset that
+ * called it (rate-limited), and with madeira.cfg trace-api = 1 every call is.
+ * Middleware (NVIDIA HBAO+ in ROTTR: GFSDK_SSAO_D3D12) gives up silently when a
+ * call fails; this names the call. */
+static int g_trace_api = -1;
+static void mad_api_trace(void *ra, const char *what, HRESULT hr, const char *fmt, ...) {
+    static LONG said_fail, said_all;
+    char mod[MAX_PATH] = "?", extra[320] = "";
+    const char *base;
+    HMODULE m = NULL;
+    va_list ap;
+    if (g_trace_api < 0) g_trace_api = mad_cfg_int_pe("trace-api", 0) ? 1 : 0;
+    if (SUCCEEDED(hr) && !g_trace_api) return;
+    if (FAILED(hr) ? InterlockedIncrement(&said_fail) > 400 : InterlockedIncrement(&said_all) > 6000) return;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ra, &m) && m)
+        GetModuleFileNameA(m, mod, sizeof mod);
+    base = strrchr(mod, '\\'); base = base ? base + 1 : mod;
+    if (fmt) { va_start(ap, fmt); vsnprintf(extra, sizeof extra, fmt, ap); va_end(ap); }
+    d3d12_log("[api] %s+%#llx %s -> %#lx %s\n", base, (unsigned long long)((char *)ra - (char *)m), what, (unsigned long)hr, extra);
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateRootSignature(ID3D12Device *This, UINT node, const void *blob, SIZE_T size, REFIID riid, void **out) {
+    HRESULT hr = device_CreateRootSignature(This, node, blob, size, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateRootSignature", hr, "%lu bytes -> %p", (unsigned long)size, out ? *out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateGraphicsPipelineState(ID3D12Device *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d, REFIID riid, void **out) {
+    HRESULT hr = device_CreateGraphicsPipelineState(This, d, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateGraphicsPipelineState", hr, "VS %lu GS %lu PS %lu B, %u RTs fmt0 %u dsv %u, rs %p -> %p",
+                  d ? (unsigned long)d->VS.BytecodeLength : 0, d ? (unsigned long)d->GS.BytecodeLength : 0, d ? (unsigned long)d->PS.BytecodeLength : 0,
+                  d ? d->NumRenderTargets : 0, d ? (unsigned)d->RTVFormats[0] : 0, d ? (unsigned)d->DSVFormat : 0, d ? (void *)d->pRootSignature : NULL, out ? *out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateComputePipelineState(ID3D12Device *This, const D3D12_COMPUTE_PIPELINE_STATE_DESC *d, REFIID riid, void **out) {
+    HRESULT hr = device_CreateComputePipelineState(This, d, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateComputePipelineState", hr, "CS %lu B -> %p", d ? (unsigned long)d->CS.BytecodeLength : 0, out ? *out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreatePipelineState(ID3D12Device10 *This, const D3D12_PIPELINE_STATE_STREAM_DESC *sd, REFIID riid, void **out) {
+    HRESULT hr = device_CreatePipelineState(This, sd, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreatePipelineState(stream)", hr, "%lu bytes -> %p", sd ? (unsigned long)sd->SizeInBytes : 0, out ? *out : NULL);
+    return hr;
+}
+static const char *mad_trace_rdesc(char *b, size_t n, const D3D12_RESOURCE_DESC *d) {
+    if (!d) return "(null desc)";
+    snprintf(b, n, "dim %u %llux%ux%u mips %u fmt %u samples %u layout %u flags %#x", (unsigned)d->Dimension, (unsigned long long)d->Width,
+             d->Height, d->DepthOrArraySize, d->MipLevels, (unsigned)d->Format, d->SampleDesc.Count, (unsigned)d->Layout, (unsigned)d->Flags);
+    return b;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateCommittedResource(ID3D12Device *This, const D3D12_HEAP_PROPERTIES *hp, D3D12_HEAP_FLAGS hf,
+        const D3D12_RESOURCE_DESC *d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE *cv, REFIID riid, void **out) {
+    char b[200];
+    HRESULT hr = device_CreateCommittedResource(This, hp, hf, d, st, cv, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateCommittedResource", hr, "heap %u, %s, state %#x -> %p", hp ? (unsigned)hp->Type : 0,
+                  mad_trace_rdesc(b, sizeof b, d), (unsigned)st, out ? *out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreatePlacedResource(ID3D12Device *This, ID3D12Heap *heap, UINT64 off, const D3D12_RESOURCE_DESC *d,
+        D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE *cv, REFIID riid, void **out) {
+    char b[200];
+    HRESULT hr = device_CreatePlacedResource(This, heap, off, d, st, cv, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreatePlacedResource", hr, "heap %p +%llu, %s -> %p", (void *)heap, (unsigned long long)off,
+                  mad_trace_rdesc(b, sizeof b, d), out ? *out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateDescriptorHeap(ID3D12Device *This, const D3D12_DESCRIPTOR_HEAP_DESC *d, REFIID riid, void **out) {
+    HRESULT hr = device_CreateDescriptorHeap(This, d, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateDescriptorHeap", hr, "type %u, %u, flags %#x -> %p", d ? (unsigned)d->Type : 0,
+                  d ? d->NumDescriptors : 0, d ? (unsigned)d->Flags : 0, out ? *out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateFence(ID3D12Device *This, UINT64 v, D3D12_FENCE_FLAGS f, REFIID riid, void **out) {
+    HRESULT hr = device_CreateFence(This, v, f, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateFence", hr, "flags %#x -> %p", (unsigned)f, out ? *out : NULL);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateQueryHeap(ID3D12Device *This, const D3D12_QUERY_HEAP_DESC *d, REFIID riid, void **out) {
+    HRESULT hr = device_CreateQueryHeap(This, d, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateQueryHeap", hr, "type %u count %u", d ? (unsigned)d->Type : 0, d ? d->Count : 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateHeap(ID3D12Device *This, const D3D12_HEAP_DESC *d, REFIID riid, void **out) {
+    HRESULT hr = device_CreateHeap(This, d, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateHeap", hr, "%llu bytes type %u flags %#x", d ? (unsigned long long)d->SizeInBytes : 0,
+                  d ? (unsigned)d->Properties.Type : 0, d ? (unsigned)d->Flags : 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CheckFeatureSupport(ID3D12Device *This, D3D12_FEATURE f, void *data, UINT size) {
+    HRESULT hr = device_CheckFeatureSupport(This, f, data, size);
+    mad_api_trace(__builtin_return_address(0), "CheckFeatureSupport", hr, "feature %u size %u%s", (unsigned)f, size,
+                  f == D3D12_FEATURE_FORMAT_SUPPORT && data && size >= 4 ? " (format support)" : "");
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE tr_CreateCommandList(ID3D12Device *This, UINT node, D3D12_COMMAND_LIST_TYPE t, ID3D12CommandAllocator *a,
+        ID3D12PipelineState *pso, REFIID riid, void **out) {
+    HRESULT hr = device_CreateCommandList(This, node, t, a, pso, riid, out);
+    mad_api_trace(__builtin_return_address(0), "CreateCommandList", hr, "type %u -> %p", (unsigned)t, out ? *out : NULL);
+    return hr;
+}
+
 /* ---- vtable construction ------------------------------------------------- */
 static void build_vtables(void) {
     static LONG done;
@@ -14741,6 +14843,19 @@ static void build_vtables(void) {
     g_list_vtbl.SetComputeRoot32BitConstant        = (void *)list_SetComputeRoot32BitConstant;
     g_list_vtbl.SetComputeRoot32BitConstants       = (void *)list_SetComputeRoot32BitConstants;
     g_device_vtbl.CreateComputePipelineState = (void *)device_CreateComputePipelineState;
+    /* wine-lab port: the traced entry points (mad_api_trace) */
+    g_device_vtbl.CreateRootSignature = (void *)tr_CreateRootSignature;
+    g_device_vtbl.CreateGraphicsPipelineState = (void *)tr_CreateGraphicsPipelineState;
+    g_device_vtbl.CreateComputePipelineState = (void *)tr_CreateComputePipelineState;
+    g_device_vtbl.CreatePipelineState = tr_CreatePipelineState;
+    g_device_vtbl.CreateCommittedResource = (void *)tr_CreateCommittedResource;
+    g_device_vtbl.CreatePlacedResource = (void *)tr_CreatePlacedResource;
+    g_device_vtbl.CreateDescriptorHeap = (void *)tr_CreateDescriptorHeap;
+    g_device_vtbl.CreateFence = (void *)tr_CreateFence;
+    g_device_vtbl.CreateQueryHeap = (void *)tr_CreateQueryHeap;
+    g_device_vtbl.CreateHeap = (void *)tr_CreateHeap;
+    g_device_vtbl.CheckFeatureSupport = (void *)tr_CheckFeatureSupport;
+    g_device_vtbl.CreateCommandList = (void *)tr_CreateCommandList;
     g_list_vtbl.CopyResource            = (void *)list_CopyResource;
     g_list_vtbl.ResourceBarrier         = (void *)list_ResourceBarrier;
     g_list_vtbl.Dispatch                = (void *)list_Dispatch;
@@ -15974,12 +16089,17 @@ HRESULT WINAPI D3D12SerializeRootSignature(
     memset(&v, 0, sizeof v);
     v.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
     v.Desc_1_0 = *desc;
-    return mad_serialize_any(&v, blob, err);
+    {   HRESULT hr = mad_serialize_any(&v, blob, err);   /* wine-lab port: traced */
+        mad_api_trace(__builtin_return_address(0), "D3D12SerializeRootSignature", hr, "%u params %u samplers flags %#x",
+                      desc->NumParameters, desc->NumStaticSamplers, (unsigned)desc->Flags);
+        return hr; }
 }
 
 HRESULT WINAPI D3D12SerializeVersionedRootSignature(
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc, ID3D10Blob **blob, ID3D10Blob **err) {
-    return mad_serialize_any(desc, blob, err);
+    HRESULT hr = mad_serialize_any(desc, blob, err);   /* wine-lab port: traced */
+    mad_api_trace(__builtin_return_address(0), "D3D12SerializeVersionedRootSignature", hr, "version %u", desc ? (unsigned)desc->Version : 0);
+    return hr;
 }
 
 HRESULT WINAPI D3D12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL min_level,
