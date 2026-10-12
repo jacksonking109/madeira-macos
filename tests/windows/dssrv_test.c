@@ -160,6 +160,8 @@ static const char hlsl[] =
     "float4 ps_sample(V i) : SV_Target {\n"
     "    return float4(dep.SampleLevel(pt, i.uv, 0), dep.Sample(pt, i.uv), 0, 1); }\n"
     "float4 ps_white(V i) : SV_Target { return float4(1, 1, 1, 1); }\n"
+    "Texture2D<float4> col : register(t0);\n"
+    "float4 ps_rgba(V i) : SV_Target { return col.SampleLevel(pt, i.uv, 0); }\n"
     "float4 ps_cmp(V i) : SV_Target {\n"
     "    return float4(dep.SampleCmpLevelZero(cmp, i.uv, 0.4), dep.SampleCmpLevelZero(cmp, i.uv, 0.6),\n"
     "                  dep.SampleCmp(cmp, i.uv, 0.4), dep.SampleCmp(cmp, i.uv, 0.6)); }\n";
@@ -302,6 +304,7 @@ int main(void) {
     ID3DBlob *ps_fill = compile(hlsl, "ps_fill", "ps_5_0"), *ps_mark = compile(hlsl, "ps_mark", "ps_5_0");
     ID3DBlob *ps_load = compile(hlsl, "ps_load", "ps_5_0"), *ps_sample = compile(hlsl, "ps_sample", "ps_5_0");
     ID3DBlob *ps_white = compile(hlsl, "ps_white", "ps_5_0"), *ps_cmp = compile(hlsl, "ps_cmp", "ps_5_0");
+    ID3DBlob *ps_rgba = compile(hlsl, "ps_rgba", "ps_5_0");
     if (!vs_near || !vs_far || !ps_fill || !ps_mark || !ps_load || !ps_sample || !ps_white || !ps_cmp) goto done;
 
     /* Root signature A: table t0-t1, static point sampler s0, static LESS_EQUAL comparison sampler s1.
@@ -351,7 +354,8 @@ int main(void) {
     ID3D12PipelineState *p_mask = make_pso(rsA, vs_far, ps_white, TRUE, DXGI_FORMAT_D24_UNORM_S8_UINT, &dmask, "stencil NOT_EQUAL + depth GREATER_EQUAL");
     ID3D12PipelineState *p_cmpA = make_pso(rsA, vs_near, ps_cmp, TRUE, DXGI_FORMAT_UNKNOWN, &dclear, "SampleCmp, static sampler");
     ID3D12PipelineState *p_cmpB = make_pso(rsB, vs_near, ps_cmp, TRUE, DXGI_FORMAT_UNKNOWN, &dclear, "SampleCmp, heap sampler");
-    if (!p_fill || !p_mark || !p_load || !p_sample || !p_mask || !p_cmpA || !p_cmpB) goto done;
+    ID3D12PipelineState *p_rgba = ps_rgba ? make_pso(rsA, vs_near, ps_rgba, TRUE, DXGI_FORMAT_UNKNOWN, &dclear, "rgba sample") : NULL;
+    if (!p_rgba || !p_fill || !p_mark || !p_load || !p_sample || !p_mask || !p_cmpA || !p_cmpB) goto done;
 
     ID3D12DescriptorHeap *heaps[2] = { srvh, smph };
 
@@ -562,6 +566,46 @@ int main(void) {
                 CHECK(!bad_s, "R24G8: a stencil-only rect clear (rect past the edge) sets 0x33 inside (40,30)-(64,64) only (%u wrong; (50,50) = %g, (10,10) = %g)",
                       bad_s, px(50, 50)[1], px(10, 10)[1]);
             } else CHECK(0, "R24G8 rect clears read back");
+        }
+    }
+
+    /* ---- 9: swizzled SRVs of render targets (Shader4ComponentMapping) */
+    printf("\n[9] SRVs with a component mapping on R8_UNORM / R16G16B16A16_FLOAT render targets\n");
+    {
+        static const struct { DXGI_FORMAT f; UINT map; float clr[4]; float want[4]; const char *what; } cs[] = {
+            { DXGI_FORMAT_R8_UNORM, D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 0, 0, 0), { 0.6f, 0, 0, 0 }, { 0.6f, 0.6f, 0.6f, 0.6f }, "R8 RRRR" },
+            { DXGI_FORMAT_R8_UNORM, D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(0, 4, 4, 5), { 0.6f, 0, 0, 0 }, { 0.6f, 0, 0, 1 }, "R8 R001" },
+            { DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(3, 2, 1, 0), { 0.25f, 0.5f, 0.75f, 1.0f }, { 1.0f, 0.75f, 0.5f, 0.25f }, "RGBA16F ABGR" },
+        };
+        for (UINT i = 0; i < sizeof cs / sizeof cs[0]; i++) {
+            ID3D12Resource *t = make_tex(cs[i].f, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL);
+            ID3D12DescriptorHeap *rh = NULL; D3D12_DESCRIPTOR_HEAP_DESC h2; ZeroMemory(&h2, sizeof h2);
+            h2.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; h2.NumDescriptors = 1;
+            ID3D12Device_CreateDescriptorHeap(dev, &h2, &IID_ID3D12DescriptorHeap, (void **)&rh);
+            if (!t || !rh) { CHECK(0, "%s: target created", cs[i].what); continue; }
+            D3D12_CPU_DESCRIPTOR_HANDLE r2 = cpu_at(rh, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 0);
+            ID3D12Device_CreateRenderTargetView(dev, t, NULL, r2);
+            D3D12_SHADER_RESOURCE_VIEW_DESC v2; ZeroMemory(&v2, sizeof v2);
+            v2.Format = cs[i].f; v2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; v2.Texture2D.MipLevels = 1; v2.Shader4ComponentMapping = cs[i].map;
+            ID3D12Device_CreateShaderResourceView(dev, t, &v2, cpu_at(srvh, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 12 + i));
+            ID3D12GraphicsCommandList_ClearRenderTargetView(list, r2, cs[i].clr, 0, NULL);
+            barrier(t, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &rtv, FALSE, NULL);
+            viewport(1.0f);
+            clear_rt(-1.0f);
+            ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
+            ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rsA);
+            ID3D12GraphicsCommandList_SetGraphicsRootDescriptorTable(list, 0, gpu_at(srvh, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 12 + i));
+            ID3D12GraphicsCommandList_IASetPrimitiveTopology(list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ID3D12GraphicsCommandList_SetPipelineState(list, p_rgba);
+            ID3D12GraphicsCommandList_DrawInstanced(list, 3, 1, 0, 0);
+            if (read_rt()) {
+                const float *q = px(10, 10); int ok = 1;
+                for (int k = 0; k < 4; k++) ok &= fabsf(q[k] - cs[i].want[k]) < 0.003f;
+                CHECK(ok, "%s: got (%g, %g, %g, %g), want (%g, %g, %g, %g)", cs[i].what, q[0], q[1], q[2], q[3],
+                      cs[i].want[0], cs[i].want[1], cs[i].want[2], cs[i].want[3]);
+            } else CHECK(0, "%s: read back", cs[i].what);
+            ID3D12DescriptorHeap_Release(rh); ID3D12Resource_Release(t);
         }
     }
 

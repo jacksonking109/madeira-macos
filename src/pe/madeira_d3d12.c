@@ -2278,7 +2278,14 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
         const struct madeira_ir_air_range *rg = &e->pso->ps_air[k]; struct mad_descriptor de; UINT64 direct = 0; const char *why = "?";
         struct mad_resource *r; int xv = -1;
         if (rg->type != MADEIRA_IR_AIR_SRV && rg->type != MADEIRA_IR_AIR_CBV) continue;
-        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg, ~0u, &de, &direct, &why)) continue;
+        /* wine-lab port: the PIXEL stage's view of the root signature, as the draw binds it. With ~0u
+         * the first matching parameter of ANY stage answered: ROTTR's PS b12 resolved to a VS table's
+         * null CBV and every texture to a VS table entry, so no input texture was ever captured. */
+        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg,
+                             (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_PIXEL), &de, &direct, &why)) {
+            d3d12_log("[capture-draw] %s%u: not resolved (%s)\n", rg->type == MADEIRA_IR_AIR_CBV ? "b" : "t", rg->lower_bound, why);
+            continue;
+        }
         if (rg->type == MADEIRA_IR_AIR_CBV || !(rg->flags & MADEIRA_IR_AIR_F_TEXTURE) || (de.metadata & (1ull << 63))) {
             /* ml1107: constant buffers and buffer SRVs (raw / structured / typed):
              * the first 4 KB from the descriptor's address, as kind cb / buf. */
@@ -2290,10 +2297,13 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
             continue;
         }
         r = mad_texture_of_view(e->q->device, de.texture_view_id, &xv);
-        if (!r || !r->texture) continue;
-        d3d12_log("[capture-draw] t%u -> view %llu = %s %ux%u pf%u dx%u mips %u layers %u type %u depth %u (subview %d)\n", rg->lower_bound,
+        if (!r || !r->texture) { d3d12_log("[capture-draw] t%u -> view %llu: no live texture has this view\n", rg->lower_bound, (unsigned long long)de.texture_view_id); continue; }
+        d3d12_log("[capture-draw] t%u -> view %llu = %s %ux%u pf%u dx%u mips %u layers %u type %u depth %u (subview %d) id %06x\n", rg->lower_bound,
                   (unsigned long long)de.texture_view_id, r->name ? r->name : "?", r->width, r->height, (unsigned)r->tex_pf, (unsigned)r->desc.Format, r->tex_mips, r->tex_layers,
-                  (unsigned)r->tex_type, r->tex_depth, xv);
+                  (unsigned)r->tex_type, r->tex_depth, xv, (unsigned)(((ULONG_PTR)r >> 4) & 0xffffff));
+        if (xv >= 0)   /* wine-lab port: what the view changes: format, swizzle (Metal: 0 zero 1 one 2-5 rgba), levels, slices */
+            d3d12_log("[capture-draw]   subview: type %u pf %u swizzle %08x levels %u+%u slices %u+%u\n", r->xview[xv].type, r->xview[xv].pf,
+                      r->xview[xv].swz, r->xview[xv].lvl0, r->xview[xv].nlvl, r->xview[xv].sl0, r->xview[xv].nsl);
         if (said_tex++ < 64) mad_capture_one(e, benc, r, &v0, seq, 100 + rg->lower_bound, "tex", 0);
     }
     exec_fence_blit(e, benc, 1);
@@ -2832,6 +2842,10 @@ static void exec_barrier_flush_clears(struct mad_exec *e, const struct mad_cmd *
 static void exec_add_clear(struct mad_exec *e, struct mad_resource *r, const struct mad_rtvp *v, const float *rgba, float depth, int is_depth, UINT8 stencil, UINT8 flags) {
     int i;
     if (!r) return;
+    if (g_capture_on)   /* wine-lab port: a captured frame names its clears (what a target holds where nothing draws) */
+        d3d12_log("[capture] clear %s %ux%u id %06x level %u slice %u: %s %g %g %g %g\n", r->name ? r->name : "?", r->width, r->height,
+                  (unsigned)(((ULONG_PTR)r >> 4) & 0xffffff), v->level, v->slice, is_depth ? "depth/stencil" : "rgba",
+                  is_depth ? depth : rgba[0], is_depth ? (double)stencil : rgba[1], is_depth ? (double)flags : rgba[2], is_depth ? 0.0 : rgba[3]);
     /* A clear ends the pass in progress so the next one can load it as a
      * clear; a clear mid-pass would otherwise be lost. */
     if (e->renc) { InterlockedIncrement(&g_pass_end_clear); exec_end(e); }
