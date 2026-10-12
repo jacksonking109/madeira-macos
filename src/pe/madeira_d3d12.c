@@ -1411,6 +1411,27 @@ static D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE list_GetType(ID3D12GraphicsComm
 }
 
 /* ---- command queue ------------------------------------------------------- */
+/* wine-lab port: ONE ENCODING STREAM -- the state that belongs to the command
+ * buffer being encoded rather than to the queue. A queue has one (st, for its
+ * open batch); parallel-encode gives every run of lists encoded on a worker its
+ * own (see mad_ecl_run_parallel), so nothing below is shared between threads. */
+struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; };
+struct mad_vis_batch;
+struct mad_exec;
+struct mad_stream {
+    /* ml1134: fence-chain = 6. Every encoder updates its own fence from this
+     * pool; f6_pend lists the encoders that no later encoder has waited for
+     * yet, with the attachments each one wrote. */
+    obj_handle_t f6_pool[64]; unsigned f6_next;
+    struct mad_f6_pend f6_pend[40]; unsigned f6_npend;
+    /* wine-lab port: the render pass the previous list of this replay left open
+     * (pass-carry), see mad_exec_list. */
+    struct mad_exec *carry; int carry_live;
+    unsigned char *bat;   /* wine-lab port: arena for the draw chains of one render encoder (see exec_bat_*) */
+    struct mad_vis_batch *vis;     /* ml1088: the open batch's query slots, NULL until a query heap exists */
+    UINT64 batch_no;      /* parallel-encode: the batch number its command buffer gets (0: the queue's open batch) */
+    obj_handle_t cb;      /* parallel-encode: that command buffer */
+};
 struct mad_queue {
     ID3D12CommandQueueVtbl *vtbl;
     LONG refs;
@@ -1460,7 +1481,6 @@ struct mad_queue {
      * A Win32 CRITICAL_SECTION is recursive, so mad_queue_flush being reached
      * from inside a locked ExecuteCommandLists is safe. */
     CRITICAL_SECTION submit_lock;
-    struct mad_vis_batch *vis;     /* ml1088: the open batch's query slots, NULL until a query heap exists */
     /* ml1120: ASYNCHRONOUS SUBMISSION. With madeira.cfg async-submit = 1 every
      * queue owns a worker thread and a FIFO; ExecuteCommandLists, Signal and Wait
      * enqueue and return, and the worker replays them in exactly the order the
@@ -1473,16 +1493,10 @@ struct mad_queue {
     struct mad_subjob *sub_head, *sub_tail;
     int sub_busy, sub_quit;
     CONDITION_VARIABLE sub_presented; LONG sub_presents;   /* ml1121: queued presents not yet done */
-    /* ml1134: fence-chain = 6. Every encoder updates its own fence from this
-     * pool; f6_pend lists the encoders that no later encoder has waited for
-     * yet, with the attachments each one wrote. Touched only under
-     * submit_lock (the replay and mad_queue_flush both hold it). */
-    obj_handle_t f6_pool[64]; unsigned f6_next;
-    struct mad_f6_pend { unsigned char idx, kind, natt; struct mad_resource *att[9]; } f6_pend[40]; unsigned f6_npend;
-    /* wine-lab port: the render pass the previous list of this replay left open
-     * (pass-carry), see mad_exec_list. Touched only under submit_lock. */
-    struct mad_exec *carry; int carry_live;
-    unsigned char *bat;   /* wine-lab port: arena for the draw chains of one render encoder (see exec_bat_*) */
+    /* The open batch's encoding stream. Touched only under submit_lock (the
+     * replay and mad_queue_flush both hold it). */
+    struct mad_stream st;
+    struct mad_stream *pst; unsigned npst;   /* parallel-encode: the worker runs' streams */
 };
 
 static HRESULT mad_queue_dxgi_tearoff(struct mad_queue *q, void **out);
@@ -1518,8 +1532,10 @@ static ULONG STDMETHODCALLTYPE queue_Release(ID3D12CommandQueue *This) {
         }
         d3d12_log("[madeira-d3d12] destroyed %s\n", q->name);
         DeleteCriticalSection(&q->submit_lock);   /* ml1021 */
-        free(q->carry);   /* wine-lab port */
-        free(q->bat);     /* wine-lab port: the draw-batch arena */
+        free(q->st.carry);   /* wine-lab port */
+        free(q->st.bat);     /* wine-lab port: the draw-batch arena */
+        for (i = 0; i < q->npst; i++) { free(q->pst[i].carry); free(q->pst[i].bat); }   /* parallel-encode */
+        free(q->pst);
         free(q);
     }
     return (ULONG)r;
@@ -1559,6 +1575,7 @@ struct mad_exec {
     int fence_needed;
     struct mad_resource *wr[64]; unsigned nwr; int wr_all;   /* ml1116: written since the last fence wait (mode 3) */   /* ml1111: fence-chain = 2: a barrier (or list start) was seen since the last wait */
     struct mad_queue *q;
+    struct mad_stream *st;   /* wine-lab port: the stream (command buffer) this list is encoded into */
     struct mad_list *l;
     obj_handle_t cb, renc, benc;
     struct mad_resource *rt[8]; UINT nrt; struct mad_resource *depth;          /* bound */
@@ -1654,7 +1671,7 @@ static obj_handle_t mad_vis_chunk(struct mad_exec *e, struct mad_vis_batch *v, U
 static void exec_query_begin(struct mad_exec *e, const struct mad_cmd *c);
 static void exec_query_end(struct mad_exec *e, const struct mad_cmd *c);
 static void exec_query_resolve(struct mad_exec *e, const struct mad_cmd *c);
-static void mad_vis_flush(struct mad_queue *q, obj_handle_t cb);
+static void mad_vis_flush(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb);
 
 static long long mad_cfg_int_pe(const char *key, long long dflt);
 /* wine-lab port: perf-replay. Phase timers around the replay of a draw (madeira.cfg
@@ -1750,9 +1767,9 @@ static void exec_note_write(struct mad_exec *e, struct mad_resource *r) {   /* m
 enum { F6_RENDER, F6_BLIT, F6_COMPUTE };
 static int g_f6_compute_open = -1;
 union f6_op { struct wmtcmd_render_fence_op r; struct wmtcmd_blit_fence_op b; struct wmtcmd_compute_fence_op c; };
-static obj_handle_t f6_fence(struct mad_queue *q, unsigned idx) {
-    if (!q->f6_pool[idx]) q->f6_pool[idx] = MTLDevice_newFence(q->device->mtl_device);
-    return q->f6_pool[idx];
+static obj_handle_t f6_fence(struct mad_queue *q, struct mad_stream *st, unsigned idx) {
+    if (!st->f6_pool[idx]) st->f6_pool[idx] = MTLDevice_newFence(q->device->mtl_device);
+    return st->f6_pool[idx];
 }
 /* One encodeCommands call for all of an encoder's fence operations (a chain). */
 static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigned nwait, obj_handle_t update) {
@@ -1777,21 +1794,21 @@ static void f6_encode(obj_handle_t enc, int kind, const obj_handle_t *f, unsigne
     else MTLComputeCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&ops[0]);
 }
 static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
-    struct mad_queue *q = e->q;
+    struct mad_queue *q = e->q; struct mad_stream *st = e->st;
     obj_handle_t waits[48];
     unsigned nw = 0, i, j, k;
-    int other = q->f6_npend >= 40, need;
-    for (i = 0; i < q->f6_npend && !other; i++) {
-        if (kind == F6_BLIT && q->f6_pend[i].kind == F6_BLIT) other = 1;
-        for (j = 0; j < q->f6_pend[i].natt && !other; j++)
+    int other = st->f6_npend >= 40, need;
+    for (i = 0; i < st->f6_npend && !other; i++) {
+        if (kind == F6_BLIT && st->f6_pend[i].kind == F6_BLIT) other = 1;
+        for (j = 0; j < st->f6_pend[i].natt && !other; j++)
             for (k = 0; k < e->f6_natt; k++)
-                if (e->f6_att[k] && e->f6_att[k] == q->f6_pend[i].att[j]) { other = 1; if (!e->f6_sync_needed) InterlockedIncrement(&g_f6_att_sync); break; }
+                if (e->f6_att[k] && e->f6_att[k] == st->f6_pend[i].att[j]) { other = 1; if (!e->f6_sync_needed) InterlockedIncrement(&g_f6_att_sync); break; }
     }
     need = e->f6_sync_needed || other;
     InterlockedIncrement(&g_f6_begins);
     g_f6_used = 1;
     if (need && e->f6_sync_needed && !other && (e->f7_reason & 1) && !(e->f7_reason & 2)) {   /* ml1137: a sync caused only by barriers */
-        unsigned np = q->f6_npend, rw;
+        unsigned np = st->f6_npend, rw;
         UINT64 m = e->f7_mask & (np >= 64 ? ~0ull : ((1ull << np) - 1));
         rw = e->f7_all ? np : (unsigned)__builtin_popcountll(m);
         InterlockedIncrement(&g_f7_bsync);
@@ -1801,50 +1818,50 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
     if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; }
     if (need) {
         if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
-        for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
+        for (i = 0; i < st->f6_npend; i++) waits[nw++] = f6_fence(q, st, st->f6_pend[i].idx);
         f6_encode(enc, kind, waits, nw, 0);
         InterlockedExchangeAdd(&g_fence_waits, (LONG)nw);
-        q->f6_npend = 0; e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 1;
+        st->f6_npend = 0; e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 1;
         InterlockedIncrement(&g_f6_synced);
     } else e->f6_enc_synced = 0;
-    e->f6_cur = q->f6_next++ & 63;
+    e->f6_cur = st->f6_next++ & 63;
 }
 static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
-    struct mad_queue *q = e->q;
+    struct mad_queue *q = e->q; struct mad_stream *st = e->st;
     struct mad_f6_pend *p;
-    f6_encode(enc, kind, NULL, 0, f6_fence(q, e->f6_cur));
+    f6_encode(enc, kind, NULL, 0, f6_fence(q, st, e->f6_cur));
     InterlockedIncrement(&g_fence_updates);
-    if (e->f7_open) { e->f7_mask |= 1ull << q->f6_npend; e->f7_open = 0; }   /* ml1137: the barrier needed this encoder */
-    p = &q->f6_pend[q->f6_npend++];   /* < 40 here: a begin with 40 pending syncs and empties the set */
+    if (e->f7_open) { e->f7_mask |= 1ull << st->f6_npend; e->f7_open = 0; }   /* ml1137: the barrier needed this encoder */
+    p = &st->f6_pend[st->f6_npend++];   /* < 40 here: a begin with 40 pending syncs and empties the set */
     p->idx = (unsigned char)e->f6_cur; p->kind = (unsigned char)kind; p->natt = (unsigned char)e->f6_natt;
     memcpy(p->att, e->f6_att, sizeof p->att);
     e->f6_natt = 0;
 }
 /* At commit: one blit encoder waits for everything pending and moves the device
  * fence, so the next batch (either queue) starts after all of this one. */
-static void f6_join(struct mad_queue *q) {
+static void f6_join(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb) {
     obj_handle_t waits[48], benc, dfence;
     unsigned i, nw = 0;
-    if (!q->f6_npend || !q->open_cb) return;   /* ml1136: whatever the current mode */
+    if (!st->f6_npend || !cb) return;   /* ml1136: whatever the current mode */
     dfence = mad_enc_fence_obj(q->device);
-    benc = MTLCommandBuffer_blitCommandEncoder(q->open_cb);
+    benc = MTLCommandBuffer_blitCommandEncoder(cb);
     if (!benc) return;
-    for (i = 0; i < q->f6_npend; i++) waits[nw++] = f6_fence(q, q->f6_pend[i].idx);
+    for (i = 0; i < st->f6_npend; i++) waits[nw++] = f6_fence(q, st, st->f6_pend[i].idx);
     f6_encode(benc, F6_BLIT, waits, nw, dfence);
     MTLCommandEncoder_endEncoding(benc);
-    q->f6_npend = 0;
+    st->f6_npend = 0;
     InterlockedIncrement(&g_f6_joins);
 }
 /* ml1136: a list in another mode that follows mode-6 lists first waits for the
  * encoders they left pending (the device fence does not cover them until a join). */
 static void f6_drain(struct mad_exec *e, int kind, obj_handle_t enc) {
-    struct mad_queue *q = e->q;
+    struct mad_queue *q = e->q; struct mad_stream *st = e->st;
     obj_handle_t waits[48];
     unsigned i, n = 0;
-    if (!q->f6_npend) return;
-    for (i = 0; i < q->f6_npend; i++) waits[n++] = f6_fence(q, q->f6_pend[i].idx);
+    if (!st->f6_npend) return;
+    for (i = 0; i < st->f6_npend; i++) waits[n++] = f6_fence(q, st, st->f6_pend[i].idx);
     f6_encode(enc, kind, waits, n, 0);
-    q->f6_npend = 0;
+    st->f6_npend = 0;
 }
 /* ml1137: what a STATE-AWARE rule would require for this barrier batch, against
  * the encoders pending now and the one still open (counted, not applied):
@@ -1858,12 +1875,12 @@ static int f7_has_att(const struct mad_f6_pend *p, const struct mad_resource *r)
     return 0;
 }
 static void f7_need(struct mad_exec *e, UINT8 cls, const struct mad_resource *r) {
-    struct mad_queue *q = e->q;
+    struct mad_stream *st = e->st;
     unsigned i;
     if (cls == BC_NONE || cls == BC_RAR) return;
     if (cls == BC_ALL) { e->f7_all = 1; return; }
-    for (i = 0; i < q->f6_npend; i++) {
-        const struct mad_f6_pend *p = &q->f6_pend[i];
+    for (i = 0; i < st->f6_npend; i++) {
+        const struct mad_f6_pend *p = &st->f6_pend[i];
         if ((cls == BC_RAW_ATT && p->kind == F6_RENDER && r && f7_has_att(p, r)) ||
             (cls == BC_RAW_COPY && p->kind == F6_BLIT) ||
             (cls == BC_RAW_UAV && p->kind != F6_BLIT)) e->f7_mask |= 1ull << i;
@@ -2054,8 +2071,8 @@ static void exec_bat_submit(struct mad_exec *e, struct wmtcmd_base *head) {
     const struct wmtcmd_base *n; size_t total = 0, sz;
     if (g_draw_batch < 0) { g_draw_batch = mad_cfg_int_pe("draw-batch", 1) ? 1 : 0;
                             d3d12_log("[madeira-d3d12] draw-batch = %d (%s)\n", g_draw_batch, g_draw_batch ? "draw chains reach the render encoder in batches" : "one unix call per draw"); }
-    if (g_draw_batch && !e->bat && e->q->bat) e->bat = e->q->bat;
-    if (g_draw_batch && !e->bat) { e->q->bat = malloc(MAD_BAT_BYTES); e->bat = e->q->bat; }
+    if (g_draw_batch && !e->bat && e->st->bat) e->bat = e->st->bat;
+    if (g_draw_batch && !e->bat) { e->st->bat = malloc(MAD_BAT_BYTES); e->bat = e->st->bat; }
     if (!g_draw_batch || !e->bat) { exec_bat_flush(e); MTLRenderCommandEncoder_encodeCommands(e->renc, head); return; }
     for (n = (const struct wmtcmd_base *)head->next.ptr; n; n = (const struct wmtcmd_base *)n->next.ptr) {
         sz = mad_render_node_size(n->type);
@@ -2094,7 +2111,7 @@ static void exec_end_impl(struct mad_exec *e) {
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
-        if (e->q->vis && e->q->vis->dirty) { e->q->vis->next++; e->q->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
+        if (e->st->vis && e->st->vis->dirty) { e->st->vis->next++; e->st->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
         e->pass_draws = 0;
     }
@@ -2505,7 +2522,7 @@ static void mad_rbdbg_watch(struct mad_exec *e, struct mad_resource *r, UINT64 o
     w->r = r; w->off = off; w->len = len;
     w->plo = off & ~(UINT64)0xfff; w->phi = (off + len + 0xfff) & ~(UINT64)0xfff;
     w->cb = e->cb; NSObject_retain(e->cb);
-    w->q = e->q; w->batch = e->q->batches + 1;   /* the batch being encoded, see mad_queue_flush_impl */
+    w->q = e->q; w->batch = e->st->batch_no ? e->st->batch_no : e->q->batches + 1;   /* the batch being encoded, see mad_queue_flush_impl */
     w->t = t.QuadPart;
     mad_rbdbg_close_locked(r);
     LeaveCriticalSection(&g_rbdbg_lock);
@@ -2721,8 +2738,8 @@ static obj_handle_t mad_vis_chunk(struct mad_exec *e, struct mad_vis_batch *v, U
 static int exec_same_targets(struct mad_exec *e) {
     UINT i;
     if (!e->renc || e->enc_nrt != e->nrt || e->enc_depth != e->depth) return 0;
-    if (e->q->vis) {   /* ml1088: a chunk boundary crossed mid-pass forces a new pass (once per 8192 slots) */
-        obj_handle_t want = mad_vis_chunk(e, e->q->vis, e->q->vis->next, NULL);
+    if (e->st->vis) {   /* ml1088: a chunk boundary crossed mid-pass forces a new pass (once per 8192 slots) */
+        obj_handle_t want = mad_vis_chunk(e, e->st->vis, e->st->vis->next, NULL);
         if (want != e->enc_vis_buf) { InterlockedIncrement(&g_vis_restarts); return 0; }
     }
     /* ml934b: with no attachments there is nothing in the loops below to
@@ -5343,7 +5360,7 @@ tess_go:
          * Placed last so a skipped draw above never leaves the encoder's mode
          * out of step with vis_prev. The mode command goes FIRST in the chain
          * (before the pipeline), which is where DXMT emits it too. */
-        struct mad_vis_batch *v = e->q->vis;
+        struct mad_vis_batch *v = e->st->vis;
         UINT64 want = (v && v->active && e->enc_vis_buf) ? v->next : ~(UINT64)0;
         PR_LAP(pr_t, PR_BUILD);
         if (want != e->vis_prev) {
@@ -5865,14 +5882,14 @@ static int mad_pass_carry_on(void) {
                   d3d12_log("[madeira-d3d12] pass-carry = %d (render passes %s command-list boundaries)\n", on, on ? "continue across" : "end at"); }
     return on;
 }
-static void mad_carry_end(struct mad_queue *q) {
-    if (!q || !q->carry_live) return;
-    q->carry_live = 0;
+static void mad_carry_end(struct mad_stream *st) {
+    if (!st || !st->carry_live) return;
+    st->carry_live = 0;
     InterlockedIncrement(&g_pass_end_list);
-    exec_end(q->carry);
+    exec_end(st->carry);
 }
-static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
-    g_list_seq++;
+static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struct mad_list *l, obj_handle_t cb) {
+    InterlockedIncrement((LONG *)&g_list_seq);
     struct mad_exec e;
     unsigned i;
     memset(&e, 0, sizeof e);
@@ -5880,13 +5897,13 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
     e.f6_sync_needed = 1; e.f6_list_start = 1;   /* ml1134: and, in mode 6, for the device fence too */
     e.mode = mad_fence_mode(q->device);          /* ml1136: fixed for the whole list */
     e.f7_reason = 2;                             /* ml1137: list start */
-    e.q = q; e.l = l; e.cb = cb;
+    e.q = q; e.st = st; e.l = l; e.cb = cb;
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
-    if (q->carry_live) {   /* wine-lab port: pass-carry -- adopt the encoder the previous list left open */
-        struct mad_exec *c = q->carry;
-        if (c->cb != cb || c->mode != e.mode || e.mode == 6) mad_carry_end(q);
+    if (st->carry_live) {   /* wine-lab port: pass-carry -- adopt the encoder the previous list left open */
+        struct mad_exec *c = st->carry;
+        if (c->cb != cb || c->mode != e.mode || e.mode == 6) mad_carry_end(st);
         else {
-            q->carry_live = 0;
+            st->carry_live = 0;
             e.renc = c->renc; e.renc_seq = c->renc_seq;
             memcpy(e.enc_rt, c->enc_rt, sizeof e.enc_rt); memcpy(e.enc_rtp, c->enc_rtp, sizeof e.enc_rtp);
             e.enc_nrt = c->enc_nrt; e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h;
@@ -5896,7 +5913,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
             InterlockedIncrement(&g_pass_carried);
         }
     }
-    l->ring_q = q; l->ring_batch = q->batches + 1;   /* ml1061: the batch this replay belongs to */
+    l->ring_q = q; l->ring_batch = st->batch_no ? st->batch_no : q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     if (q->device->shadow_pending) exec_shadows_new(&e);   /* wine-lab port: shadows made since the last list */
     LONG64 pr_list_t0 = mad_perf_replay_on() ? PR_NOW() : 0;   /* perf-replay */
@@ -6010,11 +6027,11 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
         e.nshw = 0;
         exec_shadow_flush(&e);
     }
-    q->open_draws += e.draws;   /* wine-lab port: batch-draws */
+    if (st == &q->st) q->open_draws += e.draws;   /* wine-lab port: batch-draws */
     if (e.renc && !e.npend && e.mode != 6 && mad_pass_carry_on() &&
-        (q->carry || (q->carry = malloc(sizeof *q->carry)))) {   /* wine-lab port: pass-carry */
-        memcpy(q->carry, &e, sizeof e);
-        q->carry_live = 1;
+        (st->carry || (st->carry = malloc(sizeof *st->carry)))) {   /* wine-lab port: pass-carry */
+        memcpy(st->carry, &e, sizeof e);
+        st->carry_live = 1;
     } else {
         if (e.renc) InterlockedIncrement(&g_pass_end_list);
         exec_end(&e);
@@ -6085,11 +6102,11 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_list *l, obj_hand
     }
 }
 
-static void mad_exec_list(struct mad_queue *q, struct mad_list *l, obj_handle_t cb) {
+static void mad_exec_list(struct mad_queue *q, struct mad_stream *st, struct mad_list *l, obj_handle_t cb) {
     LONG64 t0;
-    if (g_perf_replay <= 0) { mad_exec_list_impl(q, l, cb); return; }
+    if (g_perf_replay <= 0) { mad_exec_list_impl(q, st, l, cb); return; }
     t0 = PR_NOW();
-    mad_exec_list_impl(q, l, cb);
+    mad_exec_list_impl(q, st, l, cb);
     g_pr_t[PR_LTOTAL] += PR_NOW() - t0;   /* perf-replay: the whole replay of a list, setup and tail included */
 }
 
@@ -6167,14 +6184,14 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
              * one remotely; holding it across calls means taking our own reference. */
             NSObject_retain(q->open_cb);
         }
-        if (l) mad_exec_list(q, l, q->open_cb);
+        if (l) mad_exec_list(q, &q->st, l, q->open_cb);
         q->open_lists++;
         q->executed++;
-        if (q->open_lists >= 48 || (q->open_lists >= mad_batch_lists() && !q->carry_live) ||
+        if (q->open_lists >= 48 || (q->open_lists >= mad_batch_lists() && !q->st.carry_live) ||
             q->open_draws >= mad_batch_draws())
             mad_queue_flush(q);   /* bound the batch; wine-lab port: batch-lists/batch-draws */
     }
-    mad_carry_end(q);   /* wine-lab port: the open encoder is in this replay's autorelease pool */
+    mad_carry_end(&q->st);   /* wine-lab port: the open encoder is in this replay's autorelease pool */
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (ml1049_pool) NSObject_release(ml1049_pool);
 }
@@ -6457,16 +6474,15 @@ static void mad_queue_flush(struct mad_queue *q) {
     if (g_perf_replay <= 0) { mad_queue_flush_impl(q); return; }
     t0 = PR_NOW(); mad_queue_flush_impl(q); g_pr_t[PR_FLUSH] += PR_NOW() - t0;
 }
-static void mad_queue_flush_impl(struct mad_queue *q) {
-    if (!q) return;
-    EnterCriticalSection(&q->submit_lock);   /* ml1021 */
-    if (!q->open_cb) { LeaveCriticalSection(&q->submit_lock); return; }
-    mad_carry_end(q);   /* wine-lab port: pass-carry */
+/* Commits one stream's command buffer as the queue's next batch (the open batch's,
+ * or a parallel-encode run's, in submission order). Under submit_lock. */
+static void mad_commit_stream(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb) {
+    mad_carry_end(st);   /* wine-lab port: pass-carry */
     if (q->npending == sizeof q->pending / sizeof q->pending[0]) {
         for (unsigned k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
         q->npending = 0;
     }
-    f6_join(q);   /* ml1134: mode 6 only; the batch's last encoder waits for all of it and moves the device fence */
+    f6_join(q, st, cb);   /* ml1134: mode 6 only; the batch's last encoder waits for all of it and moves the device fence */
     {   /* ml1061: serial assignment, the signal and the commit are ONE step under a
          * device lock, so serials reach the GPU in strictly increasing order no
          * matter which queue or thread commits (a shared event's value is just
@@ -6482,19 +6498,27 @@ static void mad_queue_flush_impl(struct mad_queue *q) {
         EnterCriticalSection(&sd->fence_lock);
         if (sd->gpu_event) {
             serial = (UINT64)InterlockedIncrement64(&sd->gpu_serial);
-            MTLCommandBuffer_encodeSignalEvent(q->open_cb, sd->gpu_event, serial);
+            MTLCommandBuffer_encodeSignalEvent(cb, sd->gpu_event, serial);
         }
-        mad_vis_flush(q, q->open_cb);            /* ml1099: under fence_lock, so the pending list is in SERIAL order (Astra) */
-        MTLCommandBuffer_commit(q->open_cb);
+        mad_vis_flush(q, st, cb);            /* ml1099: under fence_lock, so the pending list is in SERIAL order (Astra) */
+        MTLCommandBuffer_commit(cb);
         if (serial) { q->last_serial = serial; InterlockedExchange64(&sd->gpu_serial_committed, (LONG64)serial); }
         LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
     }
-    q->pending[q->npending++] = q->open_cb;      /* the reference taken at open moves here */
-    q->open_cb = 0; q->open_lists = 0; q->open_draws = 0; q->batches++;
+    q->pending[q->npending++] = cb;      /* the reference taken at open moves here */
+    q->batches++;
     if (q->batches <= 3 || (q->batches % 500) == 0)
         d3d12_log("[madeira-d3d12] batch #%llu committed (%llu lists so far)\n",
                   (unsigned long long)q->batches, (unsigned long long)q->executed);
+}
+static void mad_queue_flush_impl(struct mad_queue *q) {
+    if (!q) return;
+    EnterCriticalSection(&q->submit_lock);   /* ml1021 */
+    if (q->open_cb) {
+        mad_commit_stream(q, &q->st, q->open_cb);
+        q->open_cb = 0; q->open_lists = 0; q->open_draws = 0;
+    }
     LeaveCriticalSection(&q->submit_lock);   /* ml1021 */
 }
 static void mad_device_flush_all(struct mad_device *d) {
@@ -8482,9 +8506,9 @@ static void STDMETHODCALLTYPE list_ResolveQueryData(ID3D12GraphicsCommandList *T
 
 /* ml1088: the batch-side machinery. */
 static struct mad_vis_batch *mad_vis_get(struct mad_exec *e) {
-    struct mad_queue *q = e->q;
-    if (!q->vis) q->vis = calloc(1, sizeof *q->vis);
-    return q->vis;
+    struct mad_stream *st = e->st;
+    if (!st->vis) st->vis = calloc(1, sizeof *st->vis);
+    return st->vis;
 }
 /* The chunk holding global slot `slot`, allocated (and zeroed) on first use. */
 static obj_handle_t mad_vis_chunk(struct mad_exec *e, struct mad_vis_batch *v, UINT64 slot, void **cpu_out) {
@@ -8518,7 +8542,7 @@ static void exec_query_begin(struct mad_exec *e, const struct mad_cmd *c) {
     InterlockedIncrement(&g_vis_begun);
 }
 static void exec_query_end(struct mad_exec *e, const struct mad_cmd *c) {
-    struct mad_vis_batch *v = e->q->vis;
+    struct mad_vis_batch *v = e->st->vis;
     unsigned k;
     if (!v) return;
     for (k = v->nq; k > 0; k--) {
@@ -8598,11 +8622,11 @@ static void exec_query_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     if (!r->dst->cpu) r->gpu = exec_query_resolve_gpu(e, c, v);   /* wine-lab port */
 }
 /* At flush: the open batch's slots go to the device's completion queue. */
-static void mad_vis_flush(struct mad_queue *q, obj_handle_t cb) {
+static void mad_vis_flush(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb) {
     struct mad_device *d = q->device;
-    struct mad_vis_batch *v = q->vis;
+    struct mad_vis_batch *v = st->vis;
     if (!v) return;
-    q->vis = NULL;
+    st->vis = NULL;
     if (v->dirty) { v->next++; v->dirty = 0; }
     v->cb = cb; NSObject_retain(cb);
     EnterCriticalSection(&d->vis_lock);
