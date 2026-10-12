@@ -139,7 +139,12 @@ serially too); d3d12-dsplane-x64.exe (tests/windows/dsplane_test.c, 0 failures, 
 plane of a D32_FLOAT_S8X24_UINT texture -- texture to texture, upload buffer to plane, colour texture to plane and back --
 leaves the other plane intact; both planes read back per texel after each copy. Needs d3d12.so's blitB2T unix call:
 DXMT's winemetal drops the MTLBlitOption on buffer-to-texture copies, so a stencil-plane copy landed in the DEPTH plane;
-and a clear followed by a barrier and a copy of its target runs before the copy). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
+and a clear followed by a barrier and a copy of its target runs before the copy); d3d12-oit-x64.exe (tests/windows/oit_test.c,
+0 failures, 29 checks: The Last of Us Part I's OIT k-buffer insert -- 4 RWTexture2D<uint64_t> layers, InterlockedMax
+returning the old value, the smaller carried down -- from 1 to 256 racing fullscreen instances, after stale data and the
+zero clear in the same list, plus a 64-bit pattern clear of R32G32_UINT; fails on a stored value that is no input of
+its pixel, unsorted layers or a wrong layer 0; prints, not fails, how many true top-4 values the load+atomic emulation
+loses to the race; precompiled DXIL from oit.hlsl). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
 (16 lists, TLOU-like mix), prints ExecuteCommandLists wall time, submit-to-GPU-done latency and image/UAV hashes.
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
