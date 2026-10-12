@@ -7960,6 +7960,26 @@ static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
     UINT64 offset = base_offset;
     UINT mips = desc->MipLevels ? desc->MipLevels : 1;
     (void)This;
+    /* wine-lab port: a buffer has one footprint at the base offset, and its
+     * size is its width -- only the row PITCH is 256-aligned. Reporting the
+     * aligned size made d3dx12's UpdateSubresources find the application's
+     * exactly-sized upload buffer too small and return without copying:
+     * every large ROTTR mesh whose size was not a multiple of 256 stayed all
+     * zeros, and the DX12 menu room was missing (walls, desk, chair...). */
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if (layouts) {
+            layouts[0].Offset = base_offset;
+            layouts[0].Footprint.Format = desc->Format;
+            layouts[0].Footprint.Width = (UINT)desc->Width;
+            layouts[0].Footprint.Height = 1;
+            layouts[0].Footprint.Depth = 1;
+            layouts[0].Footprint.RowPitch = (UINT)mad_align(desc->Width, D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+        }
+        if (row_count) row_count[0] = 1;
+        if (row_size) row_size[0] = desc->Width;
+        if (total_bytes) *total_bytes = (first == 0 && count == 1) ? desc->Width : ~(UINT64)0;
+        return;
+    }
     mad_format_info(desc->Format, &bytes, &block);
     for (i = 0; i < count; i++) {
         UINT s = first + i, mip = s % mips;
@@ -14740,6 +14760,22 @@ static void mad_trace_size_log(void *ra, const char *fmt, ...) {
     va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
     d3d12_log("[trace-size] %s+%#llx %s\n", base, (unsigned long long)((char *)ra - (char *)m), msg);
 }
+/* The game executable's return addresses on this thread's stack, nearest
+ * first (as RVAs): the x64 frames' return addresses sit on the same stack. */
+static void mad_exe_chain(char *out, size_t cap) {
+    static ULONG_PTR lo, hi;
+    volatile ULONG_PTR here = 0; ULONG_PTR *p = (ULONG_PTR *)&here, *end = p + 8192;
+    NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); size_t n = 0; unsigned k = 0;
+    if (!lo) {
+        HMODULE m = GetModuleHandleW(NULL); IMAGE_DOS_HEADER *dh = (IMAGE_DOS_HEADER *)m;
+        IMAGE_NT_HEADERS64 *nt = (IMAGE_NT_HEADERS64 *)((BYTE *)m + dh->e_lfanew);
+        lo = (ULONG_PTR)m; hi = lo + nt->OptionalHeader.SizeOfImage;
+    }
+    if (tib && (ULONG_PTR *)tib->StackBase > p && (ULONG_PTR *)tib->StackBase < end) end = (ULONG_PTR *)tib->StackBase;
+    out[0] = 0;
+    for (; p < end && k < 12 && n + 16 < cap; p++)
+        if (*p >= lo + 0x1000 && *p < hi) { n += snprintf(out + n, cap - n, "%s0x%llx", k ? " " : "", (unsigned long long)(*p - lo)); k++; }
+}
 static double mad_nonzero_frac(const void *p, UINT64 len) {
     const unsigned char *b = p; UINT64 i, n = 0;
     if (!p || !len) return -1.0;
@@ -14778,6 +14814,12 @@ static HRESULT STDMETHODCALLTYPE tr_CreateCommittedResource(ID3D12Device *This, 
         const D3D12_RESOURCE_DESC *d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE *cv, REFIID riid, void **out) {
     char b[200];
     HRESULT hr = device_CreateCommittedResource(This, hp, hf, d, st, cv, riid, out);
+    if (d && d->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && mad_trace_size_hit(d->Width)) {   /* wine-lab port: the game's call chain */
+        char chain[300];
+        mad_exe_chain(chain, sizeof chain);
+        mad_trace_size_log(__builtin_return_address(0), "committed %llu bytes heap %u -> %p; ROTTR stack (exe rva): %s",
+                           (unsigned long long)d->Width, hp ? (unsigned)hp->Type : 0, SUCCEEDED(hr) && out ? *out : NULL, chain);
+    }
     mad_api_trace(__builtin_return_address(0), "CreateCommittedResource", hr, "heap %u, %s, state %#x -> %p", hp ? (unsigned)hp->Type : 0,
                   mad_trace_rdesc(b, sizeof b, d), (unsigned)st, out ? *out : NULL);
     return hr;
