@@ -522,6 +522,25 @@ static NTSTATUS blit_t2b(void *args)
     return STATUS_SUCCESS;
 }
 
+/* wine-lab port: winemetal's copyFromBuffer:toTexture: has no options; a depth or
+ * stencil plane of a combined depth-stencil destination needs them (see madeira_ext.h). */
+static NTSTATUS blit_b2t(void *args)
+{
+    struct madeira_unix_blit_params *p = args;
+    const struct wmtcmd_blit_copy_from_buffer_to_texture *c = (const void *)(uintptr_t)p->cmd;
+    [(id<MTLBlitCommandEncoder>)p->encoder copyFromBuffer:(id<MTLBuffer>)c->src
+                                             sourceOffset:c->src_offset
+                                        sourceBytesPerRow:c->bytes_per_row
+                                      sourceBytesPerImage:c->bytes_per_image
+                                               sourceSize:MTLSizeMake(c->size.width, c->size.height, c->size.depth)
+                                                toTexture:(id<MTLTexture>)c->dst
+                                         destinationSlice:c->slice
+                                         destinationLevel:c->level
+                                        destinationOrigin:MTLOriginMake(c->origin.x, c->origin.y, c->origin.z)
+                                                  options:(MTLBlitOption)p->options];
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS command_buffer_error_info(void *args)
 {
     struct madeira_unix_pair_params *p = args;
@@ -559,6 +578,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_blitT2B] = blit_t2b,
     [madeira_unix_commandBufferErrorInfo] = command_buffer_error_info,
     [madeira_unix_commandBufferEnqueue] = command_buffer_enqueue,
+    [madeira_unix_blitB2T] = blit_b2t,
 };
 
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == madeira_unix_count,

@@ -87,6 +87,12 @@ obj_handle_t MTLDevice_newGeometryEmulationPipelineState(obj_handle_t device, co
 /* A texture-to-buffer copy; with nonzero MTLBlitOption (depth or stencil plane of a
  * combined format), which DXMT v0.80's command encoding cannot express. */
 void madeira_blit_t2b(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_texture_to_buffer *cmd, uint32_t options);
+/* wine-lab port: the buffer-to-texture direction. DXMT's winemetal encodes
+ * copyFromBuffer:toTexture: WITHOUT options, so a copy into the depth or stencil
+ * plane of a combined depth-stencil texture must come here: without
+ * MTLBlitOptionStencilFromDepthStencil, a stencil-plane copy lands in the DEPTH
+ * plane (TLOU Part I: 1 B/px stencil read as depth -> 0x71717171 = 1.2e30). */
+void madeira_blit_b2t(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_buffer_to_texture *cmd, uint32_t options);
 void MadeiraCtl(struct madeira_ctl_args *args);
 /* A command buffer whose error, on failure, lists each encoder's label and state
  * (MTLCommandBufferErrorOptionEncoderExecutionStatus). Autoreleased, like winemetal's. */
@@ -116,6 +122,7 @@ enum madeira_unix_func {
     madeira_unix_blitT2B,
     madeira_unix_commandBufferErrorInfo,
     madeira_unix_commandBufferEnqueue,
+    madeira_unix_blitB2T,
     madeira_unix_count,
 };
 
@@ -143,7 +150,8 @@ struct madeira_unix_pso_params {
 
 struct madeira_unix_blit_params {
     obj_handle_t encoder;
-    uint64_t cmd;           /* const struct wmtcmd_blit_copy_from_texture_to_buffer * */
+    uint64_t cmd;           /* const struct wmtcmd_blit_copy_from_texture_to_buffer * (blitT2B) or
+                               const struct wmtcmd_blit_copy_from_buffer_to_texture * (blitB2T) */
     uint64_t options;       /* MTLBlitOption */
 };
 

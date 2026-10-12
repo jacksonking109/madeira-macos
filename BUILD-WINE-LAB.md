@@ -135,7 +135,11 @@ d3d12-parallel-x64.exe (tests/windows/parallel_test.c, 0 failures, 32 checks: 8 
 lists whose results depend on order across list boundaries -- a compute chain with a CPU reference, per-list snapshot
 copies, order-dependent blending into targets shared by consecutive lists, occlusion queries resolved one and three
 lists later; run it serially and with `MADEIRA_PARALLEL_ENCODE=4 MADEIRA_PARALLEL_MIN_CMDS=1`; fence-chain 3 fails it
-serially too). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
+serially too); d3d12-dsplane-x64.exe (tests/windows/dsplane_test.c, 0 failures, 19 checks: CopyTextureRegion of ONE
+plane of a D32_FLOAT_S8X24_UINT texture -- texture to texture, upload buffer to plane, colour texture to plane and back --
+leaves the other plane intact; both planes read back per texel after each copy. Needs d3d12.so's blitB2T unix call:
+DXMT's winemetal drops the MTLBlitOption on buffer-to-texture copies, so a stencil-plane copy landed in the DEPTH plane;
+and a clear followed by a barrier and a copy of its target runs before the copy). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
 (16 lists, TLOU-like mix), prints ExecuteCommandLists wall time, submit-to-GPU-done latency and image/UAV hashes.
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 

@@ -2698,6 +2698,24 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     exec_drop_pending(e, i);
 }
 
+/* wine-lab port: a clear stays pending until the pass that binds its target
+ * (to become that pass's load action) or the end of the list. A copy, a
+ * dispatch or a resolve that uses the target first saw the OLD contents, and the
+ * clear then landed AFTER it, wiping what a copy or a UAV write had put there.
+ * D3D12 makes every such use go through a barrier on that resource, so a
+ * barrier naming a resource with a pending clear (or naming no resource: UAV,
+ * aliasing, overflow) runs that clear now. Test: d3d12-dsplane-x64.exe. */
+static void exec_barrier_flush_clears(struct mad_exec *e, const struct mad_cmd *c) {
+    unsigned k, b;
+    if (!e->npend) return;
+    if (c->u.barrier.all) { while (e->npend) exec_flush_clear(e, 0); return; }
+    for (k = 0; k < e->npend; ) {
+        int hit = 0;
+        for (b = 0; b < c->u.barrier.n && !hit; b++) hit = e->pend[k].res == c->u.barrier.res[b];
+        if (hit) exec_flush_clear(e, (int)k); else k++;
+    }
+}
+
 static void exec_add_clear(struct mad_exec *e, struct mad_resource *r, const struct mad_rtvp *v, const float *rgba, float depth, int is_depth, UINT8 stencil, UINT8 flags) {
     int i;
     if (!r) return;
@@ -5478,8 +5496,7 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     k2.size.width = c->u.tt.w; k2.size.height = c->u.tt.h; k2.size.depth = c->u.tt.d ? c->u.tt.d : 1;
     k2.dst = d->texture; k2.slice = c->u.tt.dslice; k2.level = c->u.tt.dlevel;
     k2.origin.x = c->u.tt.dx; k2.origin.y = c->u.tt.dy; k2.origin.z = c->u.tt.dz;
-    k2.reserved[0] = (uint16_t)mad_aspect_opt(d, c->u.tt.dplane);   /* the MTLBlitOption; winemetal honours it for a combined depth-stencil destination */
-    MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k2);
+    madeira_blit_b2t(e->benc, &k2, mad_aspect_opt(d, c->u.tt.dplane));   /* wine-lab port: winemetal drops the MTLBlitOption */
 }
 
 /* ml1151: one exact UAV-clear pattern buffer. wine-lab port: 12 KB (256 periods), 64 of them for the values a title
@@ -5581,8 +5598,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = c->u.bt.d;
         k.dst = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
         k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
-        k.reserved[0] = (uint16_t)mad_aspect_opt(c->u.bt.tex, c->u.bt.plane);   /* the MTLBlitOption, see exec_copy_aspect */
-        MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
+        madeira_blit_b2t(e->benc, &k, mad_aspect_opt(c->u.bt.tex, c->u.bt.plane));   /* wine-lab port: the MTLBlitOption via d3d12.so */
         return;
     }
     case MC_COPY_T2B: {
@@ -5603,8 +5619,11 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         struct wmtcmd_blit_copy_from_texture_to_texture k;
         if (!c->u.tt.dst->texture || !c->u.tt.src->texture) { MAD_SKIP(e); return; }
         if ((c->u.tt.src->is_depth || c->u.tt.dst->is_depth) &&
-            (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf || c->u.tt.splane || c->u.tt.dplane)) {
-            exec_copy_aspect(e, c);   /* a depth or stencil plane to or from a colour texture */
+            (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf || c->u.tt.splane || c->u.tt.dplane ||
+             (c->u.tt.src->is_depth && c->u.tt.src->has_stencil))) {
+            /* a depth or stencil plane to or from a colour texture; wine-lab port: also the DEPTH plane of a
+             * combined depth-stencil texture, which a plain texture copy would move with its stencil plane */
+            exec_copy_aspect(e, c);
             return;
         }
         memset(&k, 0, sizeof k);
@@ -5975,6 +5994,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
             if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
                                         d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
+            exec_barrier_flush_clears(&e, c);   /* wine-lab port: a cleared target leaving attachment use */
             if (e.mode == 6) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
