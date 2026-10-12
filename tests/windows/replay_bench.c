@@ -6,7 +6,9 @@
  *  times. The cost that matters is the runtime's replay of the list into Metal
  *  encoders, so the target is tiny and nearly every draw is clipped away.
  *
- *  Use:   MADEIRA_PERF_REPLAY=1 wine d3d12-bench-x64.exe [draws=2000] [frames=200] 2>&1 | grep -a "perf-replay\|bench"
+ *  Use:   MADEIRA_PERF_REPLAY=1 wine d3d12-bench-x64.exe [draws=2000] [frames=200] [draws-per-list=0] [dispatches-per-list=0] 2>&1 | grep -a "perf-replay\|bench"
+ *  dispatches-per-list > 0 (TLOU-like mixed lists): every list starts with that many compute dispatches, each
+ *  followed by a UAV barrier, before its draws; the UAV buffer is hashed too (dispatch order must be exact).
  *  Prints the app-side ExecuteCommandLists time per draw (caller thread) and, with
  *  perf-replay, the runtime's per-phase breakdown. Draw k varies like a scene would:
  *    - the per-object CBV (b1) and 4 root constants change every draw
@@ -80,10 +82,20 @@ static const char hlsl[] =
     "    float4 a = t0.Sample(s0, i.uv), b = t1.Sample(s0, i.uv), c = t2.Sample(s0, i.uv);\n"
     "    return float4(i.n.x, mat.x, rc.x + i.n.y, 1.0) + (a + b + c) * 1e-4 * mat.w;\n"
     "}\n";
+    /* the compute mix (argument 4): every dispatch is a read-modify-write of a 1024-word window that
+     * overlaps other lists' windows, so the final buffer depends on the exact dispatch order */
+static const char hlsl_cs[] =
+    "RWStructuredBuffer<uint> uo : register(u0);\n"
+    "cbuffer K : register(b4) { uint kk; uint kbase; };\n"
+    "[numthreads(64, 1, 1)] void cs_main(uint3 t : SV_DispatchThreadID) {\n"
+    "    uint a = kbase + t.x;\n"
+    "    uo[a] = uo[a] * 1664525u + 1013904223u + kk;\n"
+    "}\n";
 
 static ID3DBlob *compile(pD3DCompile fn, const char *entry, const char *target) {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = fn(hlsl, strlen(hlsl), "bench", NULL, NULL, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    const char *src = target[0] == 'c' ? hlsl_cs : hlsl;
+    HRESULT hr = fn(src, strlen(src), "bench", NULL, NULL, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     if (err) { printf("compile: %.*s\n", (int)ID3D10Blob_GetBufferSize(err), (const char *)ID3D10Blob_GetBufferPointer(err)); ID3D10Blob_Release(err); }
     if (FAILED(hr)) { printf("bench: compile failed %#lx\n", hr); exit(2); }
     return code;
@@ -92,6 +104,9 @@ static ID3DBlob *compile(pD3DCompile fn, const char *entry, const char *target) 
 int main(int argc, char **argv) {
     int ndraws = argc > 1 ? atoi(argv[1]) : 2000, nframes = argc > 2 ? atoi(argv[2]) : 200, i, f;
     int dpl = argc > 3 ? atoi(argv[3]) : 0, nl, li;   /* draws per list: 0 = one list (Unity records ~33) */
+    int cpl = argc > 4 ? atoi(argv[4]) : 0;            /* compute dispatches per list (TLOU-like mix) */
+    ID3D12RootSignature *crs = NULL; ID3D12PipelineState *cpso = NULL; ID3D12Resource *ubuf = NULL, *upix = NULL;
+    double tot_after = 0;
     ID3D12CommandAllocator *allocs[512]; ID3D12GraphicsCommandList *lists[512]; ID3D12CommandList *cl[512];
     HMODULE dcc = LoadLibraryA("d3dcompiler_47.dll"), d12 = LoadLibraryA("d3d12.dll");
     pD3DCompile comp = dcc ? (pD3DCompile)GetProcAddress(dcc, "D3DCompile") : NULL;
@@ -154,6 +169,46 @@ int main(int argc, char **argv) {
         if (FAILED(hr)) { printf("bench: PSO %d %#lx\n", i, hr); return 2; }
     }
 
+    if (cpl > 0) {   /* compute root signature (root UAV u0, 2 root constants b4) and pipeline */
+        D3D12_ROOT_PARAMETER cp[2]; D3D12_ROOT_SIGNATURE_DESC cd; D3D12_COMPUTE_PIPELINE_STATE_DESC pd; ID3DBlob *cs = compile(comp, "cs_main", "cs_5_0");
+        static D3D12_DESCRIPTOR_RANGE r_uav;   /* a table, not a root UAV: the DXBC path needs the view's length */
+        ZeroMemory(&r_uav, sizeof r_uav); r_uav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; r_uav.NumDescriptors = 1;
+        ZeroMemory(cp, sizeof cp);
+        cp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; cp[0].DescriptorTable.NumDescriptorRanges = 1; cp[0].DescriptorTable.pDescriptorRanges = &r_uav; cp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        cp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; cp[1].Constants.ShaderRegister = 4; cp[1].Constants.Num32BitValues = 2; cp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        ZeroMemory(&cd, sizeof cd); cd.NumParameters = 2; cd.pParameters = cp;
+        rsb = NULL; err = NULL;
+        hr = ser(&cd, D3D_ROOT_SIGNATURE_VERSION_1_0, &rsb, &err);
+        if (SUCCEEDED(hr)) hr = ID3D12Device_CreateRootSignature(dev, 0, ID3D10Blob_GetBufferPointer(rsb), ID3D10Blob_GetBufferSize(rsb), &IID_ID3D12RootSignature, (void **)&crs);
+        if (FAILED(hr)) { printf("bench: compute root signature %#lx\n", hr); return 2; }
+        ZeroMemory(&pd, sizeof pd); pd.pRootSignature = crs;
+        pd.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(cs); pd.CS.BytecodeLength = ID3D10Blob_GetBufferSize(cs);
+        hr = ID3D12Device_CreateComputePipelineState(dev, &pd, &IID_ID3D12PipelineState, (void **)&cpso);
+        if (FAILED(hr)) { printf("bench: compute PSO %#lx\n", hr); return 2; }
+        {   /* the UAV buffer starts at zero (copied from an upload buffer once) */
+            D3D12_HEAP_PROPERTIES hp; D3D12_RESOURCE_DESC d; ID3D12Resource *z; BYTE *m = NULL;
+            ZeroMemory(&hp, sizeof hp); hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            ZeroMemory(&d, sizeof d);
+            d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = 8192 * 4; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+            d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void **)&ubuf);
+            upix = make_buffer(D3D12_HEAP_TYPE_READBACK, 8192 * 4, D3D12_RESOURCE_STATE_COPY_DEST);
+            z = make_buffer(D3D12_HEAP_TYPE_UPLOAD, 8192 * 4, D3D12_RESOURCE_STATE_GENERIC_READ);
+            if (!ubuf || !upix || !z) { printf("bench: compute buffers\n"); return 2; }
+            ID3D12Resource_Map(z, 0, NULL, (void **)&m); if (m) { memset(m, 0, 8192 * 4); ID3D12Resource_Unmap(z, 0, NULL); }
+            ID3D12GraphicsCommandList_CopyBufferRegion(list, ubuf, 0, z, 0, 8192 * 4);
+            {
+                D3D12_RESOURCE_BARRIER b; ZeroMemory(&b, sizeof b); b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; b.Transition.pResource = ubuf;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST; b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+            }
+            ID3D12GraphicsCommandList_Close(list);
+            ID3D12CommandQueue_ExecuteCommandLists(queue, 1, (ID3D12CommandList **)&list);
+            wait_idle();
+        }
+    }
+
     /* resources */
     rt = make_tex2d(RT_W, RT_H, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
     pix = make_buffer(D3D12_HEAP_TYPE_READBACK, RT_W * RT_H * 4, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -179,6 +234,12 @@ int main(int argc, char **argv) {
         ZeroMemory(&sv, sizeof sv); sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; sv.Texture2D.MipLevels = 1;
         ID3D12Device_CreateShaderResourceView(dev, tex[i], &sv, h);
+    }
+    if (cpl > 0) {   /* the compute UAV, after the materials' SRVs */
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv; D3D12_CPU_DESCRIPTOR_HANDLE h = sc_; h.ptr += (SIZE_T)NMAT * 3 * inc_srv;
+        ZeroMemory(&uv, sizeof uv); uv.Format = DXGI_FORMAT_UNKNOWN; uv.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uv.Buffer.NumElements = 8192; uv.Buffer.StructureByteStride = 4;
+        ID3D12Device_CreateUnorderedAccessView(dev, ubuf, NULL, &uv, h);
     }
     for (i = 0; i < NMAT; i++) {
         D3D12_SAMPLER_DESC sd; D3D12_CPU_DESCRIPTOR_HANDLE h = mc_; h.ptr += (SIZE_T)i * inc_smp;
@@ -223,6 +284,22 @@ int main(int argc, char **argv) {
         list = lists[li];
         ID3D12GraphicsCommandList_OMSetRenderTargets(list, 1, &rtv, FALSE, NULL);
         if (li == 0) ID3D12GraphicsCommandList_ClearRenderTargetView(list, rtv, clear, 0, NULL);
+        if (cpl > 0) {   /* compute first, like an engine's culling / skinning / lighting jobs */
+            D3D12_RESOURCE_BARRIER ub; int j;
+            ZeroMemory(&ub, sizeof ub); ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; ub.UAV.pResource = ubuf;
+            ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &ub);   /* order behind the previous list's dispatches */
+            D3D12_GPU_DESCRIPTOR_HANDLE ug = sg; ug.ptr += (UINT64)NMAT * 3 * inc_srv;
+            ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 2, heaps);
+            ID3D12GraphicsCommandList_SetComputeRootSignature(list, crs);
+            ID3D12GraphicsCommandList_SetPipelineState(list, cpso);
+            ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 0, ug);
+            for (j = 0; j < cpl; j++) {
+                UINT k2[2]; k2[0] = (UINT)(li * cpl + j); k2[1] = (UINT)(((li + j) % 7) * 1024);
+                ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(list, 1, 2, k2, 0);
+                ID3D12GraphicsCommandList_Dispatch(list, 16, 1, 1);
+                ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &ub);
+            }
+        }
         ID3D12GraphicsCommandList_RSSetViewports(list, 1, &vp);
         ID3D12GraphicsCommandList_RSSetScissorRects(list, 1, &sc);
         ID3D12GraphicsCommandList_SetGraphicsRootSignature(list, rs);
@@ -263,6 +340,14 @@ int main(int argc, char **argv) {
             ID3D12GraphicsCommandList_CopyTextureRegion(list, &dl, 0, 0, 0, &sl, NULL);
             b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
             ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+            if (cpl > 0) {
+                b.Transition.pResource = ubuf;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+                ID3D12GraphicsCommandList_CopyBufferRegion(list, upix, 0, ubuf, 0, 8192 * 4);
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE; b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+            }
         }
         ID3D12GraphicsCommandList_Close(list);
         cl[li] = (ID3D12CommandList *)list;
@@ -277,18 +362,26 @@ int main(int argc, char **argv) {
         wait_idle();
         QueryPerformanceCounter(&q2);
         if (f >= 10) tot_frame += (double)(q2.QuadPart - q0.QuadPart) / (double)qf.QuadPart;
+        if (f >= 10) tot_after += (double)(q2.QuadPart - q1.QuadPart) / (double)qf.QuadPart;
     }
-    printf("bench: %d draws in %d lists x %d frames: ExecuteCommandLists %.3f ms/frame = %.3f us/draw (caller thread, frames 10..)\n",
-           ndraws, nl, nframes, 1000.0 * tot / (nframes - 10), 1e6 * tot / ((double)(nframes - 10) * ndraws));
+    printf("bench: %d draws + %d dispatches in %d lists x %d frames: ExecuteCommandLists %.3f ms/frame = %.3f us/draw (caller thread, frames 10..)\n",
+           ndraws, cpl * nl, nl, nframes, 1000.0 * tot / (nframes - 10), 1e6 * tot / ((double)(nframes - 10) * ndraws));
     /* what an application that waits for each frame's fence sees: submission to GPU completion
      * (with async-submit the replay leaves the caller's thread, so only this number compares) */
-    printf("bench: frame latency (ExecuteCommandLists to fence completion) %.3f ms/frame\n", 1000.0 * tot_frame / (nframes - 10));
+    printf("bench: frame latency (ExecuteCommandLists to fence completion) %.3f ms/frame; ExecuteCommandLists return to GPU done %.3f ms\n",
+           1000.0 * tot_frame / (nframes - 10), 1000.0 * tot_after / (nframes - 10));
     {   /* image hash of the last frame: must not change when the replay is optimised */
         BYTE *p = NULL; unsigned long long h = 1469598103934665603ull; int nz = 0;
         ID3D12Resource_Map(pix, 0, NULL, (void **)&p);
         if (p) { for (i = 0; i < RT_W * RT_H * 4; i++) { h = (h ^ p[i]) * 1099511628211ull; nz += p[i] != 0 && !(i % 4 == 2 && p[i] == 255); }
                  ID3D12Resource_Unmap(pix, 0, NULL); }
         printf("bench: image hash %016llx (%d non-background bytes)\n", h, nz);
+        if (cpl > 0) {
+            UINT32 *u = NULL; h = 1469598103934665603ull;
+            ID3D12Resource_Map(upix, 0, NULL, (void **)&u);
+            if (u) { int nzu = 0; for (i = 0; i < 8192; i++) { h = (h ^ u[i]) * 1099511628211ull; nzu += u[i] != 0; }
+                     printf("bench: uav hash %016llx (%d nonzero words, word 0 = %08x)\n", h, nzu, u[0]); ID3D12Resource_Unmap(upix, 0, NULL); }
+        }
     }
     (void)bad;
     return 0;
