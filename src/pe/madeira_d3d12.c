@@ -6132,6 +6132,210 @@ static unsigned mad_batch_draws(void) {
                  d3d12_log("[madeira-d3d12] batch-draws = %lld\n", n); }
     return (unsigned)n;
 }
+/* A new command buffer for the queue (cb-error-info aware), with our own reference. */
+static obj_handle_t mad_queue_new_cb(struct mad_queue *q) {
+    obj_handle_t cb;
+    static int errinfo = -1;   /* wine-lab port: madeira.cfg cb-error-info = 1 -- a failed command buffer names the encoder that
+                                * faulted or timed out (with encoder-labels = 1, by shader entry point) */
+    if (errinfo < 0) errinfo = mad_cfg_int_pe("cb-error-info", 0) ? 1 : 0;
+    cb = errinfo ? madeira_cb_with_error_info(q->device->mtl_queue) : MTLCommandQueue_commandBuffer(q->device->mtl_queue);
+    /* commandBuffer returns an AUTORELEASED object locally and an interned
+     * one remotely; holding it across calls means taking our own reference. */
+    if (cb) NSObject_retain(cb);
+    return cb;
+}
+static void mad_queue_open(struct mad_queue *q) {
+    if (q->open_cb) return;
+    if (q->device->resset && InterlockedExchange(&q->device->resset_dirty, 0))
+        mad_resident_commit(q->device);
+    mad_queue_revive(q->device);   /* ml1067 */
+    q->open_cb = mad_queue_new_cb(q);
+}
+static void mad_commit_stream(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb);
+
+/* wine-lab port: PARALLEL ENCODING OF ONE ExecuteCommandLists (madeira.cfg
+ * parallel-encode = N worker threads, default 0 = off). The Last of Us Part I
+ * makes 3-6 CPU<->GPU round trips a frame (signal, wait, read back, submit
+ * more), so the time ExecuteCommandLists takes to encode is on the critical path
+ * of every hop: async-submit hid it from the game's thread but the GPU still
+ * started late. Here the batch is cut into up to N+1 RUNS of consecutive lists
+ * (balanced by command count, at list boundaries only), each run gets its own
+ * command buffer, and all of them are ENQUEUED in submission order before any is
+ * encoded -- enqueue fixes their GPU order. The caller encodes run 0 (it
+ * continues the open batch) while the workers encode the rest; the caller then
+ * commits them in order as each finishes, so run 0 reaches the GPU while the
+ * others are still being encoded.
+ *
+ * Ordering between runs is the same as between two batches: every list starts
+ * with a sync (all fence-chain modes wait at a list start); in mode 6 a run's
+ * command buffer ends with the join encoder (waits for every encoder the run left
+ * pending, updates the device fence) and the next run's first sync waits for the
+ * device fence. Fences are evaluated in queue submission order (MTLFence docs),
+ * which enqueue has already fixed, so it does not matter which run is ENCODED
+ * first. Each run has its own mad_stream: its own mode-6 fence pool and pending
+ * set, pass-carry, draw arena and query slots (a query resolved in a later run
+ * than its End sees no record and answers "visible", as across a batch boundary,
+ * so a list with a query End/Resolve never starts a run). Everything else the
+ * replay touches is device state that two queues' replays already share under
+ * their own locks (rings, pipeline variants, views, residency, fill patterns).
+ *
+ * Falls back to the serial replay for fence-chain 5 (its stage choice reads a
+ * device flag the previous encoder set) and 3 (fails parallel_test serially
+ * too: UAV writes through tables are not tracked), debug captures/dumps, debug-readback, a
+ * list submitted twice in one call, an RGB32 shadow made since the last list, and
+ * batches too small to split (parallel-min-cmds commands per run, default 96). */
+static int g_par_n = -1, g_par_min = 96;
+static LONG g_par_batches, g_par_runs, g_par_serial;   /* 5 s report */
+static int mad_parallel_n(void) {
+    if (g_par_n < 0) {
+        int n = (int)mad_cfg_int_pe("parallel-encode", 0);
+        g_par_min = (int)mad_cfg_int_pe("parallel-min-cmds", 96); if (g_par_min < 1) g_par_min = 1;
+        if (n < 0) n = 0;
+        if (n > 7) n = 7;
+        d3d12_log("[madeira-d3d12] parallel-encode = %d (%s), parallel-min-cmds = %d\n", n,
+                  n ? "an ExecuteCommandLists batch is encoded by the caller and that many workers, one command buffer per run of lists" : "serial replay", g_par_min);
+        g_par_n = n;
+    }
+    return g_par_n;
+}
+struct mad_pjob {
+    struct mad_pjob *next;
+    struct mad_queue *q; struct mad_stream *st; obj_handle_t cb;
+    struct mad_list *const *lists; unsigned n;
+    volatile LONG done;
+};
+static SRWLOCK g_pw_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_pw_work = CONDITION_VARIABLE_INIT, g_pw_done = CONDITION_VARIABLE_INIT;
+static struct mad_pjob *g_pw_head, *g_pw_tail;
+static int g_pw_threads;
+static DWORD WINAPI mad_pw_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        struct mad_pjob *j;
+        obj_handle_t pool;
+        unsigned i;
+        AcquireSRWLockExclusive(&g_pw_lock);
+        while (!g_pw_head) SleepConditionVariableSRW(&g_pw_work, &g_pw_lock, INFINITE, 0);
+        j = g_pw_head; g_pw_head = j->next; if (!g_pw_head) g_pw_tail = NULL;
+        ReleaseSRWLockExclusive(&g_pw_lock);
+        pool = NSAutoreleasePool_alloc_init();   /* ml1049: this thread's encoders; all ended before it drains */
+        for (i = 0; i < j->n; i++) if (j->lists[i]) mad_exec_list(j->q, j->st, j->lists[i], j->cb);
+        mad_carry_end(j->st);
+        if (pool) NSObject_release(pool);
+        AcquireSRWLockExclusive(&g_pw_lock);
+        j->done = 1;
+        WakeAllConditionVariable(&g_pw_done);
+        ReleaseSRWLockExclusive(&g_pw_lock);
+    }
+    return 0;
+}
+static int mad_pw_start(int n) {   /* under some queue's submit_lock; the pool is process-wide */
+    AcquireSRWLockExclusive(&g_pw_lock);
+    while (g_pw_threads < n) {
+        HANDLE h = CreateThread(NULL, 0, mad_pw_main, NULL, 0, NULL);
+        if (!h) break;
+        SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+        CloseHandle(h);
+        g_pw_threads++;
+    }
+    n = g_pw_threads;
+    ReleaseSRWLockExclusive(&g_pw_lock);
+    return n;
+}
+static int mad_list_starts_run(const struct mad_list *l) {   /* see above: query Ends and Resolves stay with their Begins */
+    unsigned i;
+    for (i = 0; i < l->ncmds; i++)
+        if (l->cmds[i].kind == MC_QUERY_END || l->cmds[i].kind == MC_QUERY_RESOLVE) return 0;
+    return 1;
+}
+/* Cuts vl[0..n) into runs: start[r] is run r's first list, start[nr] = n. Returns nr (< 2: serial). */
+static unsigned mad_par_plan(struct mad_queue *q, struct mad_list *const *vl, unsigned n, unsigned *start, unsigned maxr) {
+    unsigned i, j, nr, r; UINT64 total = 0, acc = 0;
+    if (n < 2 || maxr < 2) return 0;
+    (void)mad_fence_mode(q->device); (void)mad_enc_fence_obj(q->device);   /* the mode, and the device fence, exist before any worker looks */
+    if (g_fence_chain == 5 || g_fence_chain == 3 || g_capture_on || g_draw_dump > 0 || g_census_on || g_rbdbg > 0 || q->device->shadow_pending) return 0;
+    for (i = 0; i < n; i++) {
+        if (!vl[i]) continue;
+        total += vl[i]->ncmds;
+        for (j = 0; j < i; j++) if (vl[j] == vl[i]) return 0;   /* one list's rings and ring batch cannot be in two runs */
+    }
+    nr = (unsigned)(total / (UINT64)g_par_min);
+    if (nr > maxr) nr = maxr;
+    if (nr > n) nr = n;
+    if (nr < 2) return 0;
+    /* Run 0 gets half a share: it is committed first, and the GPU, which then
+     * works through the runs in order while the rest are still being encoded, is
+     * idle until it is. Boundary r sits at (2r - 1) / (2nr - 1) of the commands. */
+    start[0] = 0; r = 1;
+    for (i = 0; i < n && r < nr; i++) {
+        if (i && acc * (2 * nr - 1) >= total * (2 * r - 1) && vl[i] && mad_list_starts_run(vl[i])) start[r++] = i;
+        if (vl[i]) acc += vl[i]->ncmds;
+    }
+    start[r] = n;
+    return r;
+}
+static void mad_ecl_run_parallel(struct mad_queue *q, struct mad_list *const *vl, unsigned n, const unsigned *start, unsigned nr) {
+    struct mad_pjob jobs[8];
+    obj_handle_t cbs[8];
+    unsigned r, i;
+    if (!q->pst) q->pst = calloc(8, sizeof *q->pst);
+    mad_queue_open(q);
+    if (!q->open_cb || !q->pst) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected += n; return; }
+    cbs[0] = q->open_cb;
+    for (r = 1; r < nr; r++) {
+        struct mad_stream *st = &q->pst[r - 1];
+        st->cb = mad_queue_new_cb(q);
+        st->batch_no = q->batches + 1 + r;   /* each run before it commits as one batch */
+        if (!st->cb) break;
+        cbs[r] = st->cb;
+    }
+    if (r < nr) {   /* out of command buffers: what got one runs serially into the open batch */
+        unsigned k;
+        for (k = 1; k < r; k++) { NSObject_release(q->pst[k - 1].cb); q->pst[k - 1].cb = 0; q->pst[k - 1].batch_no = 0; }
+        nr = 1;
+    }
+    if (nr > 1) madeira_cb_enqueue(cbs, nr);   /* GPU order = run order, fixed before anything is encoded */
+    AcquireSRWLockExclusive(&g_pw_lock);
+    for (r = 1; r < nr; r++) {
+        struct mad_pjob *j = &jobs[r];
+        j->next = NULL; j->q = q; j->st = &q->pst[r - 1]; j->cb = cbs[r];
+        j->lists = vl + start[r]; j->n = start[r + 1] - start[r]; j->done = 0;
+        if (g_pw_tail) g_pw_tail->next = j; else g_pw_head = j;
+        g_pw_tail = j;
+    }
+    if (nr > 1) WakeAllConditionVariable(&g_pw_work);
+    ReleaseSRWLockExclusive(&g_pw_lock);
+    /* run 0 here, into the open batch */
+    for (i = 0; i < (nr > 1 ? start[1] : n); i++) {
+        if (vl[i]) mad_exec_list(q, &q->st, vl[i], q->open_cb);
+        q->open_lists++; q->executed++;
+    }
+    if (nr < 2) return;   /* the serial fallback above: the batch stays open as usual */
+    mad_carry_end(&q->st);
+    mad_commit_stream(q, &q->st, q->open_cb);
+    q->open_cb = 0; q->open_lists = 0; q->open_draws = 0;
+    for (r = 1; r < nr; r++) {   /* in order, each as soon as it is done */
+        struct mad_pjob *j = &jobs[r];
+        if (!j->done) {
+            AcquireSRWLockExclusive(&g_pw_lock);
+            while (!j->done) SleepConditionVariableSRW(&g_pw_done, &g_pw_lock, INFINITE, 0);
+            ReleaseSRWLockExclusive(&g_pw_lock);
+        }
+        mad_commit_stream(q, j->st, j->cb);
+        j->st->cb = 0; j->st->batch_no = 0;
+        q->executed += j->n;
+    }
+    InterlockedIncrement(&g_par_batches); InterlockedExchangeAdd(&g_par_runs, (LONG)nr);
+    {
+        static LONG said;
+        if (InterlockedIncrement(&said) <= 3) {
+            char t[96]; unsigned k, o = 0;
+            for (k = 0; k < nr && o < sizeof t - 8; k++) o += snprintf(t + o, sizeof t - o, "%s%u", k ? "+" : "", start[k + 1] - start[k]);
+            d3d12_log("[madeira-d3d12] parallel-encode: %u lists encoded as %u runs (%s lists), one command buffer each\n", n, nr, t);
+        }
+    }
+}
+
 /* ml1120: the replay itself; runs on the caller (async-submit = 0) or on the
  * queue's submission worker. */
 static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList *const *lists) {
@@ -6145,6 +6349,8 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
      * by exec_end before a list returns, so nothing in the pool is still in use
      * when it drains. Same thread pushes and pops. */
     obj_handle_t ml1049_pool = NSAutoreleasePool_alloc_init();
+    struct mad_list *vl_stack[64], **vl = vl_stack;
+    unsigned nv = 0, pstart[9], nr = 0;
     /* Lazy pipelines this batch binds, built in parallel. wine-lab port: before
      * submit_lock, not under it -- it touches only the pipelines (each build
      * under its own rlock) and its own pool (under its serial lock), and a
@@ -6154,6 +6360,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
     if (ml1021_q) EnterCriticalSection(&ml1021_q->submit_lock);
 
     struct mad_queue *q = (struct mad_queue *)This;
+    if (count > 64 && !(vl = malloc(count * sizeof *vl))) vl = NULL;
     for (UINT i = 0; i < count; i++) {
         struct mad_list *l = (struct mad_list *)lists[i];
         if (l && !l->closed) {
@@ -6168,29 +6375,39 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
             q->rejected++;
             continue;
         }
-        if (!q->open_cb) {
-            if (q->device->resset && InterlockedExchange(&q->device->resset_dirty, 0))
-                mad_resident_commit(q->device);
-            mad_queue_revive(q->device);   /* ml1067 */
-            {   /* wine-lab port: madeira.cfg cb-error-info = 1 -- a failed command buffer names the encoder that
-                 * faulted or timed out (with encoder-labels = 1, by shader entry point) */
-                static int errinfo = -1;
-                if (errinfo < 0) errinfo = mad_cfg_int_pe("cb-error-info", 0) ? 1 : 0;
-                q->open_cb = errinfo ? madeira_cb_with_error_info(q->device->mtl_queue)
-                                     : MTLCommandQueue_commandBuffer(q->device->mtl_queue);
-            }
+        if (!vl) {   /* no room for the batch: replay it list by list, as always */
+            mad_queue_open(q);
             if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
-            /* commandBuffer returns an AUTORELEASED object locally and an interned
-             * one remotely; holding it across calls means taking our own reference. */
-            NSObject_retain(q->open_cb);
+            if (l) mad_exec_list(q, &q->st, l, q->open_cb);
+            q->open_lists++;
+            q->executed++;
+            if (q->open_lists >= 48 || (q->open_lists >= mad_batch_lists() && !q->st.carry_live) ||
+                q->open_draws >= mad_batch_draws())
+                mad_queue_flush(q);
+            continue;
         }
-        if (l) mad_exec_list(q, &q->st, l, q->open_cb);
-        q->open_lists++;
-        q->executed++;
-        if (q->open_lists >= 48 || (q->open_lists >= mad_batch_lists() && !q->st.carry_live) ||
-            q->open_draws >= mad_batch_draws())
-            mad_queue_flush(q);   /* bound the batch; wine-lab port: batch-lists/batch-draws */
+        vl[nv++] = l;
     }
+    if (vl && mad_parallel_n() > 0) {
+        unsigned w = (unsigned)mad_pw_start(mad_parallel_n());   /* the pool starts once */
+        nr = w ? mad_par_plan(q, vl, nv, pstart, w + 1) : 0;
+        if (nr >= 2) mad_ecl_run_parallel(q, vl, nv, pstart, nr);
+        else InterlockedIncrement(&g_par_serial);
+    }
+    if (vl && nr < 2) {
+        for (unsigned i = 0; i < nv; i++) {
+            struct mad_list *l = vl[i];
+            mad_queue_open(q);
+            if (!q->open_cb) { d3d12_log("[madeira-d3d12] no command buffer\n"); q->rejected++; continue; }
+            if (l) mad_exec_list(q, &q->st, l, q->open_cb);
+            q->open_lists++;
+            q->executed++;
+            if (q->open_lists >= 48 || (q->open_lists >= mad_batch_lists() && !q->st.carry_live) ||
+                q->open_draws >= mad_batch_draws())
+                mad_queue_flush(q);   /* bound the batch; wine-lab port: batch-lists/batch-draws */
+        }
+    }
+    if (vl != vl_stack) free(vl);
     mad_carry_end(&q->st);   /* wine-lab port: the open encoder is in this replay's autorelease pool */
     if (ml1021_q) LeaveCriticalSection(&ml1021_q->submit_lock);   /* ml1021 */
     if (ml1049_pool) NSObject_release(ml1049_pool);
@@ -6361,6 +6578,12 @@ static void mad_perf_present(void) {
                       g_perf_presents ? 1000.0 * g_perf_present_ticks / (double)fq.QuadPart / g_perf_presents : 0.0,
                       g_perf_presents ? 1000.0 * wall / g_perf_presents : 0.0);
             g_perf_ecl_ticks = 0; g_perf_present_ticks = 0;
+            if (g_par_n > 0) {   /* wine-lab port: parallel-encode */
+                LONG pb = InterlockedExchange(&g_par_batches, 0), pr = InterlockedExchange(&g_par_runs, 0), ps = InterlockedExchange(&g_par_serial, 0);
+                d3d12_log("[perf] parallel-encode per frame: %.1f ExecuteCommandLists split into %.1f runs (%.1f runs each), %.1f encoded serially\n",
+                          g_perf_presents ? (double)pb / g_perf_presents : 0.0, g_perf_presents ? (double)pr / g_perf_presents : 0.0,
+                          pb ? (double)pr / pb : 0.0, g_perf_presents ? (double)ps / g_perf_presents : 0.0);
+            }
             if (g_async_submit > 0)
                 d3d12_log("[perf] ml1120 async per frame: worker busy %.2f ms (%.1f jobs), Present drain %.2f ms, list Reset waits %.2f ms (%.1f), queue-Wait jobs blocked %.2f ms\n",
                           g_perf_presents ? 1000.0 * g_perf_worker_ticks / (double)fq.QuadPart / g_perf_presents : 0.0,

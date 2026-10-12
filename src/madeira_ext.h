@@ -91,6 +91,9 @@ void MadeiraCtl(struct madeira_ctl_args *args);
 /* A command buffer whose error, on failure, lists each encoder's label and state
  * (MTLCommandBufferErrorOptionEncoderExecutionStatus). Autoreleased, like winemetal's. */
 obj_handle_t madeira_cb_with_error_info(obj_handle_t queue);
+/* [MTLCommandBuffer enqueue] for n buffers, in array order: reserves their places
+ * in the queue's GPU order before any of them is encoded (parallel-encode). */
+void madeira_cb_enqueue(const obj_handle_t *cbs, unsigned n);
 void MadeiraIRConvert(struct madeira_ir_convert_args *args);
 #endif
 
@@ -112,6 +115,7 @@ enum madeira_unix_func {
     madeira_unix_ir_convert,
     madeira_unix_blitT2B,
     madeira_unix_commandBufferErrorInfo,
+    madeira_unix_commandBufferEnqueue,
     madeira_unix_count,
 };
 

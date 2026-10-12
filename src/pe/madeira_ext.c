@@ -118,6 +118,12 @@ obj_handle_t madeira_cb_with_error_info(obj_handle_t queue)
     return p.b;
 }
 
+void madeira_cb_enqueue(const obj_handle_t *cbs, unsigned n)
+{
+    struct madeira_unix_pair_params p = { P(cbs), n };   /* a = the array, b = its length */
+    CALL(commandBufferEnqueue, &p);
+}
+
 void madeira_blit_t2b(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_texture_to_buffer *cmd, uint32_t options)
 {
     struct madeira_unix_blit_params p = { encoder, P(cmd), options };

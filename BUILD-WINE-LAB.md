@@ -130,10 +130,20 @@ view shares a UINT view's shadow; a big (>= rgb32-big-mb, default 4) view is ref
 (every time with rgb32-big-exact = 1; rgb32-big-frames = 0, never, fails 3 checks by design); a genuine R32_FLOAT view
 through the same read site, GetDimensions of both kinds, and SM 6.6 ResourceDescriptorHeap indexing; with
 rgb32-shader = 1 (default) the run must make no shadow and copy nothing; typed UAV writes, an atomic and a typed UAV
-load next to an RGB32 read in one kernel; precompiled DXIL from rgb32.hlsl, rgb32_heap.hlsl and rgb32_uav.hlsl).
+load next to an RGB32 read in one kernel; precompiled DXIL from rgb32.hlsl, rgb32_heap.hlsl and rgb32_uav.hlsl);
+d3d12-parallel-x64.exe (tests/windows/parallel_test.c, 0 failures, 32 checks: 8 rounds of ONE ExecuteCommandLists of 12
+lists whose results depend on order across list boundaries -- a compute chain with a CPU reference, per-list snapshot
+copies, order-dependent blending into targets shared by consecutive lists, occlusion queries resolved one and three
+lists later; run it serially and with `MADEIRA_PARALLEL_ENCODE=4 MADEIRA_PARALLEL_MIN_CMDS=1`; fence-chain 3 fails it
+serially too). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
+(16 lists, TLOU-like mix), prints ExecuteCommandLists wall time, submit-to-GPU-done latency and image/UAV hashes.
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 
 Config: madeira.cfg keys are read from the environment, e.g. fence-chain -> MADEIRA_FENCE_CHAIN.
+Parallel encoding: `parallel-encode = N` (default 0, off; max 7) cuts one ExecuteCommandLists into up to N+1 runs of
+consecutive lists (run 0 half-size, `parallel-min-cmds` commands per run, default 96), gives each run its own command
+buffer, enqueues them all in order, encodes run 0 on the caller and the rest on N worker threads, and commits them in
+order. Serial fallback: fence-chain 3/5, captures/dumps, debug-readback, a list twice in one call, new RGB32 shadows.
 Readback diagnostics: `debug-readback = 1` puts every READBACK buffer on our own storage and makes the pages each GPU
 copy into one writes PAGE_NOACCESS until the CPU next touches them; a touch before that copy's command buffer has
 completed is logged once per buffer ("debug-readback: EARLY read ..." with the command buffer's status and the reading
