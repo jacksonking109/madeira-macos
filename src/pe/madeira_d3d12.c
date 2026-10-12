@@ -263,6 +263,9 @@ struct mad_device {
      * which was a GPU page fault that killed the whole queue. They now point
      * at 64 KB of zeros instead. */
     obj_handle_t null_buffer; UINT64 null_gpu;
+    /* wine-lab port: ClearDepthStencilView with rects (exec_clear_ds_rects): vertex-only
+     * pipelines by (depth format, stencil format, samples) and depth-stencil states by flags */
+    struct { UINT32 dpf, spf, samples; obj_handle_t pso; } clr_pso[8]; unsigned nclr_pso; obj_handle_t clr_dsso[4];
     struct mad_queue *queues[16]; unsigned nqueues;   /* ml884: every live queue, for flush-all */
     /* ml910: GPU-ordered capture of what a draw actually receives. Blits run
      * in the same command buffer right before the draw, so they see the
@@ -1263,7 +1266,8 @@ struct mad_cmd {
         struct { UINT slot; struct mad_resource *res; UINT64 off; UINT stride; } vb;
         struct { struct mad_resource *rt[8]; UINT n; struct mad_resource *depth; struct mad_rtvp v[8], dv; } rts;   /* ml925: + sub-views */
         struct { struct mad_resource *res[8]; UINT n; UINT all; UINT8 cls[8]; UINT8 cls_noref; } barrier;   /* ml1116: transitioned resources; all = UAV/aliasing/overflow; ml1137: state classes (BC_*) */
-        struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared */
+        struct { struct mad_resource *res; float rgba[4]; float depth; UINT8 stencil; UINT8 flags; struct mad_rtvp v;
+                 UINT16 nrect; UINT32 rect_at; } clear;   /* ml904: flags = D3D12_CLEAR_FLAGS; ml925: v = the view cleared; wine-lab port: DSV rects in cdata (4 words each) */
         struct { UINT vcount, icount, vstart, istart; } draw;
         struct { UINT icount, inst, start; INT base; UINT istart; } drawi;
         struct { struct mad_resource *dst, *src; UINT64 doff, soff, len; } bb;
@@ -2147,7 +2151,11 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
          * 16 MB unless madeira.cfg capture-big = 1. */
         static int big = -1; static unsigned said_big;
         if (big < 0) big = mad_cfg_int_pe("capture-big", 0) ? 1 : 0;
-        if (!big && total > (16ull << 20)) {
+        /* wine-lab port: only ATLASES (4096 or more on a side). A screen-sized
+         * target over 16 MB is what a lighting investigation needs: ROTTR's DX12
+         * G-buffer normals (1920x1200 RGBA16_SNORM) and both light-accumulation
+         * targets (RGBA16F) were 17 MB each and never written. */
+        if (!big && total > (16ull << 20) && (w >= 4096 || h >= 4096)) {
             if (said_big++ < 8) d3d12_log("[capture] ml1140 skipped a %ux%u target (%llu MB) at enc#%u; set capture-big = 1 to include atlases\n",
                                           w, h, (unsigned long long)(total >> 20), seq);
             return;
@@ -2166,8 +2174,13 @@ static void mad_capture_one(struct mad_exec *e, obj_handle_t benc, struct mad_re
     k.type = WMTBlitCommandCopyFromTextureToBuffer;
     k.src = r->texture; k.slice = v->slice; k.level = v->level;
     k.size.width = w; k.size.height = h; k.size.depth = d;
-    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)(total / d); (void)options;   /* wine-lab port: DXMT v0.80 has no blit options; capture-only path */
-    MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
+    k.dst = buf; k.offset = 0; k.bytes_per_row = (UINT32)bpr; k.bytes_per_image = (UINT32)(total / d);
+    /* wine-lab port: the plane through d3d12.so's blitT2B. winemetal drops the
+     * MTLBlitOption, so every "stencil9" file of a combined depth-stencil target
+     * was the first quarter of its DEPTH plane (ROTTR DX12 capture, frame 781:
+     * 100% byte-equal to the depth file; 0x00/0x80/0x3f = 1.0f where the depth
+     * was cleared), and the many stencil-masked passes could not be checked. */
+    madeira_blit_t2b(benc, &k, options);
     if (!mad_grow((void **)&g_capbufs, &g_capbufs_cap, g_ncapbufs + 1, sizeof *g_capbufs)) { NSObject_release(buf); return; }
     cb = &g_capbufs[g_ncapbufs++];
     memset(cb, 0, sizeof *cb);
@@ -2696,6 +2709,106 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     e->f6_natt = 0;
     if (enc) MTLCommandEncoder_endEncoding(enc);
     exec_drop_pending(e, i);
+}
+
+/* wine-lab port: ClearDepthStencilView with rects. Metal clears only whole
+ * attachments, so each rect is a fullscreen triangle of a vertex-only pipeline,
+ * scissored to the rect, under a viewport with znear = zfar = the clear depth
+ * (exactly that value, quantised by the format like a clear), depth test ALWAYS
+ * and stencil REPLACE with the clear value as reference; the aspects the flags
+ * do not name keep their contents (write disabled). Ordered after any pending
+ * clear of the same view and fenced like a clear-only pass. */
+static obj_handle_t mad_clear_ds_pso(struct mad_device *d, const struct mad_resource *r) {
+    UINT32 dpf = (UINT32)r->tex_pf, spf = r->has_stencil ? (UINT32)r->tex_pf : 0, smp = r->samples ? r->samples : 1;
+    obj_handle_t pso = 0; unsigned i;
+    EnterCriticalSection(&d->heap_lock);
+    for (i = 0; i < d->nclr_pso; i++)
+        if (d->clr_pso[i].dpf == dpf && d->clr_pso[i].spf == spf && d->clr_pso[i].samples == smp) { pso = d->clr_pso[i].pso; break; }
+    if (!pso && i == d->nclr_pso) {
+        pso = madeira_new_clear_pipeline(d->mtl_device, dpf, spf, smp);
+        if (d->nclr_pso < 8) { d->clr_pso[d->nclr_pso].dpf = dpf; d->clr_pso[d->nclr_pso].spf = spf; d->clr_pso[d->nclr_pso].samples = smp; d->clr_pso[d->nclr_pso++].pso = pso; }
+        d3d12_log("[madeira-d3d12] clear-rect pipeline for depth format %u, stencil format %u, %u sample(s): %s\n", dpf, spf, smp, pso ? "built" : "FAILED");
+    }
+    LeaveCriticalSection(&d->heap_lock);
+    return pso;
+}
+static obj_handle_t mad_clear_ds_dsso(struct mad_device *d, UINT8 flags) {
+    unsigned k = flags & 3;
+    obj_handle_t o;
+    EnterCriticalSection(&d->heap_lock);
+    if (!d->clr_dsso[k]) {
+        struct WMTDepthStencilInfo dsi; memset(&dsi, 0, sizeof dsi);
+        dsi.depth_compare_function = WMTCompareFunctionAlways;
+        dsi.depth_write_enabled = (flags & D3D12_CLEAR_FLAG_DEPTH) != 0;
+        dsi.front_stencil.enabled = (flags & D3D12_CLEAR_FLAG_STENCIL) != 0;
+        dsi.front_stencil.stencil_compare_function = WMTCompareFunctionAlways;
+        dsi.front_stencil.depth_stencil_pass_op = dsi.front_stencil.stencil_fail_op = dsi.front_stencil.depth_fail_op = WMTStencilOperationReplace;
+        dsi.front_stencil.read_mask = 0xff; dsi.front_stencil.write_mask = 0xff;
+        dsi.back_stencil = dsi.front_stencil;
+        d->clr_dsso[k] = MTLDevice_newDepthStencilState(d->mtl_device, &dsi);
+    }
+    o = d->clr_dsso[k];
+    LeaveCriticalSection(&d->heap_lock);
+    return o;
+}
+static void exec_clear_ds_rects(struct mad_exec *e, const struct mad_cmd *c) {
+    struct mad_device *d = e->q->device;
+    struct mad_resource *r = c->u.clear.res;
+    const UINT32 *rc = e->l->cdata + c->u.clear.rect_at;
+    UINT lw, lh, s, ns, i, n = c->u.clear.nrect;
+    obj_handle_t pso, dsso;
+    static LONG said;
+    int p;
+    if (!r || !r->texture || !r->is_depth || !n) return;
+    p = exec_pending_index(e, r, &c->u.clear.v);
+    if (p >= 0) exec_flush_clear(e, p);   /* an earlier whole clear of the view lands first */
+    pso = mad_clear_ds_pso(d, r); dsso = mad_clear_ds_dsso(d, c->u.clear.flags);
+    if (!pso || !dsso) { MAD_SKIP(e); return; }
+    if (e->renc) InterlockedIncrement(&g_pass_end_clear);
+    exec_end(e);
+    lw = r->width >> c->u.clear.v.level; lh = r->height >> c->u.clear.v.level; if (!lw) lw = 1; if (!lh) lh = 1;
+    ns = c->u.clear.v.layers > 1 ? c->u.clear.v.layers : 1;
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] ClearDepthStencilView: %u rect(s) of '%s' cleared by draws (flags %#x, depth %g, stencil %u)\n",
+                  n, r->name ? r->name : "?", (unsigned)c->u.clear.flags, c->u.clear.depth, (unsigned)c->u.clear.stencil);
+    for (s = 0; s < ns; s++) {
+        struct WMTRenderPassInfo rpi;
+        obj_handle_t enc;
+        struct wmtcmd_render_setpso c_pso; struct wmtcmd_render_setdsso c_ds;
+        struct wmtcmd_render_setviewport c_vp; struct wmtcmd_render_setscissorrect c_sc; struct wmtcmd_render_draw c_dr;
+        memset(&rpi, 0, sizeof rpi);
+        rpi.depth.texture = r->texture; rpi.depth.level = c->u.clear.v.level; rpi.depth.slice = c->u.clear.v.slice + s;
+        rpi.depth.load_action = WMTLoadActionLoad; rpi.depth.store_action = WMTStoreActionStore;
+        if (r->has_stencil) {
+            rpi.stencil.texture = r->texture; rpi.stencil.level = c->u.clear.v.level; rpi.stencil.slice = c->u.clear.v.slice + s;
+            rpi.stencil.load_action = WMTLoadActionLoad; rpi.stencil.store_action = WMTStoreActionStore;
+        }
+        rpi.render_target_width = lw; rpi.render_target_height = lh;
+        rpi.default_raster_sample_count = r->samples ? r->samples : 1;
+        enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+        if (!enc) { MAD_SKIP(e); return; }
+        e->f6_att[0] = r; e->f6_natt = 1;
+        exec_fence_render(e, enc, 0);
+        memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = pso;
+        memset(&c_ds, 0, sizeof c_ds); c_ds.type = WMTRenderCommandSetDSSO; c_ds.dsso = dsso; c_ds.stencil_ref = c->u.clear.stencil;
+        c_pso.next.ptr = &c_ds;
+        MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&c_pso);
+        for (i = 0; i < n; i++) {
+            memset(&c_vp, 0, sizeof c_vp); c_vp.type = WMTRenderCommandSetViewport;
+            c_vp.viewport.originX = 0; c_vp.viewport.originY = 0; c_vp.viewport.width = lw; c_vp.viewport.height = lh;
+            c_vp.viewport.znear = c->u.clear.depth; c_vp.viewport.zfar = c->u.clear.depth;
+            memset(&c_sc, 0, sizeof c_sc); c_sc.type = WMTRenderCommandSetScissorRect;
+            c_sc.scissor_rect.x = rc[4 * i]; c_sc.scissor_rect.y = rc[4 * i + 1];
+            c_sc.scissor_rect.width = rc[4 * i + 2]; c_sc.scissor_rect.height = rc[4 * i + 3];
+            memset(&c_dr, 0, sizeof c_dr); c_dr.type = WMTRenderCommandDraw;
+            c_dr.primitive_type = WMTPrimitiveTypeTriangle; c_dr.vertex_start = 0; c_dr.vertex_count = 3; c_dr.instance_count = 1;
+            c_vp.next.ptr = &c_sc; c_sc.next.ptr = &c_dr;
+            MTLRenderCommandEncoder_encodeCommands(enc, (const struct wmtcmd_base *)&c_vp);
+        }
+        exec_fence_render(e, enc, 1);
+        e->f6_natt = 0;
+        MTLCommandEncoder_endEncoding(enc);
+    }
 }
 
 /* wine-lab port: a clear stays pending until the pass that binds its target
@@ -5983,7 +6096,10 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
             memcpy(e.rtp, c->u.rts.v, sizeof e.rtp); e.dp = c->u.rts.dv;   /* ml925 */
             break;
         case MC_CLEAR_RT: exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, c->u.clear.rgba, 0.0f, 0, 0, 0); break;
-        case MC_CLEAR_DS: exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags); break;
+        case MC_CLEAR_DS:
+            if (c->u.clear.nrect) exec_clear_ds_rects(&e, c);   /* wine-lab port */
+            else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags);
+            break;
         case MC_ROOTSIG: e.rs = c->u.rootsig; break;
         case MC_ROOT_CONST:
             if (c->u.rconst.index < MAD_ROOT_PARAM_MAX && c->u.rconst.dst + c->u.rconst.n <= 64)
@@ -10893,7 +11009,18 @@ static void mad_sampler_info(struct WMTSamplerInfo *si, UINT filter, UINT au, UI
      * clamps another (Astra; DXMT's D3D11 layer has it right). */
     si->s_address_mode = am[au < 6 ? au : 3]; si->t_address_mode = am[av < 6 ? av : 3]; si->r_address_mode = am[aw < 6 ? aw : 3];
     si->border_color = border == 2 ? WMTSamplerBorderColorOpaqueWhite : border == 1 ? WMTSamplerBorderColorOpaqueBlack : WMTSamplerBorderColorTransparentBlack;
-    si->compare_function = (filter & 0x80) ? mad_compare((D3D12_COMPARISON_FUNC)cmp) : WMTCompareFunctionNever;
+    /* wine-lab port: the reduction type is bits 7-8 (D3D12_FILTER_REDUCTION_TYPE_SHIFT):
+     * 1 comparison, 2 minimum, 3 maximum. Testing bit 7 alone made every MAXIMUM
+     * filter a comparison sampler. Metal has no min/max reduction: both filter
+     * normally, counted, so a game that relies on them (TiledResourcesTier 2
+     * implies them) shows in the log. */
+    si->compare_function = ((filter >> 7) & 3) == 1 ? mad_compare((D3D12_COMPARISON_FUNC)cmp) : WMTCompareFunctionNever;
+    if (((filter >> 7) & 3) >= 2) {
+        static LONG said_minmax;
+        if (InterlockedIncrement(&said_minmax) <= 4)
+            d3d12_log("[madeira-d3d12] sampler filter %#x asks for %s reduction, which Metal lacks: filtered normally\n",
+                      filter, ((filter >> 7) & 3) == 2 ? "MINIMUM" : "MAXIMUM");
+    }
     /* wine-lab port: Metal's lodMinClamp/lodMaxClamp must lie in [0, ...]. D3D
      * samplers commonly say MinLOD = -FLT_MAX, MaxLOD = FLT_MAX (Unity 6 does for
      * every sampler); passed through, the negative minimum made every sample
@@ -12771,7 +12898,9 @@ static void STDMETHODCALLTYPE list_ClearRenderTargetView(ID3D12GraphicsCommandLi
     struct mad_cmd *c;
     static unsigned said_rects;
     if (!rt) return;
-    if (n && rects && !said_rects++) d3d12_log("[madeira-d3d12] ClearRenderTargetView: rects are ignored; the whole target is cleared\n");
+    if (n && rects && said_rects++ < 8)   /* wine-lab port: name it (DSV rects are honoured, RTV rects not yet) */
+        d3d12_log("[madeira-d3d12] ClearRenderTargetView: %u rect(s) on %s %ux%u, first (%ld,%ld)-(%ld,%ld), are ignored; the whole target is cleared\n",
+                  n, rt->name ? rt->name : "?", rt->width, rt->height, (long)rects[0].left, (long)rects[0].top, (long)rects[0].right, (long)rects[0].bottom);
     c = mad_list_push(l, MC_CLEAR_RT);
     if (!c) return;
     c->u.clear.res = rt; c->u.clear.v = mad_slot_view(rtv.ptr);
@@ -12784,17 +12913,47 @@ static void STDMETHODCALLTYPE list_ClearDepthStencilView(ID3D12GraphicsCommandLi
     struct mad_resource *d = mad_slot_resource(dsv.ptr);
     struct mad_cmd *c;
     static unsigned said, said_rect;
+    struct mad_rtvp v;
+    UINT i, k = 0, lw, lh, full = 0;
     if (!d) return;
-    if (n && rects && said_rect++ < 4)
-        d3d12_log("[madeira-d3d12] ClearDepthStencilView: %u clear rects ignored (whole view cleared)\n", n);
+    v = mad_slot_view(dsv.ptr);
+    lw = d->width >> v.level; lh = d->height >> v.level; if (!lw) lw = 1; if (!lh) lh = 1;
+    /* wine-lab port: ONLY the rects are cleared. They used to be ignored and the whole
+     * view cleared: Rise of the Tomb Raider (DX12) clears each tile of its 8192x4096
+     * shadow atlas with a rect before drawing that tile, so every tile wiped the ones
+     * drawn before it and only the last survived. A rect covering the view is a plain
+     * clear (it can merge into the next pass's load action). */
+    if (n && rects) {
+        for (i = 0; i < n; i++)
+            if (rects[i].left <= 0 && rects[i].top <= 0 && rects[i].right >= (LONG)lw && rects[i].bottom >= (LONG)lh) full = 1;
+        if (said_rect++ < 8)
+            d3d12_log("[madeira-d3d12] ClearDepthStencilView: %u rect(s) on %s %ux%u (level %u slice %u) flags %#x depth %g stencil %u, "
+                      "first (%ld,%ld)-(%ld,%ld)%s\n", n, d->name ? d->name : "?", lw, lh, v.level, v.slice, (unsigned)flags, depth,
+                      (unsigned)stencil, (long)rects[0].left, (long)rects[0].top, (long)rects[0].right, (long)rects[0].bottom,
+                      full ? ": covers the view, a plain clear" : "");
+    }
     if (said++ < 24)
         d3d12_log("[madeira-d3d12] ClearDepthStencilView: res %p %ux%u flags %#x depth %g stencil %u\n", (void *)d,
                   d->width, d->height, (unsigned)flags, depth, (unsigned)stencil);
+    if (n && rects && !full) {
+        if (!mad_grow((void **)&l->cdata, &l->cdcap, l->ncdata + 4 * n, sizeof *l->cdata)) return;
+        for (i = 0; i < n; i++) {
+            LONG x0 = rects[i].left > 0 ? rects[i].left : 0, y0 = rects[i].top > 0 ? rects[i].top : 0;
+            LONG x1 = rects[i].right < (LONG)lw ? rects[i].right : (LONG)lw, y1 = rects[i].bottom < (LONG)lh ? rects[i].bottom : (LONG)lh;
+            if (x1 <= x0 || y1 <= y0) continue;   /* empty: clears nothing */
+            l->cdata[l->ncdata + 4 * k + 0] = (UINT32)x0; l->cdata[l->ncdata + 4 * k + 1] = (UINT32)y0;
+            l->cdata[l->ncdata + 4 * k + 2] = (UINT32)(x1 - x0); l->cdata[l->ncdata + 4 * k + 3] = (UINT32)(y1 - y0);
+            k++;
+        }
+        if (!k) return;
+    }
     c = mad_list_push(l, MC_CLEAR_DS);
     if (!c) return;
-    c->u.clear.res = d; c->u.clear.v = mad_slot_view(dsv.ptr); c->u.clear.depth = depth; c->u.clear.stencil = stencil;
+    c->u.clear.res = d; c->u.clear.v = v; c->u.clear.depth = depth; c->u.clear.stencil = stencil;
     c->u.clear.flags = (UINT8)(flags & (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL));
     if (!c->u.clear.flags) c->u.clear.flags = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+    c->u.clear.nrect = 0; c->u.clear.rect_at = 0;
+    if (k) { c->u.clear.nrect = (UINT16)(k > 0xffff ? 0xffff : k); c->u.clear.rect_at = l->ncdata; l->ncdata += 4 * k; }
 }
 static void STDMETHODCALLTYPE list_SetPipelineState(ID3D12GraphicsCommandList *This, ID3D12PipelineState *pso) {
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_PSO);

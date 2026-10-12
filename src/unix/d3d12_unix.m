@@ -541,6 +541,45 @@ static NTSTATUS blit_b2t(void *args)
     return STATUS_SUCCESS;
 }
 
+/* wine-lab port: see madeira_new_clear_pipeline. The library is compiled from
+ * source once per device; pipelines are cached by the caller. */
+static NTSTATUS new_clear_pipeline(void *args)
+{
+    static id<MTLLibrary> lib;
+    static id<MTLDevice> lib_dev;
+    struct madeira_unix_pso_params *p = args;
+    NSError *err = nil;
+    p->ret_pso = 0; p->ret_error = 0;
+    @autoreleasepool {
+    id<MTLDevice> dev = (id<MTLDevice>)p->device;
+    if (!lib || lib_dev != dev) {
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                         "struct madeira_clear_out { float4 pos [[position]]; };\n"
+                         "vertex madeira_clear_out madeira_clear_vs(uint id [[vertex_id]]) {\n"
+                         "    madeira_clear_out o; float2 uv = float2((id << 1) & 2, id & 2);\n"
+                         "    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0); return o; }\n";
+        id<MTLLibrary> l = [dev newLibraryWithSource:src options:nil error:&err];
+        if (!l) {
+            fprintf(stderr, "[madeira-d3d12] clear pipeline: library: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+            return STATUS_SUCCESS;
+        }
+        if (lib) [lib release];
+        lib = l; lib_dev = dev;
+    }
+    id<MTLFunction> vs = [[lib newFunctionWithName:@"madeira_clear_vs"] autorelease];
+    MTLRenderPipelineDescriptor *d = [[[MTLRenderPipelineDescriptor alloc] init] autorelease];
+    d.vertexFunction = vs;
+    d.depthAttachmentPixelFormat = to_metal_pixel_format((enum WMTPixelFormat)(uint32_t)p->info);
+    d.stencilAttachmentPixelFormat = to_metal_pixel_format((enum WMTPixelFormat)(uint32_t)(p->info >> 32));
+    d.rasterSampleCount = p->extra ? (NSUInteger)p->extra : 1;
+    d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle;
+    id<MTLRenderPipelineState> pso = [dev newRenderPipelineStateWithDescriptor:d error:&err];
+    if (!pso) fprintf(stderr, "[madeira-d3d12] clear pipeline: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+    p->ret_pso = (obj_handle_t)pso;   /* retained; the caller's cache owns it */
+    }
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS command_buffer_error_info(void *args)
 {
     struct madeira_unix_pair_params *p = args;
@@ -579,6 +618,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_commandBufferErrorInfo] = command_buffer_error_info,
     [madeira_unix_commandBufferEnqueue] = command_buffer_enqueue,
     [madeira_unix_blitB2T] = blit_b2t,
+    [madeira_unix_newClearPipeline] = new_clear_pipeline,
 };
 
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == madeira_unix_count,

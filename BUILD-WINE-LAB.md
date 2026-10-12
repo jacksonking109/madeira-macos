@@ -144,7 +144,15 @@ and a clear followed by a barrier and a copy of its target runs before the copy)
 returning the old value, the smaller carried down -- from 1 to 256 racing fullscreen instances, after stale data and the
 zero clear in the same list, plus a 64-bit pattern clear of R32G32_UINT; fails on a stored value that is no input of
 its pixel, unsorted layers or a wrong layer 0; prints, not fails, how many true top-4 values the load+atomic emulation
-loses to the race; precompiled DXIL from oit.hlsl). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
+loses to the race; precompiled DXIL from oit.hlsl); d3d12-dssrv-x64.exe (tests/windows/dssrv_test.c, 0 failures, 53 checks,
+HLSL compiled at run time to SM 5.0/5.1 DXBC: Rise of the Tomb Raider's DX12 lighting shapes -- an SV_Depth pattern and
+a discard + stencil REPLACE edge mark read back through R24_UNORM_X8_TYPELESS (Load, Gather .w/.z, SampleLevel, Sample)
+and X24_TYPELESS_G8_UINT (.y), a fullscreen pass masked by stencil NOT_EQUAL (read mask 2) and depth GREATER_EQUAL from
+z = 1 under a viewport of MaxDepth 0.98, SampleCmp(LevelZero) on D16 and D32 maps through static and heap comparison
+samplers, StructuredBuffer / ByteAddressBuffer / Buffer<uint4> with FirstElement / Texture2DArray reads as SM 5.0 and
+5.1, a MAXIMUM-reduction sampler, and ClearDepthStencilView with RECTS: three tiles of a D16 atlas cleared one after
+another keep their own depths, depth-only and stencil-only rect clears leave the other aspect and the rest alone; needs
+d3d12.so's newClearPipeline unix call). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
 (16 lists, TLOU-like mix), prints ExecuteCommandLists wall time, submit-to-GPU-done latency and image/UAV hashes.
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 

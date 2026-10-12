@@ -134,6 +134,13 @@ void madeira_blit_t2b(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_t
     CALL(blitT2B, &p);
 }
 
+obj_handle_t madeira_new_clear_pipeline(obj_handle_t device, uint32_t depth_pf, uint32_t stencil_pf, uint32_t samples)
+{
+    struct madeira_unix_pso_params p = { .device = device, .info = (uint64_t)depth_pf | ((uint64_t)stencil_pf << 32), .extra = samples };
+    CALL(newClearPipeline, &p);
+    return p.ret_pso;
+}
+
 void madeira_blit_b2t(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_buffer_to_texture *cmd, uint32_t options)
 {
     struct madeira_unix_blit_params p = { encoder, P(cmd), options };

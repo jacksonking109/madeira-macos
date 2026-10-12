@@ -93,6 +93,11 @@ void madeira_blit_t2b(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_t
  * MTLBlitOptionStencilFromDepthStencil, a stencil-plane copy lands in the DEPTH
  * plane (TLOU Part I: 1 B/px stencil read as depth -> 0x71717171 = 1.2e30). */
 void madeira_blit_b2t(obj_handle_t encoder, const struct wmtcmd_blit_copy_from_buffer_to_texture *cmd, uint32_t options);
+/* wine-lab port: a vertex-only pipeline (fullscreen triangle at z = 0, no fragment
+ * function) for the given depth and stencil attachment formats: ClearDepthStencilView
+ * with rects draws it once per rect under a viewport whose znear = zfar = the clear
+ * depth, and a stencil REPLACE. Metal has no partial depth/stencil clear. */
+obj_handle_t madeira_new_clear_pipeline(obj_handle_t device, uint32_t depth_pf, uint32_t stencil_pf, uint32_t samples);
 void MadeiraCtl(struct madeira_ctl_args *args);
 /* A command buffer whose error, on failure, lists each encoder's label and state
  * (MTLCommandBufferErrorOptionEncoderExecutionStatus). Autoreleased, like winemetal's. */
@@ -123,6 +128,7 @@ enum madeira_unix_func {
     madeira_unix_commandBufferErrorInfo,
     madeira_unix_commandBufferEnqueue,
     madeira_unix_blitB2T,
+    madeira_unix_newClearPipeline,
     madeira_unix_count,
 };
 
