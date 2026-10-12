@@ -77,7 +77,15 @@ static void d3d12_log(const char *fmt, ...) {
         if (len >= sizeof buf - 1) { buf[sizeof buf - 2] = '\n'; buf[sizeof buf - 1] = 0; }
         else { buf[len] = '\n'; buf[len + 1] = 0; }
     }
-    OutputDebugStringA(buf);
+    /* wine-lab port: OutputDebugStringA raises DBG_PRINTEXCEPTION_C, a full exception dispatch -- under Rosetta
+     * every one goes through the translator's single exception-server thread, which a sample of TLOU Part I found
+     * pegged at 100 % (42k log lines a session), stalling the game's threads behind it. Only a debugger reads it,
+     * so it is opt-in: MADEIRA_LOG_ODS=1 in the environment. __wine_dbg_output below writes the log. */
+    {
+        static int ods = -1;
+        if (ods < 0) { char v[4] = ""; ods = GetEnvironmentVariableA("MADEIRA_LOG_ODS", v, sizeof v) && v[0] == '1'; }
+        if (ods) OutputDebugStringA(buf);
+    }
     /* Wine's own debug output: an unbuffered write on the log's file
      * descriptor from unix ntdll, which reaches the log from EVERY process.
      * The engine launched from the desktop is a child of its launcher and has
