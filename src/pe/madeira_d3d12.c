@@ -3549,14 +3549,27 @@ static void exec_shadow_encode(struct mad_exec *e, const struct mad_shadow *s, U
         InterlockedExchangeAdd64(&g_shadow_refresh_bytes, (LONG64)(n * 12)); InterlockedExchangeAdd64(&g_shadow_sum_copied, (LONG64)(n * 12));
     }
 }
+/* wine-lab port: with fencepost (a Metal race detector) injected, declare each point where
+ * this runtime means "the next encoder follows everything before", so fencepost can check
+ * the fences encoded for it. One unix call per point, only when fencepost is loaded. */
+static int g_fencepost = -1;
+static void mad_fp_barrier(struct mad_exec *e)
+{
+    if (g_fencepost < 0) {
+        g_fencepost = madeira_fencepost(0);
+        if (g_fencepost) d3d12_log("[madeira-d3d12] fencepost is loaded: declaring barriers and list starts to it\n");
+    }
+    if (g_fencepost && e->cb) madeira_fencepost(e->cb);
+}
 static int exec_shadow_open(struct mad_exec *e) {   /* its own encoder, synced on both sides as after a barrier */
     exec_end(e);
     e->fence_needed = 1; e->f6_sync_needed = 1;
+    mad_fp_barrier(e);
     if (!exec_begin_blit(e)) return 0;
     InterlockedIncrement(&g_shadow_encoders);
     return 1;
 }
-static void exec_shadow_close(struct mad_exec *e) { exec_end(e); e->fence_needed = 1; e->f6_sync_needed = 1; }
+static void exec_shadow_close(struct mad_exec *e) { exec_end(e); e->fence_needed = 1; e->f6_sync_needed = 1; mad_fp_barrier(e); }
 /* List start: the shadows made since, whole. */
 static void exec_shadows_new(struct mad_exec *e) {
     struct mad_device *d = e->q->device;
@@ -6426,6 +6439,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
     e.mode = mad_fence_mode(q->device);          /* ml1136: fixed for the whole list */
     e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.st = st; e.l = l; e.cb = cb;
+    mad_fp_barrier(&e);                          /* wine-lab port: the list start is a sync point too (fencepost) */
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     if (st->carry_live) {   /* wine-lab port: pass-carry -- adopt the encoder the previous list left open */
         struct mad_exec *c = st->carry;
@@ -6523,7 +6537,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
                 for (bk = 0; bk < c->u.barrier.n && !hit; bk++) if (c->u.barrier.res[bk] == e.prect->u.clear.res) hit = 1;
                 if (hit) exec_prect_flush(&e);
             }
-            if (e.mode == 6) e.f6_sync_needed = 1;   /* wine-lab port: a clear the barrier flushes is post-barrier work too */
+            if (e.mode == 6) { e.f6_sync_needed = 1; mad_fp_barrier(&e); }   /* wine-lab port: a clear the barrier flushes is post-barrier work too */
             exec_barrier_flush_clears(&e, c);   /* wine-lab port: a cleared target leaving attachment use */
             if (e.mode == 6) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */

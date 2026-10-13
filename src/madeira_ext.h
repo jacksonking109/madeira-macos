@@ -108,6 +108,10 @@ void madeira_cb_enqueue(const obj_handle_t *cbs, unsigned n);
 obj_handle_t madeira_render_encoder_sampled(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index);
 obj_handle_t madeira_compute_encoder_sampled(obj_handle_t cmdbuf, int concurrent, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index);
 void madeira_render_set_store_actions(obj_handle_t encoder, const uint8_t color[8], uint8_t depth, uint8_t stencil);
+/* wine-lab port: fencepost (~/wine-lab/fencepost, a Metal race detector) when it is injected.
+ * cmdbuf 0 asks whether it is loaded (returns 1 if so); a command buffer declares a barrier
+ * at its current point: what was submitted before must be ordered before what follows. */
+int madeira_fencepost(obj_handle_t cmdbuf);
 void MadeiraIRConvert(struct madeira_ir_convert_args *args);
 #endif
 
@@ -135,6 +139,7 @@ enum madeira_unix_func {
     madeira_unix_renderEncoderSampled,
     madeira_unix_computeEncoderSampled,
     madeira_unix_renderSetStoreActions,
+    madeira_unix_fencepost,
     madeira_unix_count,
 };
 

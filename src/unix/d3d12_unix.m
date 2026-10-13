@@ -11,6 +11,7 @@
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -686,6 +687,20 @@ static NTSTATUS render_set_store_actions(void *args)
     return STATUS_SUCCESS;
 }
 
+/* wine-lab port: fencepost, a Metal race detector, when it is injected
+ * (DYLD_INSERT_LIBRARIES). a = 0: is it loaded (b = 1)? a = a command buffer: declare a
+ * barrier at its current point, which fencepost then checks the encoded fences against. */
+static NTSTATUS fencepost(void *args)
+{
+    static void (*barrier)(id);
+    static int looked;
+    struct madeira_unix_pair_params *p = args;
+    if (!looked) { barrier = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_barrier"); looked = 1; }
+    p->b = barrier != NULL;
+    if (barrier && p->a) barrier((id)p->a);
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_newPlacementHeap] = new_placement_heap,
     [madeira_unix_heapBufferSizeAndAlign] = heap_buffer_size_and_align,
@@ -709,6 +724,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_renderEncoderSampled] = render_encoder_sampled,
     [madeira_unix_computeEncoderSampled] = compute_encoder_sampled,
     [madeira_unix_renderSetStoreActions] = render_set_store_actions,
+    [madeira_unix_fencepost] = fencepost,
 };
 
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == madeira_unix_count,
