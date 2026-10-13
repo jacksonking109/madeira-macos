@@ -268,6 +268,10 @@ struct mad_device {
      * which was a GPU page fault that killed the whole queue. They now point
      * at 64 KB of zeros instead. */
     obj_handle_t null_buffer; UINT64 null_gpu;
+    /* wine-lab port: null texture SRVs read zeros from these 1x1 dummies, by view shape
+     * (2D/1D arrays, cube arrays, 3D) and channel type (float, uint, sint); each is
+     * zero-filled by a blit at the start of the first list after it is made. */
+    struct mad_resource *null_tex[3][3]; volatile LONG null_tex_unzeroed[3][3]; volatile LONG null_tex_pending;
     /* wine-lab port: ClearDepthStencilView with rects (exec_clear_ds_rects): vertex-only
      * pipelines by (depth format, stencil format, samples) and depth-stencil states by flags */
     struct { UINT32 dpf, spf, samples; obj_handle_t pso; } clr_pso[8]; unsigned nclr_pso; obj_handle_t clr_dsso[4];
@@ -552,7 +556,7 @@ static void mad_skip_at(LONG line) {
         }
     }
 }
-static LONG g_cb_errors, g_cb_retired, g_null_cbv_bound, g_vis_fallback;
+static LONG g_cb_errors, g_cb_retired, g_null_cbv_bound, g_vis_fallback, g_null_srv_views;
 /* ml1109: sync census -- what the game does per frame and how long it waits for us */
 static LONGLONG g_perf_ecl_ticks, g_perf_present_ticks;   /* ml1119 */
 static int g_async_submit;   /* ml1120: defined with the worker below */
@@ -593,7 +597,7 @@ static void mad_skip_report(void) {
     for (i = 0; i < 32 && g_skip_why[i].why; i++)
         d3d12_log("[madeira-d3d12] ml1049 bind failure x%ld: %s\n", g_skip_why[i].n, g_skip_why[i].why);
     d3d12_log("[madeira-d3d12] ml1049 command buffers: %ld retired, %ld ENDED IN ERROR; null CBVs bound to zeros %ld; "
-              "visibility fallbacks %ld\n", g_cb_retired, g_cb_errors, g_null_cbv_bound, g_vis_fallback);
+              "visibility fallbacks %ld; null SRVs on zero dummies %ld\n", g_cb_retired, g_cb_errors, g_null_cbv_bound, g_vis_fallback, g_null_srv_views);
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
               "resolved into GPU-only buffers: %ld copied, %ld answered visible; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
@@ -6106,6 +6110,7 @@ static void mad_carry_end(struct mad_stream *st) {
     InterlockedIncrement(&g_pass_end_list);
     exec_end(st->carry);
 }
+static void exec_null_tex_zero(struct mad_exec *e);   /* wine-lab port: null-SRV dummies */
 static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struct mad_list *l, obj_handle_t cb) {
     InterlockedIncrement((LONG *)&g_list_seq);
     struct mad_exec e;
@@ -6134,6 +6139,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
     l->ring_q = q; l->ring_batch = st->batch_no ? st->batch_no : q->batches + 1;   /* ml1061: the batch this replay belongs to */
     e.topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     if (q->device->shadow_pending) exec_shadows_new(&e);   /* wine-lab port: shadows made since the last list */
+    if (q->device->null_tex_pending) exec_null_tex_zero(&e);   /* wine-lab port: null-SRV dummies made since */
     LONG64 pr_list_t0 = mad_perf_replay_on() ? PR_NOW() : 0;   /* perf-replay */
     for (i = 0; i < l->ncmds; i++) {
         const struct mad_cmd *c = &l->cmds[i];
@@ -11023,13 +11029,102 @@ static UINT STDMETHODCALLTYPE device_GetDescriptorHandleIncrementSize(ID3D12Devi
 /* A texture descriptor. The encoding is the converter's
  * IRDescriptorTableSetTexture: the resource id in the second word, the min LOD
  * clamp in the low half of the third. */
+/* wine-lab port: D3D12 null SRVs. A view made with a NULL resource must read
+ * as zeros. It used to become texture handle 0, which Metal does not define:
+ * ROTTR's lighting pass read such a slot (t40) for its foliage and wrote NaN,
+ * which bloom spread into black rectangles over the jungle benchmark. */
+static int mad_fmt_int_kind(DXGI_FORMAT f) {   /* 0 float/unorm/snorm, 1 uint, 2 sint */
+    switch (f) {
+    case DXGI_FORMAT_R32G32B32A32_UINT: case DXGI_FORMAT_R32G32B32_UINT: case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R32G32_UINT: case DXGI_FORMAT_R10G10B10A2_UINT: case DXGI_FORMAT_R8G8B8A8_UINT:
+    case DXGI_FORMAT_R16G16_UINT: case DXGI_FORMAT_R32_UINT: case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R16_UINT:
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_X24_TYPELESS_G8_UINT: case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT: return 1;
+    case DXGI_FORMAT_R32G32B32A32_SINT: case DXGI_FORMAT_R32G32B32_SINT: case DXGI_FORMAT_R16G16B16A16_SINT:
+    case DXGI_FORMAT_R32G32_SINT: case DXGI_FORMAT_R8G8B8A8_SINT: case DXGI_FORMAT_R16G16_SINT: case DXGI_FORMAT_R32_SINT:
+    case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_R8_SINT: return 2;
+    default: return 0;
+    }
+}
+static struct mad_resource *mad_null_texture(struct mad_device *d, int shape, int kind) {
+    static const DXGI_FORMAT fmt[3] = { DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_SINT };
+    D3D12_RESOURCE_DESC rd;
+    struct mad_resource *r = d->null_tex[shape][kind];
+    void *out = NULL;
+    if (r) return r;
+    memset(&rd, 0, sizeof rd);
+    rd.Dimension = shape == 2 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = 1; rd.Height = 1; rd.DepthOrArraySize = shape == 1 ? 6 : 1; rd.MipLevels = 1;
+    rd.Format = fmt[kind]; rd.SampleDesc.Count = 1;
+    if (FAILED(mad_create_resource(d, D3D12_HEAP_TYPE_DEFAULT, &rd, &IID_ID3D12Resource, &out)) || !out) return NULL;
+    r = (struct mad_resource *)out; r->name = "NullSRV";
+    if (InterlockedCompareExchangePointer((void **)&d->null_tex[shape][kind], r, NULL) != NULL)
+        return d->null_tex[shape][kind];   /* another thread made it first; ours stays unused */
+    InterlockedExchange(&d->null_tex_unzeroed[shape][kind], 1);
+    InterlockedExchange(&d->null_tex_pending, 1);
+    d3d12_log("[madeira-d3d12] null SRVs (shape %d, kind %d) now read a zeroed 1x1 dummy\n", shape, kind);
+    return r;
+}
+/* List start: zero the dummies made since, with the 64 KB null buffer. */
+static int exec_shadow_open(struct mad_exec *e);
+static void exec_shadow_close(struct mad_exec *e);
+static void exec_null_tex_zero(struct mad_exec *e) {
+    struct mad_device *d = e->q->device;
+    int shape, kind, open = 0; UINT z;
+    if (!InterlockedExchange(&d->null_tex_pending, 0) || !d->null_buffer) return;
+    for (shape = 0; shape < 3; shape++) for (kind = 0; kind < 3; kind++) {
+        struct mad_resource *r = d->null_tex[shape][kind];
+        if (!r || !r->texture || !InterlockedExchange(&d->null_tex_unzeroed[shape][kind], 0)) continue;
+        if (!open && !(open = exec_shadow_open(e))) { InterlockedExchange(&d->null_tex_unzeroed[shape][kind], 1); InterlockedExchange(&d->null_tex_pending, 1); return; }
+        for (z = 0; z < (shape == 1 ? 6u : 1u); z++) {
+            struct wmtcmd_blit_copy_from_buffer_to_texture c;
+            memset(&c, 0, sizeof c);
+            c.type = WMTBlitCommandCopyFromBufferToTexture;
+            c.src = d->null_buffer; c.src_offset = 0; c.bytes_per_row = 16; c.bytes_per_image = 16;
+            c.size.width = 1; c.size.height = 1; c.size.depth = 1;
+            c.dst = r->texture; c.slice = z; c.level = 0;
+            MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&c);
+        }
+    }
+    if (open) exec_shadow_close(e);
+}
 static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This,
         ID3D12Resource *res, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc,
         D3D12_CPU_DESCRIPTOR_HANDLE h) {
     struct mad_resource *r = (struct mad_resource *)res;
     struct mad_descriptor *e = (struct mad_descriptor *)h.ptr;
     if (!e) return;
-    if (!r) { memset(e, 0, sizeof *e); return; }                                /* a null view */
+    if (!r) {   /* a null view: reads zeros (wine-lab port: was texture handle 0) */
+        struct mad_device *dv = (struct mad_device *)This;
+        memset(e, 0, sizeof *e);
+        if (!desc) return;
+        if (desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) { if (dv->null_gpu) mad_set_buffer_descriptor(e, dv->null_gpu, 65536); return; }
+        if (desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMS || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY ||
+            desc->ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE || desc->ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN) return;
+        {
+            int shape = desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D ? 2 :
+                        (desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE || desc->ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBEARRAY) ? 1 : 0;
+            int kind = mad_fmt_int_kind(desc->Format);
+            struct mad_resource *nt = mad_null_texture(dv, shape, kind);
+            D3D12_SHADER_RESOURCE_VIEW_DESC nd;
+            if (!nt) return;
+            memset(&nd, 0, sizeof nd);
+            nd.Format = nt->desc.Format; nd.ViewDimension = desc->ViewDimension;
+            nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            switch (desc->ViewDimension) {
+            case D3D12_SRV_DIMENSION_TEXTURE1D: case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+                nd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; nd.Texture2DArray.MipLevels = 1; nd.Texture2DArray.ArraySize = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE2D: nd.Texture2D.MipLevels = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: nd.Texture2DArray.MipLevels = 1; nd.Texture2DArray.ArraySize = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE3D: nd.Texture3D.MipLevels = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURECUBE: nd.TextureCube.MipLevels = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: nd.TextureCubeArray.MipLevels = 1; nd.TextureCubeArray.NumCubes = 1; break;
+            default: return;
+            }
+            device_CreateShaderResourceView(This, (ID3D12Resource *)nt, &nd, h);
+            InterlockedIncrement(&g_null_srv_views);
+        }
+        return;
+    }
     if (r->buffer) {
         UINT64 stride = 4, first = 0, num = r->size / 4;
         if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
@@ -12432,6 +12527,20 @@ static HRESULT mad_create_graphics_pso(ID3D12Device *This,
         free(LV);
         if (p->vs_fn) {
             snprintf(p->vs_name, sizeof p->vs_name, "%s", vsentry[0] ? vsentry : g_last_entry);
+            {   /* wine-lab port: madeira.cfg trace-layout = <vs name part>: the input layout as the game gave it */
+                static char want[128]; static int loaded; static unsigned said;
+                if (!loaded) { loaded = 1; mad_cfg_str_pe("trace-layout", want, sizeof want); }
+                if (want[0] && strstr(p->vs_name, want) && said < 64) {
+                    UINT k;
+                    said++;
+                    d3d12_log("[trace-layout] pso %p vs '%s': %u element(s)\n", (void *)p, p->vs_name, desc->InputLayout.NumElements);
+                    for (k = 0; k < desc->InputLayout.NumElements; k++) {
+                        const D3D12_INPUT_ELEMENT_DESC *el = &desc->InputLayout.pInputElementDescs[k];
+                        d3d12_log("[trace-layout]   %s%u fmt %u slot %u offset %d class %u step %u\n", el->SemanticName ? el->SemanticName : "?",
+                                  el->SemanticIndex, (unsigned)el->Format, el->InputSlot, (int)el->AlignedByteOffset, (unsigned)el->InputSlotClass, el->InstanceDataStepRate);
+                    }
+                }
+            }
             p->backend = air_vs.backend;
             if (air_vs.backend == MADEIRA_IR_BACKEND_AIRCONV) {   /* ml1011 */
                 static unsigned said_vs;
