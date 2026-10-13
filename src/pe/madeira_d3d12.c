@@ -183,7 +183,7 @@ static int g_occlusion_visible = -1;   /* ml1103: madeira.cfg occlusion-visible 
  * captured BEFORE they run (vertex/index buffers, indirect arguments, every
  * texture the pixel stage samples) and their resolved argument tables logged
  * range by range. Answers "bad source or bad composite" for one draw. */
-static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shots, g_dump_tables;   /* ml1152: a comma list */
+static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shots, g_dump_tables, g_capture_ps_max = 8;   /* ml1152: a comma list */
 /* ml1141: TARGETED DISPATCH CAPTURE, the compute twin of the above. madeira.cfg
  * capture-cs = <compute entry name> (capture-cs-indirect = 1 keeps only indirect
  * dispatches, capture-cs-max = N, default 12): during a CAP frame the first N
@@ -2336,6 +2336,26 @@ static void mad_capture_draw_inputs(struct mad_exec *e, const struct mad_cmd *c)
     if (e->ib) mad_capture_buffer(e, benc, e->ib, e->ib_off, 65536, "ib", 0, seq);
     if ((c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT) && c->u.ind.args)
         mad_capture_buffer(e, benc, c->u.ind.args, c->u.ind.off, 64, "iargs", 0, seq);
+    /* wine-lab port: the VERTEX stage's constant buffers and buffer views, as kinds vcb / vbuf
+     * (up to 64 KB: per-instance matrix arrays). ROTTR's grass builds its normal matrix there. */
+    for (k = 0; k < e->pso->nair; k++) {
+        const struct madeira_ir_air_range *rg = &e->pso->air[k]; struct mad_descriptor de; UINT64 direct = 0, va, boff = 0; const char *why = "?";
+        struct mad_resource *br;
+        if (rg->type != MADEIRA_IR_AIR_SRV && rg->type != MADEIRA_IR_AIR_CBV) continue;
+        if (rg->type == MADEIRA_IR_AIR_SRV && (rg->flags & MADEIRA_IR_AIR_F_TEXTURE)) continue;
+        if (!mad_air_resolve(e, e->rs, e->root, (const UINT32 (*)[64])e->consts, rg,
+                             (1u << MADEIRA_IR_VIS_ALL) | (1u << MADEIRA_IR_VIS_VERTEX), &de, &direct, &why)) {
+            d3d12_log("[capture-draw] VS %s%u: not resolved (%s)\n", rg->type == MADEIRA_IR_AIR_CBV ? "b" : "t", rg->lower_bound, why);
+            continue;
+        }
+        va = direct ? direct : de.gpu_va;
+        if (!va) { d3d12_log("[capture-draw] VS %s%u: address zero\n", rg->type == MADEIRA_IR_AIR_CBV ? "b" : "t", rg->lower_bound); continue; }
+        br = mad_resolve_address(e->q->device, va, &boff);
+        if (!br || !br->buffer) { d3d12_log("[capture-draw] VS %s%u va=0x%llx resolves to no live buffer\n", rg->type == MADEIRA_IR_AIR_CBV ? "b" : "t", rg->lower_bound, (unsigned long long)va); continue; }
+        d3d12_log("[capture-draw] VS %s%u <- va 0x%llx (+%llu in a %llu-byte buffer)\n", rg->type == MADEIRA_IR_AIR_CBV ? "b" : "t", rg->lower_bound,
+                  (unsigned long long)va, (unsigned long long)boff, (unsigned long long)br->size);
+        mad_capture_buffer(e, benc, br, boff, 65536, rg->type == MADEIRA_IR_AIR_CBV ? "vcb" : "vbuf", rg->lower_bound, seq);
+    }
     for (k = 0; k < e->pso->ps_nair; k++) {
         const struct madeira_ir_air_range *rg = &e->pso->ps_air[k]; struct mad_descriptor de; UINT64 direct = 0; const char *why = "?";
         struct mad_resource *r; int xv = -1;
@@ -5067,7 +5087,7 @@ static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
     PR_LAP(pr_t, PR_BEGIN);
     g_dump_tables = 0;
     if (g_capture_on && g_capture_ps[0] && ((e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name)) ||
-                                            (e->pso->vs_name[0] && strstr(g_capture_ps, e->pso->vs_name))) && g_capture_ps_shots < 8) {   /* wine-lab port: or its VS */   /* ml1106; ml1152: any listed ps, 8 shots */
+                                            (e->pso->vs_name[0] && strstr(g_capture_ps, e->pso->vs_name))) && g_capture_ps_shots < g_capture_ps_max) {   /* wine-lab port: or its VS; capture-ps-max */   /* ml1106; ml1152: any listed ps, 8 shots */
         g_capture_ps_shots++;
         mad_capture_draw_inputs(e, c);
         if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
@@ -12692,8 +12712,14 @@ static HRESULT mad_create_graphics_pso(ID3D12Device *This,
                 vd.attributes[ai].offset = off;
                 vd.attributes[ai].buffer_index = 6 + slot;
                 vd.attribute_mask |= 1u << ai;
-                vd.layouts[6 + slot].step_function = (el->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) ? 2 : 1;
-                vd.layouts[6 + slot].step_rate = el->InstanceDataStepRate ? el->InstanceDataStepRate : 1;
+                /* wine-lab port: per-instance with step rate 0 = every instance reads element 0:
+                 * Metal's constant step function (0), whose step rate must be 0. */
+                if (el->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA && !el->InstanceDataStepRate) {
+                    vd.layouts[6 + slot].step_function = 0; vd.layouts[6 + slot].step_rate = 0;
+                } else {
+                    vd.layouts[6 + slot].step_function = (el->InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) ? 2 : 1;
+                    vd.layouts[6 + slot].step_rate = el->InstanceDataStepRate ? el->InstanceDataStepRate : 1;
+                }
                 vd.layout_mask |= 1u << (6 + slot);
                 has_vd = 1;
                 break;
@@ -15730,7 +15756,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             {   /* ml1152: re-read every CAP, like capture-cs */
                 g_capture_ps_loaded = 1; mad_cfg_str_pe("capture-ps", g_capture_ps, sizeof g_capture_ps);
                 if (g_capture_ps[0]) d3d12_log("[capture] ml1106 targeted draw capture for ps='%s'\n", g_capture_ps); }
-            g_capture_ps_shots = 0;
+            g_capture_ps_shots = 0; g_capture_ps_max = (int)mad_cfg_int_pe("capture-ps-max", 8);   /* wine-lab port */
             {   /* ml1141: re-read every CAP, so the target can change between captures of one run */
                 mad_cfg_str_pe("capture-cs", g_capture_cs, sizeof g_capture_cs);
                 g_capture_cs_ind = mad_cfg_int_pe("capture-cs-indirect", 0) ? 1 : 0;

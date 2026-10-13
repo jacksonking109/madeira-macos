@@ -65,7 +65,13 @@ extern "C" int madeira_sm5_resolve_ia(const void *bc_in, size_t bclen,
         out[n].aligned_byte_offset = ie->offset;
         out[n].format = ie->attr_format;
         out[n].step_function = ie->per_instance ? 1u : 0u;
-        out[n].step_rate = ie->per_instance ? (ie->step_rate ? ie->step_rate : 1u) : 1u;
+        /* wine-lab port: per-instance step rate 0 means "never advance" (every
+         * instance reads element 0), which airconv implements as rate 0. It used
+         * to become 1: instance N read element N past the end of ROTTR's one-
+         * element grass UV buffer, the UV derivatives went to zero and the
+         * derivative-built tangent frame divided by zero -> NaN normals -> black
+         * rectangles through bloom in the benchmark's jungle. */
+        out[n].step_rate = ie->per_instance ? ie->step_rate : 1u;
         slot_mask |= 1u << ie->slot;
         reg_mask |= 1u << sig->Register;
         n++;
