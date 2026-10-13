@@ -6156,6 +6156,18 @@ static int mad_pass_carry_on(void) {
                   d3d12_log("[madeira-d3d12] pass-carry = %d (render passes %s command-list boundaries)\n", on, on ? "continue across" : "end at"); }
     return on;
 }
+/* wine-lab port: pass-carry in fence-chain mode 6 (f6-pass-carry, default 1).
+ * Mode 6 used to end every render pass at a list boundary. ROTTR records its
+ * draws 128 per command list, so each list stored and reloaded every target -
+ * ~5.9 GB of attachment traffic a frame, most of it its 16384x8192 shadow map.
+ * The carried encoder takes its mode-6 state along (its fence index, whether it
+ * synced, its attachments); the next NEW encoder of the list still syncs. */
+static int mad_f6_carry_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("f6-pass-carry", 1) ? 1 : 0;
+                  d3d12_log("[madeira-d3d12] f6-pass-carry = %d (mode-6 render passes %s command-list boundaries)\n", on, on ? "continue across" : "end at"); }
+    return on;
+}
 static void mad_carry_end(struct mad_stream *st) {
     if (!st || !st->carry_live) return;
     st->carry_live = 0;
@@ -6176,10 +6188,14 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     if (st->carry_live) {   /* wine-lab port: pass-carry -- adopt the encoder the previous list left open */
         struct mad_exec *c = st->carry;
-        if (c->cb != cb || c->mode != e.mode || e.mode == 6) mad_carry_end(st);
+        if (c->cb != cb || c->mode != e.mode || (e.mode == 6 && !mad_f6_carry_on())) mad_carry_end(st);
         else {
             st->carry_live = 0;
             e.renc = c->renc; e.renc_seq = c->renc_seq;
+            if (e.mode == 6) {   /* wine-lab port: the encoder's mode-6 state */
+                e.f6_cur = c->f6_cur; e.f6_enc_synced = c->f6_enc_synced; e.f7_open = c->f7_open;
+                memcpy(e.f6_att, c->f6_att, sizeof e.f6_att); e.f6_natt = c->f6_natt;
+            }
             memcpy(e.enc_rt, c->enc_rt, sizeof e.enc_rt); memcpy(e.enc_rtp, c->enc_rtp, sizeof e.enc_rtp);
             e.enc_nrt = c->enc_nrt; e.enc_depth = c->enc_depth; e.enc_dp = c->enc_dp; e.enc_w = c->enc_w; e.enc_h = c->enc_h;
             e.vis_prev = c->vis_prev; e.enc_vis_buf = c->enc_vis_buf; e.pass_draws = c->pass_draws;
@@ -6309,7 +6325,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
         exec_shadow_flush(&e);
     }
     if (st == &q->st) q->open_draws += e.draws;   /* wine-lab port: batch-draws */
-    if (e.renc && !e.npend && e.mode != 6 && mad_pass_carry_on() &&
+    if (e.renc && !e.npend && (e.mode != 6 || mad_f6_carry_on()) && mad_pass_carry_on() &&
         (st->carry || (st->carry = malloc(sizeof *st->carry)))) {   /* wine-lab port: pass-carry */
         memcpy(st->carry, &e, sizeof e);
         st->carry_live = 1;
