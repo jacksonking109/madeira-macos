@@ -105,6 +105,9 @@ obj_handle_t madeira_cb_with_error_info(obj_handle_t queue);
 /* [MTLCommandBuffer enqueue] for n buffers, in array order: reserves their places
  * in the queue's GPU order before any of them is encoded (parallel-encode). */
 void madeira_cb_enqueue(const obj_handle_t *cbs, unsigned n);
+obj_handle_t madeira_render_encoder_sampled(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index);
+obj_handle_t madeira_compute_encoder_sampled(obj_handle_t cmdbuf, int concurrent, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index);
+void madeira_render_set_store_actions(obj_handle_t encoder, const uint8_t color[8], uint8_t depth, uint8_t stencil);
 void MadeiraIRConvert(struct madeira_ir_convert_args *args);
 #endif
 
@@ -129,6 +132,9 @@ enum madeira_unix_func {
     madeira_unix_commandBufferEnqueue,
     madeira_unix_blitB2T,
     madeira_unix_newClearPipeline,
+    madeira_unix_renderEncoderSampled,
+    madeira_unix_computeEncoderSampled,
+    madeira_unix_renderSetStoreActions,
     madeira_unix_count,
 };
 
@@ -144,6 +150,27 @@ struct madeira_unix_heap_params {
 
 struct madeira_unix_pair_params {
     obj_handle_t a, b;
+};
+
+/* wine-lab port: an encoder whose pass samples GPU timestamps into sample_buffer
+ * at start_index (start of the vertex stage / of the compute pass) and end_index
+ * (end of the fragment stage / of the compute pass). info: a WMTRenderPassInfo
+ * for render; for compute, concurrent selects the dispatch type. */
+struct madeira_unix_sampled_encoder_params {
+    obj_handle_t cmdbuf;
+    uint64_t info;          /* struct WMTRenderPassInfo * (render) */
+    obj_handle_t sample_buffer;
+    uint32_t start_index, end_index;
+    uint32_t concurrent;    /* compute */
+    uint32_t pad;
+    obj_handle_t ret;
+};
+/* wine-lab port: store actions decided at the END of a render pass whose
+ * descriptor said MTLStoreActionUnknown (WMTStoreAction values; 0xff = leave). */
+struct madeira_unix_store_actions_params {
+    obj_handle_t encoder;
+    uint8_t color[8];
+    uint8_t depth, stencil, pad[6];
 };
 
 struct madeira_unix_pso_params {

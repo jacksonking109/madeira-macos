@@ -599,6 +599,93 @@ static NTSTATUS command_buffer_enqueue(void *args)
     return STATUS_SUCCESS;
 }
 
+/* wine-lab port: the render pass descriptor exactly as winemetal builds it
+ * (_MTLCommandBuffer_renderCommandEncoder), plus one timestamp sample buffer
+ * attachment: start of the vertex stage and end of the fragment stage, the
+ * stage boundaries Apple GPUs can sample. Autoreleased, like winemetal's. */
+static NTSTATUS render_encoder_sampled(void *args)
+{
+    struct madeira_unix_sampled_encoder_params *p = args;
+    struct WMTRenderPassInfo *info = (struct WMTRenderPassInfo *)(uintptr_t)p->info;
+    MTLRenderPassDescriptor *d = [[MTLRenderPassDescriptor alloc] init];
+    unsigned i;
+    for (i = 0; i < 8; i++) {
+        d.colorAttachments[i].clearColor = MTLClearColorMake(info->colors[i].clear_color.r, info->colors[i].clear_color.g,
+                                                             info->colors[i].clear_color.b, info->colors[i].clear_color.a);
+        d.colorAttachments[i].level = info->colors[i].level;
+        d.colorAttachments[i].slice = info->colors[i].slice;
+        d.colorAttachments[i].depthPlane = info->colors[i].depth_plane;
+        d.colorAttachments[i].texture = (id<MTLTexture>)info->colors[i].texture;
+        d.colorAttachments[i].loadAction = (MTLLoadAction)info->colors[i].load_action;
+        d.colorAttachments[i].storeAction = (MTLStoreAction)info->colors[i].store_action;
+        d.colorAttachments[i].resolveTexture = (id<MTLTexture>)info->colors[i].resolve_texture;
+        d.colorAttachments[i].resolveLevel = info->colors[i].resolve_level;
+        d.colorAttachments[i].resolveSlice = info->colors[i].resolve_slice;
+        d.colorAttachments[i].resolveDepthPlane = info->colors[i].resolve_depth_plane;
+    }
+    if (info->depth.texture) {
+        d.depthAttachment.clearDepth = info->depth.clear_depth;
+        d.depthAttachment.depthPlane = info->depth.depth_plane;
+        d.depthAttachment.level = info->depth.level;
+        d.depthAttachment.slice = info->depth.slice;
+        d.depthAttachment.texture = (id<MTLTexture>)info->depth.texture;
+        d.depthAttachment.loadAction = (MTLLoadAction)info->depth.load_action;
+        d.depthAttachment.storeAction = (MTLStoreAction)info->depth.store_action;
+    }
+    if (info->stencil.texture) {
+        d.stencilAttachment.clearStencil = info->stencil.clear_stencil;
+        d.stencilAttachment.depthPlane = info->stencil.depth_plane;
+        d.stencilAttachment.level = info->stencil.level;
+        d.stencilAttachment.slice = info->stencil.slice;
+        d.stencilAttachment.texture = (id<MTLTexture>)info->stencil.texture;
+        d.stencilAttachment.loadAction = (MTLLoadAction)info->stencil.load_action;
+        d.stencilAttachment.storeAction = (MTLStoreAction)info->stencil.store_action;
+    }
+    d.defaultRasterSampleCount = info->default_raster_sample_count;
+    d.renderTargetArrayLength = info->render_target_array_length;
+    d.renderTargetHeight = info->render_target_height;
+    d.renderTargetWidth = info->render_target_width;
+    d.visibilityResultBuffer = (id<MTLBuffer>)info->visibility_buffer;
+    if (info->tile_height && info->tile_width) { d.tileWidth = info->tile_width; d.tileHeight = info->tile_height; }
+    if (p->sample_buffer) {
+        MTLRenderPassSampleBufferAttachmentDescriptor *sa = d.sampleBufferAttachments[0];
+        sa.sampleBuffer = (id<MTLCounterSampleBuffer>)p->sample_buffer;
+        sa.startOfVertexSampleIndex = p->start_index;
+        sa.endOfVertexSampleIndex = MTLCounterDontSample;
+        sa.startOfFragmentSampleIndex = MTLCounterDontSample;
+        sa.endOfFragmentSampleIndex = p->end_index;
+    }
+    p->ret = (obj_handle_t)[(id<MTLCommandBuffer>)p->cmdbuf renderCommandEncoderWithDescriptor:d];
+    [d release];
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS compute_encoder_sampled(void *args)
+{
+    struct madeira_unix_sampled_encoder_params *p = args;
+    MTLComputePassDescriptor *d = [MTLComputePassDescriptor computePassDescriptor];
+    d.dispatchType = p->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;
+    if (p->sample_buffer) {
+        MTLComputePassSampleBufferAttachmentDescriptor *sa = d.sampleBufferAttachments[0];
+        sa.sampleBuffer = (id<MTLCounterSampleBuffer>)p->sample_buffer;
+        sa.startOfEncoderSampleIndex = p->start_index;
+        sa.endOfEncoderSampleIndex = p->end_index;
+    }
+    p->ret = (obj_handle_t)[(id<MTLCommandBuffer>)p->cmdbuf computeCommandEncoderWithDescriptor:d];
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS render_set_store_actions(void *args)
+{
+    struct madeira_unix_store_actions_params *p = args;
+    id<MTLRenderCommandEncoder> enc = (id<MTLRenderCommandEncoder>)p->encoder;
+    unsigned i;
+    for (i = 0; i < 8; i++) if (p->color[i] != 0xff) [enc setColorStoreAction:(MTLStoreAction)p->color[i] atIndex:i];
+    if (p->depth != 0xff) [enc setDepthStoreAction:(MTLStoreAction)p->depth];
+    if (p->stencil != 0xff) [enc setStencilStoreAction:(MTLStoreAction)p->stencil];
+    return STATUS_SUCCESS;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_newPlacementHeap] = new_placement_heap,
     [madeira_unix_heapBufferSizeAndAlign] = heap_buffer_size_and_align,
@@ -619,6 +706,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     [madeira_unix_commandBufferEnqueue] = command_buffer_enqueue,
     [madeira_unix_blitB2T] = blit_b2t,
     [madeira_unix_newClearPipeline] = new_clear_pipeline,
+    [madeira_unix_renderEncoderSampled] = render_encoder_sampled,
+    [madeira_unix_computeEncoderSampled] = compute_encoder_sampled,
+    [madeira_unix_renderSetStoreActions] = render_set_store_actions,
 };
 
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == madeira_unix_count,

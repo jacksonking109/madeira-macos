@@ -3,6 +3,7 @@
  * See src/madeira_ext.h.
  */
 #include <windows.h>
+#include <string.h>
 #include "wineunixlib.h"
 #include "madeira_ext.h"
 #include "madeira_ir_abi.h"
@@ -116,6 +117,32 @@ obj_handle_t madeira_cb_with_error_info(obj_handle_t queue)
     struct madeira_unix_pair_params p = { queue, 0 };
     CALL(commandBufferErrorInfo, &p);
     return p.b;
+}
+
+obj_handle_t madeira_render_encoder_sampled(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index)
+{
+    struct madeira_unix_sampled_encoder_params p;
+    memset(&p, 0, sizeof p);
+    p.cmdbuf = cmdbuf; p.info = P(info); p.sample_buffer = sample_buffer; p.start_index = start_index; p.end_index = end_index;
+    CALL(renderEncoderSampled, &p);
+    return p.ret;
+}
+
+obj_handle_t madeira_compute_encoder_sampled(obj_handle_t cmdbuf, int concurrent, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index)
+{
+    struct madeira_unix_sampled_encoder_params p;
+    memset(&p, 0, sizeof p);
+    p.cmdbuf = cmdbuf; p.sample_buffer = sample_buffer; p.start_index = start_index; p.end_index = end_index; p.concurrent = concurrent ? 1 : 0;
+    CALL(computeEncoderSampled, &p);
+    return p.ret;
+}
+
+void madeira_render_set_store_actions(obj_handle_t encoder, const uint8_t color[8], uint8_t depth, uint8_t stencil)
+{
+    struct madeira_unix_store_actions_params p;
+    memset(&p, 0, sizeof p);
+    p.encoder = encoder; memcpy(p.color, color, 8); p.depth = depth; p.stencil = stencil;
+    CALL(renderSetStoreActions, &p);
 }
 
 void madeira_cb_enqueue(const obj_handle_t *cbs, unsigned n)

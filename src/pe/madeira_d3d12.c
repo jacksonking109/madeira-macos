@@ -1686,6 +1686,7 @@ struct mad_exec {
     UINT64 vis_prev;            /* ml1088: the visibility slot the open encoder was last told to count into, ~0 = disabled */
     obj_handle_t enc_vis_buf;   /* ml1088: the slot chunk attached to the open encoder (a pass attribute) */
     unsigned pass_draws;        /* ml1098: draws encoded into the open render pass */
+    int renc_defer;             /* wine-lab port: the open render pass decides its store actions at its end */
     /* ml1134: fence-chain = 6 */
     int f6_sync_needed;         /* a ResourceBarrier (or the list start) since the last sync point */
     int f6_list_start;          /* the next sync also waits for the device fence (other queue, earlier batch) */
@@ -2189,6 +2190,159 @@ static void exec_bat_submit(struct mad_exec *e, struct wmtcmd_base *head) {
     }
     if (e->bat_used + MAD_BAT_SLACK > MAD_BAT_BYTES) exec_bat_flush(e);
 }
+/* ---- wine-lab port: per-pass GPU timing (madeira.cfg gpu-pass-profile = 1) ----
+ * Every render, compute, clear and resolve pass samples a GPU timestamp at its
+ * start and end (the stage boundaries Apple GPUs can sample) into a buffer per
+ * command buffer. When the command buffer has finished (mad_perf_cb), the
+ * samples become per-pass times, scaled by the command buffer's own GPU start
+ * and end, and are summed by pass name; the 5 s perf report lists the 25
+ * costliest names in ms per frame. */
+#define MAD_PROF_MAXP 512
+#define MAD_PROF_RECS 48
+struct mad_prof_rec { obj_handle_t cb, sb; unsigned n; char name[MAD_PROF_MAXP][64]; };
+static struct mad_prof_rec *g_prof_rec[MAD_PROF_RECS]; static obj_handle_t g_prof_sb_pool[MAD_PROF_RECS]; static unsigned g_prof_nsb;
+static SRWLOCK g_prof_lock = SRWLOCK_INIT; static int g_prof_on = -1;
+static struct { char name[64]; double ms; unsigned n; } g_prof_top[512]; static unsigned g_prof_ntop;
+static double g_prof_ns_sum, g_prof_tick_sum;
+static int mad_prof_enabled(void) {
+    if (g_prof_on < 0) { g_prof_on = mad_cfg_int_pe("gpu-pass-profile", 0) ? 1 : 0;
+                         if (g_prof_on) d3d12_log("[madeira-d3d12] gpu-pass-profile = 1: every pass is timed on the GPU; [perf] pass-top lines every 5 s\n"); }
+    return g_prof_on;
+}
+/* The record for cb (made on first use), and a slot in it; NULL when full. */
+static struct mad_prof_rec *mad_prof_slot(struct mad_device *d, obj_handle_t cb, unsigned *slot, const char *name) {
+    struct mad_prof_rec *r = NULL; unsigned i;
+    AcquireSRWLockExclusive(&g_prof_lock);
+    for (i = 0; i < MAD_PROF_RECS; i++) if (g_prof_rec[i] && g_prof_rec[i]->cb == cb) { r = g_prof_rec[i]; break; }
+    if (!r) {
+        for (i = 0; i < MAD_PROF_RECS && g_prof_rec[i]; i++) ;
+        if (i < MAD_PROF_RECS && (r = calloc(1, sizeof *r))) {
+            r->cb = cb;
+            r->sb = g_prof_nsb ? g_prof_sb_pool[--g_prof_nsb] : MTLCounterSampleBuffer_newTimestampBuffer(d->mtl_device, 2 * MAD_PROF_MAXP, true);
+            if (!r->sb) { free(r); r = NULL; } else g_prof_rec[i] = r;
+        }
+    }
+    if (r && r->n < MAD_PROF_MAXP) { *slot = r->n++; snprintf(r->name[*slot], sizeof r->name[0], "%s", name); }
+    else r = NULL;
+    ReleaseSRWLockExclusive(&g_prof_lock);
+    return r;
+}
+static obj_handle_t mad_prof_render(struct mad_exec *e, struct WMTRenderPassInfo *rpi, const char *name) {
+    struct mad_prof_rec *r; unsigned slot;
+    if (!mad_prof_enabled() || !(r = mad_prof_slot(e->q->device, e->cb, &slot, name))) return MTLCommandBuffer_renderCommandEncoder(e->cb, rpi);
+    return madeira_render_encoder_sampled(e->cb, rpi, r->sb, 2 * slot, 2 * slot + 1);
+}
+static obj_handle_t mad_prof_compute(struct mad_exec *e, const char *name) {
+    struct mad_prof_rec *r; unsigned slot;
+    if (!mad_prof_enabled() || !(r = mad_prof_slot(e->q->device, e->cb, &slot, name))) return MTLCommandBuffer_computeCommandEncoder(e->cb, false);
+    return madeira_compute_encoder_sampled(e->cb, 0, r->sb, 2 * slot, 2 * slot + 1);
+}
+/* cb has finished: its passes' times into the totals (gpu_s = its GPU time, from Metal). */
+static void mad_prof_retire(obj_handle_t cb, double gpu_s) {
+    struct mad_prof_rec *r = NULL; unsigned i, k; UINT64 *ts, lo = ~0ull, hi = 0; double scale;
+    if (g_prof_on <= 0) return;
+    AcquireSRWLockExclusive(&g_prof_lock);
+    for (i = 0; i < MAD_PROF_RECS; i++) if (g_prof_rec[i] && g_prof_rec[i]->cb == cb) { r = g_prof_rec[i]; g_prof_rec[i] = NULL; break; }
+    ReleaseSRWLockExclusive(&g_prof_lock);
+    if (!r) return;
+    if (r->n && (ts = malloc(16 * r->n))) {
+        MTLCounterSampleBuffer_resolveCounterRange(r->sb, 0, 2 * r->n, ts, 16 * (UINT64)r->n);
+        for (i = 0; i < 2 * r->n; i++) if (ts[i] && ts[i] != ~0ull) { if (ts[i] < lo) lo = ts[i]; if (ts[i] > hi) hi = ts[i]; }
+        AcquireSRWLockExclusive(&g_prof_lock);
+        if (hi > lo && gpu_s > 0) { g_prof_ns_sum += gpu_s * 1e9; g_prof_tick_sum += (double)(hi - lo); }
+        scale = 1.0;   /* Apple GPU timestamps are nanoseconds: the passes then sum to the measured GPU time. (The command-buffer calibration
+                        * above read 0.41, skewed by stale samples of passes with no vertex stage; it stays in the report as a check.) */
+        for (i = 0; i < r->n; i++) {
+            UINT64 a = ts[2 * i], b = ts[2 * i + 1];
+            if (!a || !b || a == ~0ull || b == ~0ull || b <= a) continue;
+            for (k = 0; k < g_prof_ntop; k++) if (!strcmp(g_prof_top[k].name, r->name[i])) break;
+            if (k == g_prof_ntop) { if (k == 512) continue; snprintf(g_prof_top[k].name, sizeof g_prof_top[k].name, "%s", r->name[i]); g_prof_top[k].ms = 0; g_prof_top[k].n = 0; g_prof_ntop++; }
+            g_prof_top[k].ms += (double)(b - a) * scale / 1e6; g_prof_top[k].n++;
+        }
+        ReleaseSRWLockExclusive(&g_prof_lock);
+        free(ts);
+    }
+    AcquireSRWLockExclusive(&g_prof_lock);
+    if (g_prof_nsb < MAD_PROF_RECS) g_prof_sb_pool[g_prof_nsb++] = r->sb; else NSObject_release(r->sb);
+    ReleaseSRWLockExclusive(&g_prof_lock);
+    free(r);
+}
+static void mad_prof_report(double frames) {
+    unsigned a, b, m; double total = 0;
+    if (g_prof_on <= 0 || frames <= 0) return;
+    AcquireSRWLockExclusive(&g_prof_lock);
+    for (a = 0; a < g_prof_ntop; a++) total += g_prof_top[a].ms;
+    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes can overlap; %.3f ns/tick)\n", total / frames, g_prof_ntop,
+              g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0);
+    for (a = 0; a < g_prof_ntop && a < 25; a++) {
+        for (m = a, b = a + 1; b < g_prof_ntop; b++) if (g_prof_top[b].ms > g_prof_top[m].ms) m = b;
+        if (m != a) { char t[sizeof g_prof_top[0]]; memcpy(t, &g_prof_top[a], sizeof t); memcpy(&g_prof_top[a], &g_prof_top[m], sizeof t); memcpy(&g_prof_top[m], t, sizeof t); }
+        d3d12_log("[perf] pass-top %2u: %6.2f ms/frame %5.1f%% in %5.1f passes/frame: %s\n", a + 1, g_prof_top[a].ms / frames,
+                  total > 0 ? 100.0 * g_prof_top[a].ms / total : 0.0, g_prof_top[a].n / frames, g_prof_top[a].name);
+    }
+    g_prof_ntop = 0;
+    ReleaseSRWLockExclusive(&g_prof_lock);
+}
+
+/* ---- wine-lab port: store actions decided at the end of a pass (madeira.cfg store-defer, default 1) ----
+ * A render target the list fully CLEARS next (the first later command that
+ * touches it, same mip and slice) does not need its tiles written back: about
+ * 1 GB a frame in ROTTR's benchmark. Anything else - including a pass carried
+ * into the next list, and every capture - stores. */
+static int g_store_defer = -1; static LONG64 g_store_skipped;
+static int mad_next_is_full_clear(const struct mad_exec *e, const struct mad_resource *r, const struct mad_rtvp *v, UINT need) {
+    const struct mad_list *l = e->l; unsigned j, k, lim; int rebound = 0;
+    if (!l || g_capture_on) return 0;
+    for (k = 0; k < e->npend; k++)   /* a clear already recorded, still pending: it is the next thing to happen to r */
+        if (e->pend[k].res == r && e->pend[k].v.level == v->level && e->pend[k].v.slice == v->slice && e->pend[k].v.layers >= v->layers)
+            return need ? (e->pend[k].flags & need) == need : 1;
+    lim = e->cur + 4096 < l->ncmds ? e->cur + 4096 : l->ncmds;
+    for (j = e->cur; j < lim; j++) {   /* from the CURRENT command: a clear ends the open pass before it is queued */
+        const struct mad_cmd *c = &l->cmds[j];
+        switch (c->kind) {
+        case MC_CLEAR_RT:
+            if (c->u.clear.res == r) return !need && c->u.clear.v.level == v->level && c->u.clear.v.slice == v->slice && c->u.clear.v.layers >= v->layers;
+            break;
+        case MC_CLEAR_DS:
+            if (c->u.clear.res == r) return need && !c->u.clear.nrect && (c->u.clear.flags & need) == need &&
+                                            c->u.clear.v.level == v->level && c->u.clear.v.slice == v->slice && c->u.clear.v.layers >= v->layers;
+            break;
+        case MC_RTS:
+            for (k = 0; k < c->u.rts.n; k++) if (c->u.rts.rt[k] == r) rebound = 1;
+            if (c->u.rts.depth == r) rebound = 1;
+            break;
+        case MC_DRAW: case MC_DRAW_INDEXED: case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT:
+        case MC_DISPATCH: case MC_DISPATCH_INDIRECT: case MC_RESOLVE: case MC_COPY_T2T: case MC_COPY_T2B: case MC_COPY_B2T:
+            if (rebound) return 0;
+            if ((c->kind == MC_COPY_T2T || c->kind == MC_RESOLVE) && (c->u.tt.src == r || c->u.tt.dst == r)) return 0;
+            if ((c->kind == MC_COPY_T2B || c->kind == MC_COPY_B2T) && c->u.bt.tex == r) return 0;
+            break;
+        case MC_BARRIER:
+            if (c->u.barrier.all) return 0;
+            for (k = 0; k < c->u.barrier.n; k++) if (c->u.barrier.res[k] == r) return 0;
+            break;
+        default: break;
+        }
+    }
+    return 0;
+}
+static void exec_store_actions(struct mad_exec *e) {
+    UINT8 col[8]; UINT8 dep = 0xff, sten = 0xff; unsigned k;
+    memset(col, 0xff, sizeof col);
+    for (k = 0; k < e->enc_nrt && k < 8; k++) if (e->enc_rt[k] && e->enc_rt[k]->texture) {
+        int skip = mad_next_is_full_clear(e, e->enc_rt[k], &e->enc_rtp[k], 0);
+        col[k] = skip ? WMTStoreActionDontCare : WMTStoreActionStore;
+        if (skip) InterlockedExchangeAdd64(&g_store_skipped, f7_att_bytes(e->enc_rt[k], e->enc_rtp[k].level));
+    }
+    if (e->enc_depth && e->enc_depth->texture) {
+        int skip = mad_next_is_full_clear(e, e->enc_depth, &e->enc_dp, D3D12_CLEAR_FLAG_DEPTH);
+        dep = skip ? WMTStoreActionDontCare : WMTStoreActionStore;
+        if (skip) InterlockedExchangeAdd64(&g_store_skipped, f7_att_bytes(e->enc_depth, e->enc_dp.level));
+        if (e->enc_depth->has_stencil)
+            sten = mad_next_is_full_clear(e, e->enc_depth, &e->enc_dp, D3D12_CLEAR_FLAG_STENCIL) ? WMTStoreActionDontCare : WMTStoreActionStore;
+    }
+    madeira_render_set_store_actions(e->renc, col, dep, sten);
+}
 static void exec_end_impl(struct mad_exec *e);
 static void exec_end(struct mad_exec *e) {
     LONG64 t0;
@@ -2208,6 +2362,7 @@ static void exec_end_impl(struct mad_exec *e) {
     e->f7_next_rts = 0;
     if (e->renc) {
         if (g_capture_on) { cn = e->enc_nrt; memcpy(crt, e->enc_rt, sizeof crt); memcpy(crtp, e->enc_rtp, sizeof crtp); cdepth = e->enc_depth; cdp = e->enc_dp; cseq = e->renc_seq; cdraws = e->pass_draws; }
+        if (e->renc_defer) { exec_store_actions(e); e->renc_defer = 0; }   /* wine-lab port: store-defer */
         MTLCommandEncoder_endEncoding(e->renc); e->renc = 0; e->enc_nrt = 0; e->enc_depth = NULL; e->enc_w = e->enc_h = 0;
         if (e->st->vis && e->st->vis->dirty) { e->st->vis->next++; e->st->vis->dirty = 0; }   /* ml1088: DXMT's endEncoder */
         e->vis_prev = ~(UINT64)0; e->enc_vis_buf = 0;
@@ -2827,7 +2982,7 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     rpi.render_target_height = e->pend[i].res->height >> e->pend[i].v.level;
     if (!rpi.render_target_width) rpi.render_target_width = 1; if (!rpi.render_target_height) rpi.render_target_height = 1;
     rpi.default_raster_sample_count = e->pend[i].res->samples ? e->pend[i].res->samples : 1;
-    enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+    enc = mad_prof_render(e, &rpi, "clear (flushed)"); if (enc) g_enc_seq++;   /* wine-lab port: timed */
     e->f6_att[0] = e->pend[i].res; e->f6_natt = 1;   /* ml1134 */
     if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }   /* ml1091: a clear pass writes its target; keep it in the chain */
     e->f6_natt = 0;
@@ -2875,6 +3030,7 @@ static obj_handle_t mad_clear_ds_dsso(struct mad_device *d, UINT8 flags) {
     LeaveCriticalSection(&d->heap_lock);
     return o;
 }
+static LONG g_ds_rect_inpass;   /* wine-lab port */
 static void exec_clear_ds_rects(struct mad_exec *e, const struct mad_cmd *c) {
     struct mad_device *d = e->q->device;
     struct mad_resource *r = c->u.clear.res;
@@ -2888,6 +3044,41 @@ static void exec_clear_ds_rects(struct mad_exec *e, const struct mad_cmd *c) {
     if (p >= 0) exec_flush_clear(e, p);   /* an earlier whole clear of the view lands first */
     pso = mad_clear_ds_pso(d, r); dsso = mad_clear_ds_dsso(d, c->u.clear.flags);
     if (!pso || !dsso) { MAD_SKIP(e); return; }
+    {   /* wine-lab port: ds-rect-inpass (default 1). The open pass is depth-only on this
+         * very view: draw the clear quads into it, in command order, instead of ending it
+         * and running a pass of their own. ROTTR clears one 2048x2048 tile of its
+         * 16384x8192 shadow atlas before each cascade; every such clear used to cost a
+         * whole-atlas load and store, twice (its own pass, and the pass after it). */
+        static int inpass = -1;
+        if (inpass < 0) { inpass = mad_cfg_int_pe("ds-rect-inpass", 1) ? 1 : 0;
+                          d3d12_log("[madeira-d3d12] ds-rect-inpass = %d (rect depth clears %s)\n", inpass, inpass ? "join an open depth-only pass on the same view" : "always run as a pass of their own"); }
+        if (inpass && e->renc && e->enc_depth == r && !e->enc_nrt && e->enc_dp.level == c->u.clear.v.level &&
+            e->enc_dp.slice == c->u.clear.v.slice && c->u.clear.v.layers <= 1 && e->enc_dp.layers <= 1) {
+            struct wmtcmd_render_setpso c_pso; struct wmtcmd_render_setdsso c_ds;
+            struct wmtcmd_render_setviewport c_vp; struct wmtcmd_render_setscissorrect c_sc; struct wmtcmd_render_draw c_dr;
+            lw = r->width >> c->u.clear.v.level; lh = r->height >> c->u.clear.v.level; if (!lw) lw = 1; if (!lh) lh = 1;
+            exec_bat_flush(e);   /* the draws before the clear go first */
+            memset(&c_pso, 0, sizeof c_pso); c_pso.type = WMTRenderCommandSetPSO; c_pso.pso = pso;
+            memset(&c_ds, 0, sizeof c_ds); c_ds.type = WMTRenderCommandSetDSSO; c_ds.dsso = dsso; c_ds.stencil_ref = c->u.clear.stencil;
+            c_pso.next.ptr = &c_ds;
+            MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_pso);
+            for (i = 0; i < n; i++) {
+                memset(&c_vp, 0, sizeof c_vp); c_vp.type = WMTRenderCommandSetViewport;
+                c_vp.viewport.width = lw; c_vp.viewport.height = lh;
+                c_vp.viewport.znear = c->u.clear.depth; c_vp.viewport.zfar = c->u.clear.depth;
+                memset(&c_sc, 0, sizeof c_sc); c_sc.type = WMTRenderCommandSetScissorRect;
+                c_sc.scissor_rect.x = rc[4 * i]; c_sc.scissor_rect.y = rc[4 * i + 1];
+                c_sc.scissor_rect.width = rc[4 * i + 2]; c_sc.scissor_rect.height = rc[4 * i + 3];
+                memset(&c_dr, 0, sizeof c_dr); c_dr.type = WMTRenderCommandDraw;
+                c_dr.primitive_type = WMTPrimitiveTypeTriangle; c_dr.vertex_count = 3; c_dr.instance_count = 1;
+                c_vp.next.ptr = &c_sc; c_sc.next.ptr = &c_dr;
+                MTLRenderCommandEncoder_encodeCommands(e->renc, (const struct wmtcmd_base *)&c_vp);
+            }
+            memset(&e->sh, 0, sizeof e->sh);   /* pipeline, depth state, viewport and scissor all changed: the next draw re-sends them */
+            InterlockedIncrement(&g_ds_rect_inpass);
+            return;
+        }
+    }
     if (e->renc) InterlockedIncrement(&g_pass_end_clear);
     exec_end(e);
     lw = r->width >> c->u.clear.v.level; lh = r->height >> c->u.clear.v.level; if (!lw) lw = 1; if (!lh) lh = 1;
@@ -2909,7 +3100,7 @@ static void exec_clear_ds_rects(struct mad_exec *e, const struct mad_cmd *c) {
         }
         rpi.render_target_width = lw; rpi.render_target_height = lh;
         rpi.default_raster_sample_count = r->samples ? r->samples : 1;
-        enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+        enc = mad_prof_render(e, &rpi, "clear (depth-stencil rects)"); if (enc) g_enc_seq++;
         if (!enc) { MAD_SKIP(e); return; }
         e->f6_att[0] = r; e->f6_natt = 1;
         exec_fence_render(e, enc, 0);
@@ -3143,8 +3334,20 @@ static int exec_begin_render_impl(struct mad_exec *e) {
         if (e->depth && e->depth->texture)
             InterlockedExchangeAdd64(rpi.depth.load_action == WMTLoadActionClear ? &g_ac_clear : &g_ac_load, f7_att_bytes(e->depth, e->dp.level));
     }
+    if (g_store_defer < 0) { g_store_defer = mad_cfg_int_pe("store-defer", 1) ? 1 : 0;
+                             d3d12_log("[madeira-d3d12] store-defer = %d (%s)\n", g_store_defer, g_store_defer ? "a render target cleared next is not written back" : "every render target is stored"); }
+    e->renc_defer = g_store_defer && !g_capture_on;   /* wine-lab port: decided at the end of the pass */
+    if (e->renc_defer) {
+        for (i = 0; i < 8; i++) if (rpi.colors[i].texture) rpi.colors[i].store_action = WMTStoreActionUnknown;
+        if (rpi.depth.texture) rpi.depth.store_action = WMTStoreActionUnknown;
+        if (rpi.stencil.texture) rpi.stencil.store_action = WMTStoreActionUnknown;
+    }
     LONG64 px0 = PR_NOW();
-    e->renc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (e->renc) e->renc_seq = ++g_enc_seq;
+    {   /* wine-lab port: gpu-pass-profile names the pass by its first pipeline */
+        char pn[64];
+        snprintf(pn, sizeof pn, "R %s|%s %ux%u", e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);
+        e->renc = mad_prof_render(e, &rpi, pn); if (e->renc) e->renc_seq = ++g_enc_seq;
+    }
     if (g_perf_replay > 0) { g_pr_x[0] += PR_NOW() - px0; g_pr_x[1]++; }
     memset(&e->sh, 0, sizeof e->sh);   /* wine-lab port: a new encoder knows nothing */
     if (g_enc_labels) mad_label(e->renc, "R#%u %s|%s %ux%u", e->renc_seq, e->pso ? e->pso->vs_name : "-", e->pso ? e->pso->ps_name : "-", w, h);   /* ml1142 */
@@ -5972,7 +6175,7 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     if (direct) { rpi.colors[0].resolve_level = dlevel; rpi.colors[0].resolve_slice = dslice; }
     rpi.render_target_width = w; rpi.render_target_height = h;
     rpi.default_raster_sample_count = src->samples;
-    enc = MTLCommandBuffer_renderCommandEncoder(e->cb, &rpi); if (enc) g_enc_seq++;
+    enc = mad_prof_render(e, &rpi, "resolve"); if (enc) g_enc_seq++;
     e->f6_att[0] = src; e->f6_att[1] = dst; e->f6_natt = 2;
     if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }
     e->f6_natt = 0;
@@ -6030,7 +6233,10 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     if (!e->cenc) {
         if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
         exec_end(e);
-        e->cenc = MTLCommandBuffer_computeCommandEncoder(e->cb, false); if (e->cenc) g_enc_seq++;
+        {   /* wine-lab port: gpu-pass-profile */
+            char pn[64]; snprintf(pn, sizeof pn, "C %s", e->cpso->vs_name);
+            e->cenc = mad_prof_compute(e, pn); if (e->cenc) g_enc_seq++;
+        }
         if (g_enc_labels) mad_label(e->cenc, "C#%u %s", g_enc_seq, e->cpso->vs_name);   /* ml1142 */
         if (!e->cenc) { d3d12_log("[madeira-d3d12] no compute encoder\n"); MAD_SKIP(e); return; }
         exec_fence_compute(e, e->cenc, 0);   /* ml1091 */
@@ -6191,7 +6397,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
         if (c->cb != cb || c->mode != e.mode || (e.mode == 6 && !mad_f6_carry_on())) mad_carry_end(st);
         else {
             st->carry_live = 0;
-            e.renc = c->renc; e.renc_seq = c->renc_seq;
+            e.renc = c->renc; e.renc_seq = c->renc_seq; e.renc_defer = c->renc_defer;   /* wine-lab port: store-defer */
             if (e.mode == 6) {   /* wine-lab port: the encoder's mode-6 state */
                 e.f6_cur = c->f6_cur; e.f6_enc_synced = c->f6_enc_synced; e.f7_open = c->f7_open;
                 memcpy(e.f6_att, c->f6_att, sizeof e.f6_att); e.f6_natt = c->f6_natt;
@@ -6838,6 +7044,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
         double s0 = t.start, e0 = t.end;
         g_perf_gpu_sum += e0 - s0;
         if (g_flight > 0) mad_perf_charge(cb, e0 - s0);   /* wine-lab port */
+        mad_perf_unlock(); mad_prof_retire(cb, e0 - s0); mad_perf_lock();   /* wine-lab port: gpu-pass-profile */
         if (!g_perf_first_start) g_perf_first_start = s0;
         if (s0 < g_perf_last_end) s0 = g_perf_last_end;
         if (e0 > s0) g_perf_gpu_union += e0 - s0;
@@ -6858,6 +7065,11 @@ static void mad_perf_present(void) {
                   wall, g_perf_presents, g_perf_presents / wall, g_perf_cbs, g_perf_gpu_union * 1000, 100.0 * g_perf_gpu_union / wall,
                   g_perf_gpu_sum * 1000, g_perf_wait_s * 1000, 100.0 * g_perf_wait_s / wall,
                   g_perf_presents ? g_perf_gpu_union * 1000 / g_perf_presents : 0.0, g_perf_presents ? g_perf_wait_s * 1000 / g_perf_presents : 0.0);
+        if (g_perf_presents) {   /* wine-lab port: store-defer and gpu-pass-profile */
+            LONG64 sk = InterlockedExchange64(&g_store_skipped, 0);
+            if (g_store_defer > 0) d3d12_log("[perf] store-defer: %.1f MB/frame of render-target stores skipped (cleared next)\n", (double)sk / 1048576.0 / g_perf_presents);
+            mad_prof_report((double)g_perf_presents);
+        }
         if (g_perf_ntop && g_perf_presents) {   /* wine-lab port: costliest command buffers by their first pass */
             unsigned a, b, m;
             for (a = 0; a < g_perf_ntop && a < 12; a++) {
