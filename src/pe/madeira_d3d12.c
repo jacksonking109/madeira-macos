@@ -354,6 +354,7 @@ static LONG g_srv_clamped; static float g_srv_clamp_max;   /* ml1089 */
 static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
 static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */
+static LONG g_f6_root_waits; static int g_f6_root_wait = -1;   /* wine-lab port */
 /* ml1137: GPU census, counts only. Barrier entries by the states they move
  * between, and what a state-aware wait rule would have needed at each
  * barrier-caused sync of mode 6; attachment bytes loaded / cleared / stored in
@@ -1488,6 +1489,7 @@ struct mad_stream {
      * yet, with the attachments each one wrote. */
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend f6_pend[40]; unsigned f6_npend;
+    unsigned f6_root; int f6_root_valid;   /* wine-lab port: the last sync point's fence, which every later encoder waits for */
     /* wine-lab port: the render pass the previous list of this replay left open
      * (pass-carry), see mad_exec_list. */
     struct mad_exec *carry; int carry_live;
@@ -1882,6 +1884,12 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
         InterlockedExchangeAdd64(&g_f7_fw6, np); InterlockedExchangeAdd64(&g_f7_fwr, rw);
     }
     if (need) { e->f7_mask = 0; e->f7_all = 0; e->f7_open = 0; e->f7_reason = 0; }
+    e->f6_cur = st->f6_next++ & 63;
+    if (g_f6_root_wait < 0) {
+        g_f6_root_wait = mad_cfg_int_pe("f6-root-wait", 1) ? 1 : 0;
+        d3d12_log("[madeira-d3d12] f6-root-wait = %d (%s)\n", g_f6_root_wait,
+                  g_f6_root_wait ? "every encoder waits for the last sync point" : "OLD: encoders after a sync point wait for nothing");
+    }
     if (need) {
         if (e->f6_list_start && q->device->enc_fence) waits[nw++] = q->device->enc_fence;
         for (i = 0; i < st->f6_npend; i++) waits[nw++] = f6_fence(q, st, st->f6_pend[i].idx);
@@ -1889,8 +1897,24 @@ static void f6_begin(struct mad_exec *e, int kind, obj_handle_t enc) {
         InterlockedExchangeAdd(&g_fence_waits, (LONG)nw);
         st->f6_npend = 0; e->f6_sync_needed = 0; e->f6_list_start = 0; e->f6_enc_synced = 1;
         InterlockedIncrement(&g_f6_synced);
-    } else e->f6_enc_synced = 0;
-    e->f6_cur = st->f6_next++ & 63;
+        st->f6_root = e->f6_cur; st->f6_root_valid = 1;   /* wine-lab port: this encoder is the new sync point */
+    } else {
+        /* wine-lab port: D3D12 orders EVERY command after a barrier behind the
+         * work before it, not just the first encoder. The sync point waited for
+         * that work and emptied the pending set, so an encoder begun after it
+         * with no new barrier used to wait for nothing - not even the sync
+         * point - and could run alongside the pre-barrier producers (ROTTR's
+         * benchmark: garbage depth-prepass geometry, exposure flashes; worse
+         * with every extra encoder boundary, invisible in captures). Waiting for
+         * the sync point covers everything before it; encoders between two
+         * barriers still overlap each other. */
+        if (g_f6_root_wait && st->f6_root_valid) {
+            obj_handle_t root = f6_fence(q, st, st->f6_root);
+            f6_encode(enc, kind, &root, 1, 0);
+            InterlockedIncrement(&g_f6_root_waits);
+        }
+        e->f6_enc_synced = 0;
+    }
 }
 static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
     struct mad_queue *q = e->q; struct mad_stream *st = e->st;
@@ -1912,10 +1936,18 @@ static void f6_join(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb)
     dfence = mad_enc_fence_obj(q->device);
     benc = MTLCommandBuffer_blitCommandEncoder(cb);
     if (!benc) return;
-    for (i = 0; i < st->f6_npend; i++) waits[nw++] = f6_fence(q, st, st->f6_pend[i].idx);
+    /* wine-lab port: and for the device fence's previous update. Each queue's
+     * join used to wait only for its own stream's encoders, so when the compute
+     * queue's join was the latest update, "the device fence passed" no longer
+     * covered the graphics queue's previous batch: the next graphics list
+     * overlapped it (ROTTR's benchmark: flashing garbage triangles, exposure
+     * flashes). Chained, the fence again means "every earlier batch, on any
+     * queue, finished". */
+    if (dfence) waits[nw++] = dfence;
+    for (i = 0; i < st->f6_npend && nw < 47; i++) waits[nw++] = f6_fence(q, st, st->f6_pend[i].idx);
     f6_encode(benc, F6_BLIT, waits, nw, dfence);
     MTLCommandEncoder_endEncoding(benc);
-    st->f6_npend = 0;
+    st->f6_npend = 0; st->f6_root_valid = 0;   /* wine-lab port: the next list syncs on the device fence */
     InterlockedIncrement(&g_f6_joins);
 }
 /* ml1136: a list in another mode that follows mode-6 lists first waits for the
@@ -1927,7 +1959,7 @@ static void f6_drain(struct mad_exec *e, int kind, obj_handle_t enc) {
     if (!st->f6_npend) return;
     for (i = 0; i < st->f6_npend; i++) waits[n++] = f6_fence(q, st, st->f6_pend[i].idx);
     f6_encode(enc, kind, waits, n, 0);
-    st->f6_npend = 0;
+    st->f6_npend = 0; st->f6_root_valid = 0;   /* wine-lab port */
 }
 /* ml1137: what a STATE-AWARE rule would require for this barrier batch, against
  * the encoders pending now and the one still open (counted, not applied):
@@ -6222,6 +6254,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
             if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
                                         d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
+            if (e.mode == 6) e.f6_sync_needed = 1;   /* wine-lab port: a clear the barrier flushes is post-barrier work too */
             exec_barrier_flush_clears(&e, c);   /* wine-lab port: a cleared target leaving attachment use */
             if (e.mode == 6) {   /* ml1134: see f6_begin */
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
@@ -6850,8 +6883,9 @@ static void mad_perf_present(void) {
                 LONG b = InterlockedExchange(&g_f6_begins, 0), sy = InterlockedExchange(&g_f6_synced, 0), at = InterlockedExchange(&g_f6_att_sync, 0);
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
-                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins\n",
-                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np);
+                          "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; "
+                          "%.1f waited for the last sync point\n",
+                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, InterlockedExchange(&g_f6_root_waits, 0) / np);
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;
