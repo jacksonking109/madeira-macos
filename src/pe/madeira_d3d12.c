@@ -1687,6 +1687,7 @@ struct mad_exec {
     obj_handle_t enc_vis_buf;   /* ml1088: the slot chunk attached to the open encoder (a pass attribute) */
     unsigned pass_draws;        /* ml1098: draws encoded into the open render pass */
     int renc_defer;             /* wine-lab port: the open render pass decides its store actions at its end */
+    const struct mad_cmd *prect; /* wine-lab port: a rect depth clear held for the next pass on its view */
     /* ml1134: fence-chain = 6 */
     int f6_sync_needed;         /* a ResourceBarrier (or the list start) since the last sync point */
     int f6_list_start;          /* the next sync also waits for the device fence (other queue, earlier batch) */
@@ -3144,6 +3145,7 @@ static void exec_barrier_flush_clears(struct mad_exec *e, const struct mad_cmd *
     }
 }
 
+static void exec_prect_flush(struct mad_exec *e);   /* wine-lab port: ds-rect-defer */
 static void exec_add_clear(struct mad_exec *e, struct mad_resource *r, const struct mad_rtvp *v, const float *rgba, float depth, int is_depth, UINT8 stencil, UINT8 flags) {
     int i;
     if (!r) return;
@@ -3151,6 +3153,7 @@ static void exec_add_clear(struct mad_exec *e, struct mad_resource *r, const str
         d3d12_log("[capture] clear %s %ux%u id %06x level %u slice %u: %s %g %g %g %g\n", r->name ? r->name : "?", r->width, r->height,
                   (unsigned)(((ULONG_PTR)r >> 4) & 0xffffff), v->level, v->slice, is_depth ? "depth/stencil" : "rgba",
                   is_depth ? depth : rgba[0], is_depth ? (double)stencil : rgba[1], is_depth ? (double)flags : rgba[2], is_depth ? 0.0 : rgba[3]);
+    if (e->prect && e->prect->u.clear.res == r) exec_prect_flush(e);   /* wine-lab port: a held rect clear of r lands first */
     /* A clear ends the pass in progress so the next one can load it as a
      * clear; a clear mid-pass would otherwise be lost. */
     if (e->renc) { InterlockedIncrement(&g_pass_end_clear); exec_end(e); }
@@ -3242,6 +3245,30 @@ static void mad_label(obj_handle_t enc, const char *fmt, ...) {
     str = NSString_alloc_init(s, WMTUTF8StringEncoding);
     if (str) { MTLCommandEncoder_setLabel(enc, str); NSObject_release(str); }
 }
+/* wine-lab port: ds-rect-defer (default 1). A rect depth clear that finds no
+ * open depth-only pass on its view is held, and the next pass that renders
+ * exactly that view (depth only) draws its quads first. Anything else that
+ * touches the target first - a pass binding it otherwise, a barrier naming it
+ * or every resource, the end of the list - runs it as its own pass, as before. */
+static void exec_clear_ds_rects(struct mad_exec *e, const struct mad_cmd *c);
+static int g_prect_defer = -1; static LONG g_prect_joined;
+static void exec_prect_flush(struct mad_exec *e) {
+    const struct mad_cmd *c = e->prect;
+    if (!c) return;
+    e->prect = NULL;
+    exec_clear_ds_rects(e, c);
+}
+static int exec_prect_fits(const struct mad_exec *e) {
+    const struct mad_cmd *c = e->prect;
+    return c && e->depth == c->u.clear.res && !e->nrt && e->dp.level == c->u.clear.v.level && e->dp.slice == c->u.clear.v.slice &&
+           c->u.clear.v.layers <= 1 && e->dp.layers <= 1;
+}
+static int exec_binds(const struct mad_exec *e, const struct mad_resource *r) {
+    unsigned k;
+    if (e->depth == r) return 1;
+    for (k = 0; k < e->nrt; k++) if (e->rt[k] == r) return 1;
+    return 0;
+}
 static int exec_begin_render_impl(struct mad_exec *e);
 static int exec_begin_render(struct mad_exec *e) {
     LONG64 t0; int r;
@@ -3259,6 +3286,7 @@ static int exec_begin_render_impl(struct mad_exec *e) {
     if (e->renc) InterlockedIncrement(&g_pass_end_rts);
     e->f7_next_rts = 1;   /* ml1137: the pass being closed hands over to the targets bound now */
     exec_end(e);
+    if (e->prect && !exec_prect_fits(e) && exec_binds(e, e->prect->u.clear.res)) exec_prect_flush(e);   /* wine-lab port */
     /* ml934: a render pass with NO colour target AND no depth is legal in
      * D3D12, and it is exactly what Nanite's hardware rasteriser uses: it
      * rasterises into UAVs -- the 64-bit-atomic visibility buffer -- and binds
@@ -3375,6 +3403,12 @@ static int exec_begin_render_impl(struct mad_exec *e) {
     e->pass_draws = 0;   /* ml1098 */
     e->enc_w = w; e->enc_h = h;
     memcpy(e->enc_rtp, e->rtp, sizeof e->rtp); e->enc_dp = e->dp;   /* ml925 */
+    if (e->prect && exec_prect_fits(e)) {   /* wine-lab port: the held rect clear draws first in this pass */
+        const struct mad_cmd *c = e->prect;
+        e->prect = NULL;
+        exec_clear_ds_rects(e, c);   /* takes its in-pass path: this pass is depth-only on its view */
+        InterlockedIncrement(&g_prect_joined);
+    }
     return 1;
 }
 
@@ -6463,7 +6497,14 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
             break;
         case MC_CLEAR_RT: exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, c->u.clear.rgba, 0.0f, 0, 0, 0); break;
         case MC_CLEAR_DS:
-            if (c->u.clear.nrect) exec_clear_ds_rects(&e, c);   /* wine-lab port */
+            if (c->u.clear.nrect) {   /* wine-lab port */
+                if (g_prect_defer < 0) { g_prect_defer = mad_cfg_int_pe("ds-rect-defer", 1) ? 1 : 0;
+                                         d3d12_log("[madeira-d3d12] ds-rect-defer = %d\n", g_prect_defer); }
+                if (g_prect_defer && !(e.renc && e.enc_depth == c->u.clear.res && !e.enc_nrt) && exec_pending_index(&e, c->u.clear.res, &c->u.clear.v) < 0) {
+                    exec_prect_flush(&e);   /* one held at a time */
+                    e.prect = c;
+                } else exec_clear_ds_rects(&e, c);
+            }
             else exec_add_clear(&e, c->u.clear.res, &c->u.clear.v, NULL, c->u.clear.depth, 1, c->u.clear.stencil, c->u.clear.flags);
             break;
         case MC_ROOTSIG: e.rs = c->u.rootsig; break;
@@ -6476,6 +6517,11 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
             if (g_barrier_render < 0) { g_barrier_render = mad_cfg_int_pe("barrier-render", 0) ? 1 : 0;
                                         d3d12_log("[madeira-d3d12] ml1098 barrier-render = %d (render passes %s at ResourceBarrier)\n", g_barrier_render, g_barrier_render ? "CLOSED" : "left open"); }
             InterlockedIncrement(&g_barrier_seen);   /* ml1116 */
+            if (e.prect) {   /* wine-lab port: ds-rect-defer - the held clear lands before anything the barrier releases */
+                unsigned bk; int hit = c->u.barrier.all;
+                for (bk = 0; bk < c->u.barrier.n && !hit; bk++) if (c->u.barrier.res[bk] == e.prect->u.clear.res) hit = 1;
+                if (hit) exec_prect_flush(&e);
+            }
             if (e.mode == 6) e.f6_sync_needed = 1;   /* wine-lab port: a clear the barrier flushes is post-barrier work too */
             exec_barrier_flush_clears(&e, c);   /* wine-lab port: a cleared target leaving attachment use */
             if (e.mode == 6) {   /* ml1134: see f6_begin */
@@ -6531,6 +6577,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
         exec_shadow_flush(&e);
     }
     if (st == &q->st) q->open_draws += e.draws;   /* wine-lab port: batch-draws */
+    if (e.prect) exec_prect_flush(&e);   /* wine-lab port: ds-rect-defer - never past the end of its list */
     if (e.renc && !e.npend && (e.mode != 6 || mad_f6_carry_on()) && mad_pass_carry_on() &&
         (st->carry || (st->carry = malloc(sizeof *st->carry)))) {   /* wine-lab port: pass-carry */
         memcpy(st->carry, &e, sizeof e);
