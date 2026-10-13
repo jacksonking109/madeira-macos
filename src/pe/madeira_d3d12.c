@@ -7840,6 +7840,17 @@ static HRESULT STDMETHODCALLTYPE device_CreateFence(ID3D12Device *This, UINT64 i
 }
 
 static UINT STDMETHODCALLTYPE device_GetNodeCount(ID3D12Device *This) { (void)This; return 1; }
+/* wine-lab port: residency. Unified memory keeps every resource resident, so
+ * MakeResident and Evict succeed and do nothing (vkd3d does the same). The
+ * E_NOTIMPL stubs told Rise of the Tomb Raider's streamer that paging failed. */
+static HRESULT STDMETHODCALLTYPE device_MakeResident(ID3D12Device *This, UINT n, ID3D12Pageable *const *objs) {
+    (void)This;
+    return (n && !objs) ? E_INVALIDARG : S_OK;
+}
+static HRESULT STDMETHODCALLTYPE device_Evict(ID3D12Device *This, UINT n, ID3D12Pageable *const *objs) {
+    (void)This;
+    return (n && !objs) ? E_INVALIDARG : S_OK;
+}
 
 /* ---- command signature ---------------------------------------------------
  * The layout of an ExecuteIndirect argument record. The object only has to
@@ -14901,6 +14912,8 @@ static void build_vtables(void) {
     g_device_vtbl.AddRef = (void *)device_AddRef;
     g_device_vtbl.Release = (void *)device_Release;
     g_device_vtbl.GetNodeCount = (void *)device_GetNodeCount;
+    g_device_vtbl.MakeResident = (void *)device_MakeResident;   /* wine-lab port */
+    g_device_vtbl.Evict = (void *)device_Evict;
     g_device_vtbl.CreateCommandQueue = (void *)device_CreateCommandQueue;
     g_device_vtbl.CreateCommandAllocator = (void *)device_CreateCommandAllocator;
     g_device_vtbl.CreateCommandList = (void *)device_CreateCommandList;
