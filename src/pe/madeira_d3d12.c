@@ -172,6 +172,7 @@ static int g_draw_dump = -1;
  * vanish before its draw, in depth, in the G-buffer, or only in lighting" can
  * then be answered from a Mac (build/tools/capture-to-png.py). */
 static int g_capture_on; static unsigned g_capture_left; static UINT64 g_capture_frame;
+static unsigned g_capture_gap = 1, g_capture_wait;   /* wine-lab port: trigger file "N K": N frames, one every K presents */
 struct mad_capbuf { obj_handle_t buf; void *cpu; UINT64 bytes; UINT w, h, bpr, pf, dxgi; unsigned enc, idx; char kind[8]; char name[40]; };
 static struct mad_capbuf *g_capbufs; static unsigned g_ncapbufs, g_capbufs_cap; static UINT64 g_cap_bytes;
 #define MAD_CAPTURE_BUDGET (384ull << 20)
@@ -5061,7 +5062,8 @@ static void exec_draw_impl(struct mad_exec *e, const struct mad_cmd *c) {
     }
     PR_LAP(pr_t, PR_BEGIN);
     g_dump_tables = 0;
-    if (g_capture_on && g_capture_ps[0] && e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots */
+    if (g_capture_on && g_capture_ps[0] && ((e->pso->ps_name[0] && strstr(g_capture_ps, e->pso->ps_name)) ||
+                                            (e->pso->vs_name[0] && strstr(g_capture_ps, e->pso->vs_name))) && g_capture_ps_shots < 8) {   /* wine-lab port: or its VS */   /* ml1106; ml1152: any listed ps, 8 shots */
         g_capture_ps_shots++;
         mad_capture_draw_inputs(e, c);
         if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
@@ -5611,13 +5613,26 @@ tess_go:
     }
 }
 
+/* wine-lab port: madeira.cfg capture-split = N ends the render pass after each
+ * of the first N draws of a captured frame, so every one of them gets its own
+ * snapshot of the attachments (which draw put garbage into depth). */
+static int g_capture_split = -1; static unsigned g_capture_split_done;
+static void exec_draw_split(struct mad_exec *e) {
+    if (!g_capture_on) return;
+    if (g_capture_split < 0) g_capture_split = (int)mad_cfg_int_pe("capture-split", 0);
+    if (g_capture_split > 0 && g_capture_split_done < (unsigned)g_capture_split && e->renc) {
+        g_capture_split_done++;
+        exec_end(e);
+    }
+}
 static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     LONG64 t0;
-    if (g_perf_replay <= 0) { exec_draw_impl(e, c); if (e->enc_dirty) { e->enc_dirty = 0; memset(&e->sh, 0, sizeof e->sh); } return; }
+    if (g_perf_replay <= 0) { exec_draw_impl(e, c); if (e->enc_dirty) { e->enc_dirty = 0; memset(&e->sh, 0, sizeof e->sh); } exec_draw_split(e); return; }
     t0 = PR_NOW();
     exec_draw_impl(e, c);
     g_pr_t[PR_DRAW] += PR_NOW() - t0; g_pr_draws++;
     if (e->enc_dirty) { e->enc_dirty = 0; memset(&e->sh, 0, sizeof e->sh); }
+    exec_draw_split(e);
 }
 
 /* Depth-stencil plane copies. Metal copies one plane of a combined
@@ -15555,7 +15570,8 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
     InterlockedExchangeAdd64(&g_xp.t_flush, mad_qpc() - tf); }
     {   /* ml1098: manual frame capture -- finish the frame that just ended, then see whether the UI asked for another */
         struct madeira_ctl_args a;
-        if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0; }
+        if (g_capture_on) { mad_capture_finish(s->queue->device, g_capture_frame); if (g_capture_left) g_capture_left--; g_capture_on = 0;
+                            g_capture_wait = g_capture_gap > 1 ? g_capture_gap - 1 : 0; }
         memset(&a, 0, sizeof a); a.op = 0; MadeiraCtl(&a);
         if (a.ret) { g_capture_left += a.ret; d3d12_log("[capture] %u frame(s) requested at present #%llu\n", a.ret, (unsigned long long)s->presents); }
         {   /* wine-lab port: madeira.cfg capture-at = <present number> captures the frame after it (no overlay here) */
@@ -15563,11 +15579,21 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             if (at == -2) at = mad_cfg_int_pe("capture-at", -1);
             if (at >= 0 && (LONG64)s->presents == at) { g_capture_left++; d3d12_log("[capture] capture-at: frame requested at present #%llu\n", (unsigned long long)s->presents); }
             /* wine-lab port: capture on demand -- create C:\madeira-capture-now (on the Mac:
-             * touch <prefix>/drive_c/madeira-capture-now); checked every 15 presents, deleted when taken */
+             * touch <prefix>/drive_c/madeira-capture-now); checked every 15 presents, deleted when taken.
+             * Empty: one frame. "N" or "N K" inside: N frames (at most 30), one every K presents
+             * (1 = consecutive, for a flicker that changes frame to frame). */
             if ((s->presents % 15) == 0 && GetFileAttributesW(L"C:\\madeira-capture-now") != INVALID_FILE_ATTRIBUTES) {
+                char txt[32] = ""; DWORD got = 0; unsigned n = 1, k = 1;
+                HANDLE h = CreateFileW(L"C:\\madeira-capture-now", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+                if (h != INVALID_HANDLE_VALUE) { ReadFile(h, txt, sizeof txt - 1, &got, NULL); CloseHandle(h); txt[got] = 0; }
+                if (txt[0]) sscanf(txt, "%u %u", &n, &k);
+                if (!n) n = 1;
+                if (n > 30) n = 30;
+                if (!k) k = 1;
                 DeleteFileW(L"C:\\madeira-capture-now");
-                g_capture_left++;
-                d3d12_log("[capture] trigger file: frame requested at present #%llu\n", (unsigned long long)s->presents);
+                g_capture_left += n; g_capture_gap = k; g_capture_wait = 0;
+                d3d12_log("[capture] trigger file: %u frame(s), one every %u present(s), requested at present #%llu\n",
+                          n, k, (unsigned long long)s->presents);
             }
         }
         {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
@@ -15589,8 +15615,9 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             d3d12_log("[madeira-d3d12] ml1103 occlusion-visible = %d (%s)\n", g_occlusion_visible,
                       g_occlusion_visible ? "EVERY occlusion query answers fully visible -- diagnostic" : "real GPU results");
         }
-        if (g_capture_left) {
-            g_capture_on = 1; g_capture_frame = s->presents + 1; g_dump_draws = 0;
+        if (g_capture_left && g_capture_wait) g_capture_wait--;   /* wine-lab port: spacing between triggered frames */
+        else if (g_capture_left) {
+            g_capture_on = 1; g_capture_frame = s->presents + 1; g_dump_draws = 0; g_capture_split_done = 0;
             {   /* ml1152: re-read every CAP, like capture-cs */
                 g_capture_ps_loaded = 1; mad_cfg_str_pe("capture-ps", g_capture_ps, sizeof g_capture_ps);
                 if (g_capture_ps[0]) d3d12_log("[capture] ml1106 targeted draw capture for ps='%s'\n", g_capture_ps); }
