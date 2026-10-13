@@ -38,7 +38,7 @@ See [BUILD-WINE-LAB.md](BUILD-WINE-LAB.md). In short: build `d3d12.dll` with llv
 builtin, build `d3d12.so` with Apple clang, and install both into Wine's `lib/wine` directories (Wine picks builtin
 DLLs by export name, so this replaces Wine's own `d3d12.dll`).
 
-##Human Comments
+## Human Comments
 
 Do not take this as some sort of poke at crossover or other vibecoded translation layers.  This was more of a learning experience with a bit of fun added in for myself.  Have fun with it as it does work fairly well for being a Rosetta/DXMT/Wine whatever with a bit of Madeira in the mix.  This does have a one off DXMT port in order to handoff windows and proton based work correctly without containerization.  No I will not be doing the 50th crossover clone or FEX port or any of that.  Also, if you want to send in game bugs and whatnot I cannot promise I will work on them but I probably will. Seperating a bunch of the debuggers I made and publishing them seperately later. -JK
 
