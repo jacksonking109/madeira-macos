@@ -2198,13 +2198,13 @@ static void exec_bat_submit(struct mad_exec *e, struct wmtcmd_base *head) {
  * samples become per-pass times, scaled by the command buffer's own GPU start
  * and end, and are summed by pass name; the 5 s perf report lists the 25
  * costliest names in ms per frame. */
-#define MAD_PROF_MAXP 512
-#define MAD_PROF_RECS 48
+#define MAD_PROF_MAXP 256    /* passes per command buffer (ROTTR: ~80) */
+#define MAD_PROF_RECS 1024   /* command buffers in flight (TLOU1 submits ~290 a frame) */
 struct mad_prof_rec { obj_handle_t cb, sb; unsigned n; char name[MAD_PROF_MAXP][64]; };
 static struct mad_prof_rec *g_prof_rec[MAD_PROF_RECS]; static obj_handle_t g_prof_sb_pool[MAD_PROF_RECS]; static unsigned g_prof_nsb;
 static SRWLOCK g_prof_lock = SRWLOCK_INIT; static int g_prof_on = -1;
 static struct { char name[64]; double ms; unsigned n; } g_prof_top[512]; static unsigned g_prof_ntop;
-static double g_prof_ns_sum, g_prof_tick_sum;
+static double g_prof_ns_sum, g_prof_tick_sum; static LONG g_prof_missed, g_prof_timed;
 static int mad_prof_enabled(void) {
     if (g_prof_on < 0) { g_prof_on = mad_cfg_int_pe("gpu-pass-profile", 0) ? 1 : 0;
                          if (g_prof_on) d3d12_log("[madeira-d3d12] gpu-pass-profile = 1: every pass is timed on the GPU; [perf] pass-top lines every 5 s\n"); }
@@ -2223,8 +2223,8 @@ static struct mad_prof_rec *mad_prof_slot(struct mad_device *d, obj_handle_t cb,
             if (!r->sb) { free(r); r = NULL; } else g_prof_rec[i] = r;
         }
     }
-    if (r && r->n < MAD_PROF_MAXP) { *slot = r->n++; snprintf(r->name[*slot], sizeof r->name[0], "%s", name); }
-    else r = NULL;
+    if (r && r->n < MAD_PROF_MAXP) { *slot = r->n++; snprintf(r->name[*slot], sizeof r->name[0], "%s", name); g_prof_timed++; }
+    else { r = NULL; g_prof_missed++; }   /* no record free, or this command buffer is full: the pass goes untimed */
     ReleaseSRWLockExclusive(&g_prof_lock);
     return r;
 }
@@ -2273,8 +2273,9 @@ static void mad_prof_report(double frames) {
     if (g_prof_on <= 0 || frames <= 0) return;
     AcquireSRWLockExclusive(&g_prof_lock);
     for (a = 0; a < g_prof_ntop; a++) total += g_prof_top[a].ms;
-    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes can overlap; %.3f ns/tick)\n", total / frames, g_prof_ntop,
-              g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0);
+    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes can overlap; %.3f ns/tick); %ld passes timed, %ld NOT timed\n",
+              total / frames, g_prof_ntop, g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0, (long)g_prof_timed, (long)g_prof_missed);
+    g_prof_timed = g_prof_missed = 0;
     for (a = 0; a < g_prof_ntop && a < 25; a++) {
         for (m = a, b = a + 1; b < g_prof_ntop; b++) if (g_prof_top[b].ms > g_prof_top[m].ms) m = b;
         if (m != a) { char t[sizeof g_prof_top[0]]; memcpy(t, &g_prof_top[a], sizeof t); memcpy(&g_prof_top[a], &g_prof_top[m], sizeof t); memcpy(&g_prof_top[m], t, sizeof t); }
