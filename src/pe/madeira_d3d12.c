@@ -3556,10 +3556,10 @@ static int g_fencepost = -1;
 static void mad_fp_barrier(struct mad_exec *e)
 {
     if (g_fencepost < 0) {
-        g_fencepost = madeira_fencepost(0);
+        g_fencepost = madeira_fencepost(0, MADEIRA_FP_BARRIER);
         if (g_fencepost) d3d12_log("[madeira-d3d12] fencepost is loaded: declaring barriers and list starts to it\n");
     }
-    if (g_fencepost && e->cb) madeira_fencepost(e->cb);
+    if (g_fencepost && e->cb) madeira_fencepost(e->cb, MADEIRA_FP_BARRIER);
 }
 static int exec_shadow_open(struct mad_exec *e) {   /* its own encoder, synced on both sides as after a barrier */
     exec_end(e);
@@ -16151,6 +16151,10 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             obj_handle_t df = s->queue->device->enc_fence;
             f6_encode(enc, F6_BLIT, &df, 1, 0);
         }
+        /* wine-lab port: it updates no fence, so the next list's sync does not wait for it.
+         * It needs none: it names both textures it touches (tracked), and Metal orders it
+         * against the next render pass on that back buffer. Tell fencepost so. */
+        if (enc && g_fencepost > 0) madeira_fencepost(enc, MADEIRA_FP_EXEMPT);
         if (enc) {
             memset(&t2t, 0, sizeof t2t);
             t2t.type = WMTBlitCommandCopyFromTextureToTexture;

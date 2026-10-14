@@ -688,16 +688,22 @@ static NTSTATUS render_set_store_actions(void *args)
 }
 
 /* wine-lab port: fencepost, a Metal race detector, when it is injected
- * (DYLD_INSERT_LIBRARIES). a = 0: is it loaded (b = 1)? a = a command buffer: declare a
- * barrier at its current point, which fencepost then checks the encoded fences against. */
+ * (DYLD_INSERT_LIBRARIES). b in: MADEIRA_FP_BARRIER (a = a command buffer: declare a barrier
+ * at its current point; a = 0: only ask) or MADEIRA_FP_EXEMPT (a = an open encoder).
+ * b out: 1 if fencepost is loaded. */
 static NTSTATUS fencepost(void *args)
 {
-    static void (*barrier)(id);
+    static void (*barrier)(id), (*exempt)(id);
     static int looked;
     struct madeira_unix_pair_params *p = args;
-    if (!looked) { barrier = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_barrier"); looked = 1; }
+    if (!looked) {
+        barrier = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_barrier");
+        exempt = (void (*)(id))dlsym(RTLD_DEFAULT, "fencepost_exempt");
+        looked = 1;
+    }
+    if (p->a && p->b == MADEIRA_FP_EXEMPT) { if (exempt) exempt((id)p->a); }
+    else if (p->a && barrier) barrier((id)p->a);
     p->b = barrier != NULL;
-    if (barrier && p->a) barrier((id)p->a);
     return STATUS_SUCCESS;
 }
 

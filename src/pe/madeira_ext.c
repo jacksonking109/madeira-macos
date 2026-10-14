@@ -145,9 +145,9 @@ void madeira_render_set_store_actions(obj_handle_t encoder, const uint8_t color[
     CALL(renderSetStoreActions, &p);
 }
 
-int madeira_fencepost(obj_handle_t cmdbuf)
+int madeira_fencepost(obj_handle_t h, int op)
 {
-    struct madeira_unix_pair_params p = { cmdbuf, 0 };
+    struct madeira_unix_pair_params p = { h, (obj_handle_t)op };
     CALL(fencepost, &p);
     return p.b != 0;
 }
