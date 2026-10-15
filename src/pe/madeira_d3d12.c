@@ -1929,6 +1929,8 @@ static void f6_end(struct mad_exec *e, int kind, obj_handle_t enc) {
     memcpy(p->att, e->f6_att, sizeof p->att);
     e->f6_natt = 0;
 }
+static int g_enc_labels;   /* wine-lab port: defined with ml1142 below; f6_join labels its encoder too */
+static void mad_label(obj_handle_t enc, const char *fmt, ...);
 /* At commit: one blit encoder waits for everything pending and moves the device
  * fence, so the next batch (either queue) starts after all of this one. */
 static void f6_join(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb) {
@@ -1938,6 +1940,7 @@ static void f6_join(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb)
     dfence = mad_enc_fence_obj(q->device);
     benc = MTLCommandBuffer_blitCommandEncoder(cb);
     if (!benc) return;
+    if (g_enc_labels) mad_label(benc, "B f6 join");   /* wine-lab port */
     /* wine-lab port: and for the device fence's previous update. Each queue's
      * join used to wait only for its own stream's encoders, so when the compute
      * queue's join was the latest update, "the device fence passed" no longer
@@ -2985,6 +2988,7 @@ static void exec_flush_clear(struct mad_exec *e, int i) {
     if (!rpi.render_target_width) rpi.render_target_width = 1; if (!rpi.render_target_height) rpi.render_target_height = 1;
     rpi.default_raster_sample_count = e->pend[i].res->samples ? e->pend[i].res->samples : 1;
     enc = mad_prof_render(e, &rpi, "clear (flushed)"); if (enc) g_enc_seq++;   /* wine-lab port: timed */
+    if (enc && g_enc_labels) mad_label(enc, "R#%u clear (flushed)", g_enc_seq);
     e->f6_att[0] = e->pend[i].res; e->f6_natt = 1;   /* ml1134 */
     if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }   /* ml1091: a clear pass writes its target; keep it in the chain */
     e->f6_natt = 0;
@@ -3103,6 +3107,7 @@ static void exec_clear_ds_rects(struct mad_exec *e, const struct mad_cmd *c) {
         rpi.render_target_width = lw; rpi.render_target_height = lh;
         rpi.default_raster_sample_count = r->samples ? r->samples : 1;
         enc = mad_prof_render(e, &rpi, "clear (depth-stencil rects)"); if (enc) g_enc_seq++;
+        if (enc && g_enc_labels) mad_label(enc, "R#%u clear (depth-stencil rects)", g_enc_seq);
         if (!enc) { MAD_SKIP(e); return; }
         e->f6_att[0] = r; e->f6_natt = 1;
         exec_fence_render(e, enc, 0);
@@ -3557,7 +3562,10 @@ static void mad_fp_barrier(struct mad_exec *e)
 {
     if (g_fencepost < 0) {
         g_fencepost = madeira_fencepost(0, MADEIRA_FP_BARRIER);
-        if (g_fencepost) d3d12_log("[madeira-d3d12] fencepost is loaded: declaring barriers and list starts to it\n");
+        if (g_fencepost) {   /* its reports then name passes (ml1142 labels), whatever madeira.cfg says */
+            g_enc_labels = 1;
+            d3d12_log("[madeira-d3d12] fencepost is loaded: declaring barriers and list starts, labelling encoders\n");
+        }
     }
     if (g_fencepost && e->cb) madeira_fencepost(e->cb, MADEIRA_FP_BARRIER);
 }
@@ -6224,6 +6232,7 @@ static void exec_resolve(struct mad_exec *e, const struct mad_cmd *c) {
     rpi.render_target_width = w; rpi.render_target_height = h;
     rpi.default_raster_sample_count = src->samples;
     enc = mad_prof_render(e, &rpi, "resolve"); if (enc) g_enc_seq++;
+    if (enc && g_enc_labels) mad_label(enc, "R#%u resolve", g_enc_seq);
     e->f6_att[0] = src; e->f6_att[1] = dst; e->f6_natt = 2;
     if (enc) { exec_fence_render(e, enc, 0); exec_fence_render(e, enc, 1); }
     e->f6_natt = 0;
@@ -16147,6 +16156,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
             copy_src = s->fx_out; copy_w = s->fx_w; copy_h = s->fx_h;
         }
         enc = MTLCommandBuffer_blitCommandEncoder(cb); if (enc) g_enc_seq++;
+        if (enc && g_enc_labels) mad_label(enc, "B present");   /* wine-lab port */
         if (enc && g_f6_used && s->queue->device->enc_fence) {   /* ml1134: after every committed batch, not just queue order */
             obj_handle_t df = s->queue->device->enc_fence;
             f6_encode(enc, F6_BLIT, &df, 1, 0);
