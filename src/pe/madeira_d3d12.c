@@ -354,6 +354,7 @@ static LONG g_srv_clamped; static float g_srv_clamp_max;   /* ml1089 */
 static LONG g_zero_inst;   /* ml1094 */
 static LONG g_fence_waits, g_fence_updates, g_barriers;   /* ml1091 */
 static LONG g_f6_begins, g_f6_synced, g_f6_att_sync, g_f6_kept_open, g_f6_joins, g_f6_rclose;   /* ml1134 */
+static LONG g_ecl_overlap_lists;   /* wine-lab port: list starts that skipped the full sync (ecl-list-overlap) */
 static LONG g_f6_root_waits; static int g_f6_root_wait = -1;   /* wine-lab port */
 /* ml1137: GPU census, counts only. Barrier entries by the states they move
  * between, and what a state-aware wait rule would have needed at each
@@ -1529,6 +1530,7 @@ struct mad_stream {
     obj_handle_t f6_pool[64]; unsigned f6_next;
     struct mad_f6_pend f6_pend[40]; unsigned f6_npend;
     unsigned f6_root; int f6_root_valid;   /* wine-lab port: the last sync point's fence, which every later encoder waits for */
+    LONG last_ecl;   /* wine-lab port: ecl-list-overlap -- the ExecuteCommandLists call this stream last replayed a list of */
     /* wine-lab port: the render pass the previous list of this replay left open
      * (pass-carry), see mad_exec_list. */
     struct mad_exec *carry; int carry_live;
@@ -1588,6 +1590,7 @@ struct mad_queue {
      * A Win32 CRITICAL_SECTION is recursive, so mad_queue_flush being reached
      * from inside a locked ExecuteCommandLists is safe. */
     CRITICAL_SECTION submit_lock;
+    LONG ecl_id;   /* wine-lab port: ecl-list-overlap -- counts ExecuteCommandLists replays (under submit_lock) */
     /* ml1120: ASYNCHRONOUS SUBMISSION. With madeira.cfg async-submit = 1 every
      * queue owns a worker thread and a FIFO; ExecuteCommandLists, Signal and Wait
      * enqueue and return, and the worker replays them in exactly the order the
@@ -6503,7 +6506,27 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
     e.mode = mad_fence_mode(q->device);          /* ml1136: fixed for the whole list */
     e.f7_reason = 2;                             /* ml1137: list start */
     e.q = q; e.st = st; e.l = l; e.cb = cb;
-    mad_fp_barrier(&e);                          /* wine-lab port: the list start is a sync point too (fencepost) */
+    {   /* wine-lab port: madeira.cfg ecl-list-overlap (default 0). D3D12 orders separate
+         * ExecuteCommandLists calls one after the other, but lets the command lists of ONE call
+         * overlap ("the driver may merge them, so the second may begin before all work from the
+         * first has finished", ExecuteCommandLists remarks; vkd3d-proton submits them together).
+         * Every list start here waited for everything before it, so the GPU ran ~95% of TLOU
+         * Part I's passes one at a time. With the key on, in mode 6, a later list of the same
+         * call in the same stream skips that full sync: its passes still wait for the stream's
+         * last sync point (f6-root-wait), which waited for every earlier call. A list after a
+         * commit in the middle of the call (no sync point left in the stream), the first list of
+         * a parallel-encode run (its own stream) and the first list of each call sync as before,
+         * and only those are declared to fencepost as barriers. */
+        static int on = -1;
+        int first = st->last_ecl != q->ecl_id;
+        st->last_ecl = q->ecl_id;
+        if (on < 0) { on = mad_cfg_int_pe("ecl-list-overlap", 0) ? 1 : 0;
+                      if (on) d3d12_log("[madeira-d3d12] ecl-list-overlap = 1: lists of one ExecuteCommandLists call may overlap on the GPU\n"); }
+        if (on && !first && e.mode == 6 && st->f6_root_valid && g_f6_root_wait > 0) {   /* > 0: still -1 before the first f6_begin reads its key */
+            e.f6_sync_needed = 0; e.f6_list_start = 0; e.f7_reason = 0;
+            InterlockedIncrement(&g_ecl_overlap_lists);
+        } else mad_fp_barrier(&e);   /* the list start is a sync point (fencepost) */
+    }
     e.vis_prev = ~(UINT64)0;   /* ml1088 */
     if (st->carry_live) {   /* wine-lab port: pass-carry -- adopt the encoder the previous list left open */
         struct mad_exec *c = st->carry;
@@ -6987,6 +7010,7 @@ static void mad_ecl_run(ID3D12CommandQueue *This, UINT count, ID3D12CommandList 
      * on another thread had to wait out. */
     mad_prebuild_lists(count, lists);
     if (ml1021_q) EnterCriticalSection(&ml1021_q->submit_lock);
+    if (ml1021_q) ml1021_q->ecl_id++;   /* wine-lab port: ecl-list-overlap */
 
     struct mad_queue *q = (struct mad_queue *)This;
     if (count > 64 && !(vl = malloc(count * sizeof *vl))) vl = NULL;
@@ -7273,8 +7297,9 @@ static void mad_perf_present(void) {
                 LONG ko = InterlockedExchange(&g_f6_kept_open, 0), jn = InterlockedExchange(&g_f6_joins, 0), rc = InterlockedExchange(&g_f6_rclose, 0);
                 d3d12_log("[perf] ml1134 fence-chain 6 per frame: %.1f encoders, %.1f synced (%.1f for a shared attachment), %.1f overlapped; "
                           "%.1f compute encoders kept open at a barrier; %.1f overlapped render passes closed at a barrier; %.1f joins; "
-                          "%.1f waited for the last sync point\n",
-                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, InterlockedExchange(&g_f6_root_waits, 0) / np);
+                          "%.1f waited for the last sync point; %.1f list starts overlapped (ecl-list-overlap)\n",
+                          b / np, sy / np, at / np, (b - sy) / np, ko / np, rc / np, jn / np, InterlockedExchange(&g_f6_root_waits, 0) / np,
+                          InterlockedExchange(&g_ecl_overlap_lists, 0) / np);
             }
             if (g_f6_used && g_perf_presents) {   /* ml1137 */
                 double np = (double)g_perf_presents;

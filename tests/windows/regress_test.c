@@ -27,6 +27,8 @@
  *    6  Two compute pipelines across UAV barriers (A, B, A, B, ...): B sees all of A's
  *       writes, also with gpu-pass-profile = 1, which splits compute encoders per
  *       pipeline for timing (run the test once with it on).
+ *    7  Two command lists in one ExecuteCommandLists call: a UAV barrier in the second
+ *       orders it after the first, also with ecl-list-overlap = 1 (run it once with it on).
  *
  *  Shaders are compiled at run time by Wine's d3dcompiler_47 (SM 5.0 DXBC, the
  *  airconv path ROTTR uses). Exit code = number of failed checks.
@@ -604,6 +606,75 @@ static void case_compute_pair(void) {
     ID3D12RootSignature_Release(rs); ID3D12DescriptorHeap_Release(uh);
 }
 
+/* 7. Two command lists in ONE ExecuteCommandLists call (2026-10-16). With madeira.cfg
+ * ecl-list-overlap = 1 the second list's start no longer waits for the first, as D3D12
+ * allows; a UAV barrier in the second list must still order its reads after the first
+ * list's writes. List A: kernel A writes a. List B: UAV barrier, kernel B reads a, writes
+ * b. Then, in a SEPARATE call, list C copies b to the readback buffer with no barrier of
+ * its own beyond the state change: separate calls are ordered. b[i] = 2 * (i + 1). */
+static void case_ecl_pair(void) {
+    enum { N = 1024 };
+    printf("\n[7] two lists in one ExecuteCommandLists: a barrier in the second orders it after the first\n");
+    D3D12_DESCRIPTOR_RANGE range; ZeroMemory(&range, sizeof range);
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; range.NumDescriptors = 2;
+    D3D12_ROOT_PARAMETER rp; ZeroMemory(&rp, sizeof rp);
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp.DescriptorTable.NumDescriptorRanges = 1; rp.DescriptorTable.pDescriptorRanges = &range;
+    D3D12_ROOT_SIGNATURE_DESC rd; ZeroMemory(&rd, sizeof rd); rd.NumParameters = 1; rd.pParameters = &rp;
+    ID3D12RootSignature *rs = make_rs("[7] list pair", &rd);
+    ID3DBlob *ca = compile("[7] kernel A", hlsl_ca, "main", "cs_5_0"), *cb = compile("[7] kernel B", hlsl_cb, "main", "cs_5_0");
+    ID3D12PipelineState *pa = rs && ca ? make_cpso("[7] kernel A", rs, ca) : NULL, *pb = rs && cb ? make_cpso("[7] kernel B", rs, cb) : NULL;
+    ID3D12Resource *a = make_uav_buffer(N * 4), *b = make_uav_buffer(N * 4);
+    ID3D12DescriptorHeap *uh = NULL; ID3D12CommandAllocator *al2 = NULL; ID3D12GraphicsCommandList *l2 = NULL;
+    D3D12_DESCRIPTOR_HEAP_DESC hd; ZeroMemory(&hd, sizeof hd);
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 2; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&uh);
+    ID3D12Device_CreateCommandAllocator(dev, D3D12_COMMAND_LIST_TYPE_DIRECT, &IID_ID3D12CommandAllocator, (void **)&al2);
+    if (al2) ID3D12Device_CreateCommandList(dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, al2, NULL, &IID_ID3D12GraphicsCommandList, (void **)&l2);
+    if (!pa || !pb || !a || !b || !uh || !l2) { CHECK(0, "[7] setup failed"); return; }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ud; ZeroMemory(&ud, sizeof ud);
+    ud.Format = DXGI_FORMAT_UNKNOWN; ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; ud.Buffer.NumElements = N; ud.Buffer.StructureByteStride = 4;
+    ID3D12Device_CreateUnorderedAccessView(dev, a, NULL, &ud, heap_cpu(uh, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0));
+    ID3D12Device_CreateUnorderedAccessView(dev, b, NULL, &ud, heap_cpu(uh, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1));
+    D3D12_GPU_DESCRIPTOR_HANDLE g; uh->lpVtbl->GetGPUDescriptorHandleForHeapStart(uh, &g);
+    D3D12_RESOURCE_BARRIER uav; ZeroMemory(&uav, sizeof uav); uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    /* list A (the test's main list): kernel A, several times so it runs long */
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &uh);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 0, g);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pa);
+    for (int k = 0; k < 8; k++) ID3D12GraphicsCommandList_Dispatch(list, N / 64, 1, 1);
+    ID3D12GraphicsCommandList_Close(list);
+    /* list B: barrier, kernel B */
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(l2, 1, &uh);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(l2, rs);
+    ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(l2, 0, g);
+    ID3D12GraphicsCommandList_ResourceBarrier(l2, 1, &uav);
+    ID3D12GraphicsCommandList_SetPipelineState(l2, pb);
+    ID3D12GraphicsCommandList_Dispatch(l2, N / 64, 1, 1);
+    ID3D12GraphicsCommandList_Close(l2);
+    {
+        ID3D12CommandList *two[2] = { (ID3D12CommandList *)list, (ID3D12CommandList *)l2 };
+        ID3D12CommandQueue_ExecuteCommandLists(queue, 2, two);
+    }
+    /* list C, a separate call: copy b out (submit_and_wait closes and executes the main list) */
+    ID3D12CommandAllocator_Reset(alloc);
+    ID3D12GraphicsCommandList_Reset(list, alloc, NULL);
+    barrier(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, b, 0, N * 4);
+    poison_rb();
+    BOOL ran = submit_and_wait();
+    UINT32 *p = NULL, got[4] = { 0 }; unsigned bad = 0, first = ~0u;
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&p);
+    for (unsigned i = 0; p && i < N; i++) if (p[i] != 2 * (i + 1)) { bad++; if (first == ~0u) first = i; }
+    if (p) { memcpy(got, p, sizeof got); ID3D12Resource_Unmap(rb, 0, NULL); }
+    CHECK(ran && p && !bad, "[7] b[i] = 2 * (i + 1) for all %d elements (%u wrong, first %d)", N, bad, (int)first);
+    if (bad) printf("        got %08x %08x %08x %08x ...\n", got[0], got[1], got[2], got[3]);
+    ID3D12GraphicsCommandList_Release(l2); ID3D12CommandAllocator_Release(al2);
+    ID3D12Resource_Release(a); ID3D12Resource_Release(b); ID3D12PipelineState_Release(pa); ID3D12PipelineState_Release(pb);
+    ID3D12RootSignature_Release(rs); ID3D12DescriptorHeap_Release(uh);
+}
+
 int main(void) {
     HRESULT hr;
     printf("wine-lab d3d12: regression checks for the 2026-10-12/13 ROTTR fixes and the 2026-10-16 stub audit\n\n");
@@ -646,6 +717,7 @@ int main(void) {
     case_rect_clears();
     case_stub_audit(rt);
     case_compute_pair();
+    case_ecl_pair();
 done:
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails;
