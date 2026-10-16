@@ -154,7 +154,7 @@ samplers, StructuredBuffer / ByteAddressBuffer / Buffer<uint4> with FirstElement
 another keep their own depths, depth-only and stencil-only rect clears leave the other aspect and the rest alone, and SRVs with a component mapping on R8 and RGBA16F render targets; needs
 d3d12.so's newClearPipeline unix call). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
 (16 lists, TLOU-like mix), prints ExecuteCommandLists wall time, submit-to-GPU-done latency and image/UAV hashes.
-d3d12-regress-x64.exe (tests/windows/regress_test.c, 0 failures, 45 checks, also with ds-rect-inpass/ds-rect-defer/
+d3d12-regress-x64.exe (tests/windows/regress_test.c, 0 failures, 51 checks, also with ds-rect-inpass/ds-rect-defer/
 store-defer = 0: the 2026-10-12/13 ROTTR fixes - buffer GetCopyableFootprints total = width at the base offset; NULL
 texture and buffer SRVs read zeros; per-instance step rate 0 = element 0 for every instance (DXBC); rect depth clears
 in an open depth-only pass and held for the next pass, ordered against draws, a full clear and a barrier; and the
@@ -163,7 +163,9 @@ PIX markers, SetPredication (ignored: predicated work runs) and OMSetDepthBounds
 answers UNRECOGNIZED). Stubs left by the audit, by reason: no capability claimed (raytracing, mesh shaders, VRS,
 protected sessions, meta commands, sampler feedback, view instancing, programmable sample positions, depth bounds,
 WriteBufferImmediate) or a real project (bundles, shared handles, stream output, tiled CopyTiles, AtomicCopyBuffer,
-ResolveSubresourceRegion, ClearState, enhanced barriers, Write/ReadFromSubresource with UMA = FALSE).
+ResolveSubresourceRegion, ClearState, enhanced barriers, Write/ReadFromSubresource with UMA = FALSE). Case 6 runs two compute
+pipelines across UAV barriers (A, B, A, B, ...) and checks every value B read; run it once with gpu-pass-profile = 1,
+which splits compute encoders per pipeline for timing (40 -> 45 encoders, same results).
 
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 

@@ -1688,6 +1688,7 @@ struct mad_exec {
     UINT64 croot[MAD_ROOT_PARAM_MAX];
     UINT32 cconsts[MAD_ROOT_PARAM_MAX][64];
     obj_handle_t cenc;
+    struct mad_pso *cenc_pso;   /* wine-lab port: the pipeline the open compute encoder is named after (gpu-pass-profile split) */
     struct mad_heap *srv, *smp;
     D3D12_VIEWPORT vp; int has_vp;
     D3D12_RECT sc; int has_sc;
@@ -2221,6 +2222,7 @@ static struct mad_prof_rec *g_prof_rec[MAD_PROF_RECS]; static obj_handle_t g_pro
 static SRWLOCK g_prof_lock = SRWLOCK_INIT; static int g_prof_on = -1;
 static struct { char name[64]; double ms; unsigned n; } g_prof_top[512]; static unsigned g_prof_ntop;
 static double g_prof_ns_sum, g_prof_tick_sum; static LONG g_prof_missed, g_prof_timed;
+static LONG g_prof_csplits;   /* compute encoders ended because the pipeline changed (profiling only) */
 static int mad_prof_enabled(void) {
     if (g_prof_on < 0) { g_prof_on = mad_cfg_int_pe("gpu-pass-profile", 0) ? 1 : 0;
                          if (g_prof_on) d3d12_log("[madeira-d3d12] gpu-pass-profile = 1: every pass is timed on the GPU; [perf] pass-top lines every 5 s\n"); }
@@ -2289,9 +2291,11 @@ static void mad_prof_report(double frames) {
     if (g_prof_on <= 0 || frames <= 0) return;
     AcquireSRWLockExclusive(&g_prof_lock);
     for (a = 0; a < g_prof_ntop; a++) total += g_prof_top[a].ms;
-    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes can overlap; %.3f ns/tick); %ld passes timed, %ld NOT timed\n",
-              total / frames, g_prof_ntop, g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0, (long)g_prof_timed, (long)g_prof_missed);
-    g_prof_timed = g_prof_missed = 0;
+    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes can overlap; %.3f ns/tick); %ld passes timed, %ld NOT timed; "
+              "%.1f compute encoders/frame split per pipeline for timing\n",
+              total / frames, g_prof_ntop, g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0, (long)g_prof_timed, (long)g_prof_missed,
+              g_prof_csplits / frames);
+    g_prof_timed = g_prof_missed = 0; g_prof_csplits = 0;
     for (a = 0; a < g_prof_ntop && a < 25; a++) {
         for (m = a, b = a + 1; b < g_prof_ntop; b++) if (g_prof_top[b].ms > g_prof_top[m].ms) m = b;
         if (m != a) { char t[sizeof g_prof_top[0]]; memcpy(t, &g_prof_top[a], sizeof t); memcpy(&g_prof_top[a], &g_prof_top[m], sizeof t); memcpy(&g_prof_top[m], t, sizeof t); }
@@ -6300,9 +6304,21 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         mad_capture_dispatch_inputs(e, c);
         cap_out = g_capture_cs_out;   /* wine-lab port */
     }
+    /* wine-lab port: gpu-pass-profile times whole encoders, and a compute encoder stays
+     * open across pipelines and even barriers (f6-compute-open), so every kernel in it
+     * was charged to the first one. While profiling, a new pipeline ends the encoder and
+     * the next one is a sync point, as after a barrier: its dispatches still run after
+     * everything before (a serial encoder ordered them), only more strictly. The
+     * profiled frame changes a little; the names become exact. */
+    if (e->cenc && e->cenc_pso != e->cpso && mad_prof_enabled()) {
+        exec_end(e);
+        e->fence_needed = 1; e->f6_sync_needed = 1;
+        InterlockedIncrement(&g_prof_csplits);
+    }
     if (!e->cenc) {
         if (e->renc) InterlockedIncrement(&g_pass_end_dispatch);
         exec_end(e);
+        e->cenc_pso = e->cpso;
         {   /* wine-lab port: gpu-pass-profile */
             char pn[64]; snprintf(pn, sizeof pn, "C %s", e->cpso->vs_name);
             e->cenc = mad_prof_compute(e, pn); if (e->cenc) g_enc_seq++;

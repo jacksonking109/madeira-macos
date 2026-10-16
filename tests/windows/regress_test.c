@@ -24,6 +24,9 @@
  *    5  Stub audit (2026-10-16): names and private data on the main objects, resource
  *       heap properties, PIX markers, SetPredication, OMSetDepthBounds and
  *       CheckDriverMatchingIdentifier no longer answer E_NOTIMPL from their stubs.
+ *    6  Two compute pipelines across UAV barriers (A, B, A, B, ...): B sees all of A's
+ *       writes, also with gpu-pass-profile = 1, which splits compute encoders per
+ *       pipeline for timing (run the test once with it on).
  *
  *  Shaders are compiled at run time by Wine's d3dcompiler_47 (SM 5.0 DXBC, the
  *  airconv path ROTTR uses). Exit code = number of failed checks.
@@ -513,6 +516,94 @@ static void case_stub_audit(ID3D12Resource *rt) {
     }
 }
 
+/* 6. Two compute pipelines in a row with a UAV barrier between (2026-10-16). The runtime
+ * may keep one compute encoder open across both (f6-compute-open); with gpu-pass-profile
+ * = 1 it splits the encoder per pipeline for timing. Either way kernel B must see every
+ * value kernel A wrote: b[i] = 2 * (i + 1). Run once with gpu-pass-profile = 1 to check
+ * the split keeps the order. */
+static const char hlsl_ca[] =
+    "RWStructuredBuffer<uint> a : register(u0);\n"
+    "[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) { a[i] = i + 1; }\n";
+static const char hlsl_cb[] =
+    "RWStructuredBuffer<uint> a : register(u0);\n"
+    "RWStructuredBuffer<uint> b : register(u1);\n"
+    "[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) { b[i] = a[i] * 2; }\n";
+static ID3D12Resource *make_uav_buffer(UINT64 size) {
+    D3D12_HEAP_PROPERTIES hp; ZeroMemory(&hp, sizeof hp); hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC d; ZeroMemory(&d, sizeof d);
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = size; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+    d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ID3D12Resource *r = NULL;
+    ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, NULL, &IID_ID3D12Resource, (void **)&r);
+    return r;
+}
+static ID3D12PipelineState *make_cpso(const char *name, ID3D12RootSignature *rs, ID3DBlob *cs) {
+    D3D12_COMPUTE_PIPELINE_STATE_DESC d; ZeroMemory(&d, sizeof d);
+    ID3D12PipelineState *p = NULL;
+    d.pRootSignature = rs; d.CS.pShaderBytecode = ID3D10Blob_GetBufferPointer(cs); d.CS.BytecodeLength = ID3D10Blob_GetBufferSize(cs);
+    HRESULT hr = ID3D12Device_CreateComputePipelineState(dev, &d, &IID_ID3D12PipelineState, (void **)&p);
+    CHECK(SUCCEEDED(hr) && p, "%s: compute pipeline created (%#lx)", name, hr);
+    return p;
+}
+static void case_compute_pair(void) {
+    enum { N = 1024 };
+    printf("\n[6] two compute pipelines across a UAV barrier: B sees all of A's writes\n");
+    /* A descriptor table of two UAVs. (Root UAVs would be the shorter test, but the DXBC
+     * backend refuses root SRV/UAV buffers: no length, see README-lab TODO.) */
+    D3D12_DESCRIPTOR_RANGE range; ZeroMemory(&range, sizeof range);
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; range.NumDescriptors = 2; range.BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER rp; ZeroMemory(&rp, sizeof rp);
+    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp.DescriptorTable.NumDescriptorRanges = 1; rp.DescriptorTable.pDescriptorRanges = &range;
+    D3D12_ROOT_SIGNATURE_DESC rd; ZeroMemory(&rd, sizeof rd); rd.NumParameters = 1; rd.pParameters = &rp;
+    ID3D12RootSignature *rs = make_rs("[6] compute pair", &rd);
+    ID3DBlob *ca = compile("[6] kernel A", hlsl_ca, "main", "cs_5_0"), *cb = compile("[6] kernel B", hlsl_cb, "main", "cs_5_0");
+    ID3D12PipelineState *pa = rs && ca ? make_cpso("[6] kernel A", rs, ca) : NULL, *pb = rs && cb ? make_cpso("[6] kernel B", rs, cb) : NULL;
+    ID3D12Resource *a = make_uav_buffer(N * 4), *b = make_uav_buffer(N * 4);
+    ID3D12DescriptorHeap *uh = NULL;
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC hd; ZeroMemory(&hd, sizeof hd);
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 2; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ID3D12Device_CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void **)&uh);
+    }
+    if (!pa || !pb || !a || !b || !uh) { CHECK(0, "[6] setup failed"); return; }
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC ud; ZeroMemory(&ud, sizeof ud);
+        ud.Format = DXGI_FORMAT_UNKNOWN; ud.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = N; ud.Buffer.StructureByteStride = 4;
+        ID3D12Device_CreateUnorderedAccessView(dev, a, NULL, &ud, heap_cpu(uh, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 0));
+        ID3D12Device_CreateUnorderedAccessView(dev, b, NULL, &ud, heap_cpu(uh, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1));
+    }
+    D3D12_RESOURCE_BARRIER uav; ZeroMemory(&uav, sizeof uav); uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &uh);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+    {
+        D3D12_GPU_DESCRIPTOR_HANDLE g; uh->lpVtbl->GetGPUDescriptorHandleForHeapStart(uh, &g);   /* as case 2: the C ABI returns it through a pointer */
+        ID3D12GraphicsCommandList_SetComputeRootDescriptorTable(list, 0, g);
+    }
+    for (int round = 0; round < 3; round++) {   /* A, B, A, B, ...: a pipeline change at every dispatch */
+        ID3D12GraphicsCommandList_SetPipelineState(list, pa);
+        ID3D12GraphicsCommandList_Dispatch(list, N / 64, 1, 1);
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uav);
+        ID3D12GraphicsCommandList_SetPipelineState(list, pb);
+        ID3D12GraphicsCommandList_Dispatch(list, N / 64, 1, 1);
+        ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &uav);
+    }
+    barrier(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, b, 0, N * 4);
+    poison_rb();
+    BOOL ran = submit_and_wait();
+    UINT32 *p = NULL; unsigned bad = 0, first = ~0u;
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&p);
+    UINT32 got[4] = { 0 };
+    for (unsigned i = 0; p && i < N; i++) if (p[i] != 2 * (i + 1)) { bad++; if (first == ~0u) first = i; }
+    if (p) { memcpy(got, p, sizeof got); ID3D12Resource_Unmap(rb, 0, NULL); }
+    CHECK(ran && p && !bad, "[6] b[i] = 2 * (i + 1) for all %d elements (%u wrong, first %d)", N, bad, (int)first);
+    if (bad) printf("        got %08x %08x %08x %08x ...\n", got[0], got[1], got[2], got[3]);
+    ID3D12Resource_Release(a); ID3D12Resource_Release(b); ID3D12PipelineState_Release(pa); ID3D12PipelineState_Release(pb);
+    ID3D12RootSignature_Release(rs); ID3D12DescriptorHeap_Release(uh);
+}
+
 int main(void) {
     HRESULT hr;
     printf("wine-lab d3d12: regression checks for the 2026-10-12/13 ROTTR fixes and the 2026-10-16 stub audit\n\n");
@@ -554,6 +645,7 @@ int main(void) {
     case_step_rate(rt);
     case_rect_clears();
     case_stub_audit(rt);
+    case_compute_pair();
 done:
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails;
