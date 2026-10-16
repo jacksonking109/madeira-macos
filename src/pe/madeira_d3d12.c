@@ -1051,6 +1051,19 @@ static void mad_pd_purge(const void *obj) {
     ReleaseSRWLockExclusive(&g_pd_lock);
     mad_pd_free_list(old);
 }
+/* wine-lab port: SetName stores the name as WKPDID_D3DDebugObjectNameW private data, as
+ * D3D12 does, so GetPrivateData reads it back (it was accepted and dropped). The generated
+ * stubs (gen_vtables.py) and the hand-written SetNames below all come through here. */
+static const GUID mad_wkpdid_name_w = { 0x4cca5fd8, 0x921f, 0x42c8, { 0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41 } };
+static HRESULT mad_set_name(const void *obj, const WCHAR *name) {
+    if (!name) return mad_pd_set(obj, &mad_wkpdid_name_w, 0, NULL);
+    return mad_pd_set(obj, &mad_wkpdid_name_w, (UINT)((wcslen(name) + 1) * sizeof(WCHAR)), name);
+}
+/* wine-lab port: PIX-style markers (SetMarker/BeginEvent/EndEvent) on queues and lists.
+ * Shipping games often keep them; there is nothing to do with them here yet. */
+static void STDMETHODCALLTYPE obj_Marker(void *This, UINT meta, const void *data, UINT size) { (void)This; (void)meta; (void)data; (void)size; }
+static void STDMETHODCALLTYPE obj_EndEvent(void *This) { (void)This; }
+#define MAD_MARKER_METHODS(vt) do { (vt).SetMarker = (void *)obj_Marker; (vt).BeginEvent = (void *)obj_Marker; (vt).EndEvent = (void *)obj_EndEvent; } while (0)
 
 static ULONG mad_release(struct mad_obj *o) {
     LONG r = InterlockedDecrement(&o->refs);
@@ -8260,7 +8273,7 @@ static HRESULT STDMETHODCALLTYPE cmdsig_SetPrivateData(ID3D12CommandSignature *T
 static HRESULT STDMETHODCALLTYPE cmdsig_SetPrivateDataInterface(ID3D12CommandSignature *This, REFGUID g, const IUnknown *d) {
     return mad_pd_set_iface(This, g, d);   /* ml1143 */
 }
-static HRESULT STDMETHODCALLTYPE cmdsig_SetName(ID3D12CommandSignature *This, LPCWSTR name) { (void)This; (void)name; return S_OK; }
+static HRESULT STDMETHODCALLTYPE cmdsig_SetName(ID3D12CommandSignature *This, LPCWSTR name) { return mad_set_name(This, name); }
 static HRESULT STDMETHODCALLTYPE cmdsig_GetDevice(ID3D12CommandSignature *This, REFIID riid, void **out) {
     struct mad_cmdsig *s = (struct mad_cmdsig *)This;
     return s->device->vtbl->QueryInterface((ID3D12Device10 *)s->device, riid, out);
@@ -9271,7 +9284,7 @@ static HRESULT STDMETHODCALLTYPE qheap_SetPrivateData(ID3D12QueryHeap *This, REF
 static HRESULT STDMETHODCALLTYPE qheap_SetPrivateDataInterface(ID3D12QueryHeap *This, REFGUID g, const IUnknown *d) {
     return mad_pd_set_iface(This, g, d);   /* ml1143 */
 }
-static HRESULT STDMETHODCALLTYPE qheap_SetName(ID3D12QueryHeap *This, LPCWSTR name) { (void)This; (void)name; return S_OK; }
+static HRESULT STDMETHODCALLTYPE qheap_SetName(ID3D12QueryHeap *This, LPCWSTR name) { return mad_set_name(This, name); }
 static HRESULT STDMETHODCALLTYPE qheap_GetDevice(ID3D12QueryHeap *This, REFIID riid, void **out) {
     struct mad_queryheap *q = (struct mad_queryheap *)This;
     return q->device->vtbl->QueryInterface((ID3D12Device10 *)q->device, riid, out);
@@ -10255,7 +10268,7 @@ static HRESULT STDMETHODCALLTYPE memheap_SetPrivateData(ID3D12Heap *This, REFGUI
 static HRESULT STDMETHODCALLTYPE memheap_SetPrivateDataInterface(ID3D12Heap *This, REFGUID g, const IUnknown *d) {
     return mad_pd_set_iface(This, g, d);   /* ml1143 */
 }
-static HRESULT STDMETHODCALLTYPE memheap_SetName(ID3D12Heap *This, LPCWSTR name) { (void)This; (void)name; return S_OK; }
+static HRESULT STDMETHODCALLTYPE memheap_SetName(ID3D12Heap *This, LPCWSTR name) { return mad_set_name(This, name); }
 static HRESULT STDMETHODCALLTYPE memheap_GetDevice(ID3D12Heap *This, REFIID riid, void **out) {
     struct mad_memheap *h = (struct mad_memheap *)This;
     return h->device->vtbl->QueryInterface((ID3D12Device10 *)h->device, riid, out);
@@ -15062,7 +15075,7 @@ static ULONG STDMETHODCALLTYPE plib_Release(ID3D12PipelineLibrary1 *This) {
 static HRESULT STDMETHODCALLTYPE plib_GetPrivateData(ID3D12PipelineLibrary1 *This, REFGUID g, UINT *n, void *d) { return mad_pd_get(This, g, n, d); }
 static HRESULT STDMETHODCALLTYPE plib_SetPrivateData(ID3D12PipelineLibrary1 *This, REFGUID g, UINT n, const void *d) { return mad_pd_set(This, g, n, d); }
 static HRESULT STDMETHODCALLTYPE plib_SetPrivateDataInterface(ID3D12PipelineLibrary1 *This, REFGUID g, const IUnknown *d) { return mad_pd_set_iface(This, g, d); }
-static HRESULT STDMETHODCALLTYPE plib_SetName(ID3D12PipelineLibrary1 *This, const WCHAR *name) { (void)This; (void)name; return S_OK; }
+static HRESULT STDMETHODCALLTYPE plib_SetName(ID3D12PipelineLibrary1 *This, const WCHAR *name) { return mad_set_name(This, name); }
 static HRESULT STDMETHODCALLTYPE plib_GetDevice(ID3D12PipelineLibrary1 *This, REFIID riid, void **out) {
     return mad_child_get_device(((struct mad_plib *)This)->device, riid, out);
 }
@@ -15362,11 +15375,41 @@ static HRESULT STDMETHODCALLTYPE tr_CreateCommandList(ID3D12Device *This, UINT n
 }
 
 /* ---- vtable construction ------------------------------------------------- */
+/* wine-lab port: small methods that were still stubs (stub audit, 2026-10-16). */
+static HRESULT STDMETHODCALLTYPE res_GetHeapProperties(ID3D12Resource *This, D3D12_HEAP_PROPERTIES *props, D3D12_HEAP_FLAGS *flags) {
+    struct mad_resource *r = (struct mad_resource *)This;
+    if (!r->heap) return E_INVALIDARG;   /* reserved: no heap of its own, as in D3D12 */
+    if (props) {
+        memset(props, 0, sizeof *props);
+        props->Type = r->heap;   /* CUSTOM properties are not kept; the page/pool fields stay UNKNOWN */
+        props->CreationNodeMask = 1; props->VisibleNodeMask = 1;
+    }
+    if (flags) *flags = r->placed_heap ? r->placed_heap->desc.Flags : D3D12_HEAP_FLAG_NONE;
+    return S_OK;
+}
+/* Predication skips draws whose query result says so; drawing them anyway gives the same
+ * picture (predication only saves work), so it is accepted and ignored. */
+static void STDMETHODCALLTYPE list_SetPredication(ID3D12GraphicsCommandList *This, ID3D12Resource *buf, UINT64 off, D3D12_PREDICATION_OP op) {
+    static LONG said;
+    (void)This; (void)off; (void)op;
+    if (buf && !InterlockedExchange(&said, 1)) d3d12_log("[madeira-d3d12] SetPredication: ignored, predicated work always runs\n");
+}
+/* Not advertised (OPTIONS2 DepthBoundsTestSupported = FALSE); a caller that sets bounds
+ * anyway gets no bounds test, which only costs shading work in the usual light-volume use. */
+static void STDMETHODCALLTYPE list_OMSetDepthBounds(ID3D12GraphicsCommandList1 *This, FLOAT lo, FLOAT hi) { (void)This; (void)lo; (void)hi; }
+/* Serialized pipeline caches from another driver: "unrecognized" tells the caller to rebuild. */
+static D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE device_CheckDriverMatchingIdentifier(ID3D12Device5 *This,
+        D3D12_SERIALIZED_DATA_TYPE type, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *id) {
+    (void)This; (void)type; (void)id;
+    return D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED;
+}
+
 static void build_vtables(void) {
     static LONG done;
     if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
 
     madeira_fill_ID3D12Device10(&g_device_vtbl);
+    g_device_vtbl.CheckDriverMatchingIdentifier = (void *)device_CheckDriverMatchingIdentifier;
     /* ml877: ID3D12Device1..9 */
     g_device_vtbl.CreatePipelineState                = device_CreatePipelineState;
     g_device_vtbl.CreateCommandList1                 = device_CreateCommandList1;
@@ -15451,6 +15494,7 @@ static void build_vtables(void) {
     g_device_vtbl.CheckFeatureSupport = (void *)device_CheckFeatureSupport;
 
     madeira_fill_ID3D12CommandQueue(&g_queue_vtbl);
+    MAD_MARKER_METHODS(g_queue_vtbl);
     g_queue_vtbl.GetDevice = queue_GetDevice;
     g_queue_vtbl.QueryInterface         = queue_QI;
     g_queue_vtbl.AddRef                 = queue_AddRef;
@@ -15472,6 +15516,7 @@ static void build_vtables(void) {
     g_alloc_vtbl.Reset                  = alloc_Reset;
 
     madeira_fill_ID3D12Resource2(&g_res_vtbl);
+    g_res_vtbl.GetHeapProperties = (void *)res_GetHeapProperties;
     g_res_vtbl.GetDevice = res_GetDevice;
     g_res_vtbl.GetDesc1 = (void *)res_GetDesc1;
     g_res_vtbl.QueryInterface = (void *)res_QI;
@@ -15483,6 +15528,9 @@ static void build_vtables(void) {
     g_res_vtbl.GetDesc = (void *)res_GetDesc;
 
     madeira_fill_ID3D12GraphicsCommandList7(&g_list_vtbl);
+    MAD_MARKER_METHODS(g_list_vtbl);
+    g_list_vtbl.SetPredication = (void *)list_SetPredication;
+    g_list_vtbl.OMSetDepthBounds = (void *)list_OMSetDepthBounds;
     g_list_vtbl.GetDevice = (void *)list_GetDevice;
     g_list_vtbl.QueryInterface          = (void *)list_QI;
     g_list_vtbl.AddRef                  = (void *)list_AddRef;

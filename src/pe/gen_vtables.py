@@ -92,6 +92,7 @@ def emit(header_path, out_path):
     L.append("static HRESULT mad_pd_get(const void *obj, REFGUID guid, UINT *data_size, void *data);")
     L.append("static HRESULT mad_pd_set(const void *obj, REFGUID guid, UINT data_size, const void *data);")
     L.append("static HRESULT mad_pd_set_iface(const void *obj, REFGUID guid, const IUnknown *data);")
+    L.append("static HRESULT mad_set_name(const void *obj, const WCHAR *name);   /* wine-lab port: WKPDID_D3DDebugObjectNameW */")
     L.append("")
 
     for iface in INTERFACES:
@@ -102,9 +103,10 @@ def emit(header_path, out_path):
             L.append("static %s STDMETHODCALLTYPE %s(%s) {" % (ret, fn, args))
             # Private data: every object keeps it, and engines read it back.
             # ml1143: storing nothing made D3DX12's residency manager (UE's D3D12
-            # RHI) see a new queue on every submission. Names are accepted.
+            # RHI) see a new queue on every submission. Names are stored as
+            # WKPDID_D3DDebugObjectNameW private data, as D3D12 does (wine-lab port).
             if name == "SetName":
-                L.append("    return S_OK;")
+                L.append("    return mad_set_name(This, name);")
                 L.append("}")
                 continue
             if name == "GetPrivateData":

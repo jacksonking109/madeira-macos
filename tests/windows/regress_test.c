@@ -21,6 +21,9 @@
  *         c  held, then an ALWAYS draw: a clear landing AFTER the draw leaves 0.25
  *         d  held, then a FULL clear of the same view: the full clear must win
  *         e  held, then a barrier and a copy: the copy must see the clear
+ *    5  Stub audit (2026-10-16): names and private data on the main objects, resource
+ *       heap properties, PIX markers, SetPredication, OMSetDepthBounds and
+ *       CheckDriverMatchingIdentifier no longer answer E_NOTIMPL from their stubs.
  *
  *  Shaders are compiled at run time by Wine's d3dcompiler_47 (SM 5.0 DXBC, the
  *  airconv path ROTTR uses). Exit code = number of failed checks.
@@ -434,9 +437,85 @@ static void case_rect_clears(void) {
     d_check("[4e] held rect clear, then a barrier and a copy", 0.25f, 0.6f);
 }
 
+/* 5. Stub audit (2026-10-16): methods that answered E_NOTIMPL from their generated stubs.
+ *  a. names and private data on the main objects (SetName is WKPDID_D3DDebugObjectNameW)
+ *  b. GetHeapProperties reports the heap type a resource was created in
+ *  c. PIX markers, SetPredication and OMSetDepthBounds are accepted, and the work around
+ *     them still runs (a predicated clear still lands)
+ *  d. CheckDriverMatchingIdentifier says "unrecognized", so cached blobs are rebuilt */
+static const GUID name_guid = { 0x4cca5fd8, 0x921f, 0x42c8, { 0x85, 0x66, 0x70, 0xca, 0xf2, 0xa9, 0xb7, 0x41 } };
+static const GUID test_guid = { 0x1234abcd, 0x5678, 0x4321, { 1, 2, 3, 4, 5, 6, 7, 8 } };
+static void name_check(const char *what, ID3D12Object *o) {
+    static const WCHAR nm[] = L"regress-name";
+    WCHAR got[32] = { 0 }; UINT n = sizeof got;
+    HRESULT h1 = ID3D12Object_SetName(o, nm);
+    HRESULT h2 = ID3D12Object_GetPrivateData(o, &name_guid, &n, got);
+    CHECK(h1 == S_OK && h2 == S_OK && n == sizeof nm && !memcmp(got, nm, sizeof nm),
+          "[5a] %s: SetName stores the name, GetPrivateData reads it back (%#lx, %#lx, %u bytes)", what, h1, h2, n);
+}
+static void case_stub_audit(ID3D12Resource *rt) {
+    printf("\n[5] stub audit: names, private data, heap properties, markers, predication\n");
+    name_check("device", (ID3D12Object *)dev);
+    name_check("queue", (ID3D12Object *)queue);
+    name_check("allocator", (ID3D12Object *)alloc);
+    name_check("command list", (ID3D12Object *)list);
+    name_check("fence", (ID3D12Object *)fence);
+    name_check("resource", (ID3D12Object *)rt);
+    name_check("descriptor heap", (ID3D12Object *)rtvh);
+    {
+        UINT64 v = 0x1122334455667788ull, got = 0; UINT n = sizeof got;
+        HRESULT h1 = ID3D12CommandQueue_SetPrivateData(queue, &test_guid, sizeof v, &v);
+        HRESULT h2 = ID3D12CommandQueue_GetPrivateData(queue, &test_guid, &n, &got);
+        CHECK(h1 == S_OK && h2 == S_OK && got == v, "[5a] queue private data round-trips (%#lx, %#lx)", h1, h2);
+        ID3D12CommandQueue_SetPrivateData(queue, &test_guid, 0, NULL);
+        n = sizeof got;
+        h2 = ID3D12CommandQueue_GetPrivateData(queue, &test_guid, &n, &got);
+        CHECK(h2 == DXGI_ERROR_NOT_FOUND, "[5a] deleted private data reads as DXGI_ERROR_NOT_FOUND (%#lx)", h2);
+    }
+    {
+        D3D12_HEAP_PROPERTIES hp; D3D12_HEAP_FLAGS hf = (D3D12_HEAP_FLAGS)-1;
+        HRESULT h = ID3D12Resource_GetHeapProperties(rb, &hp, &hf);
+        CHECK(h == S_OK && hp.Type == D3D12_HEAP_TYPE_READBACK, "[5b] readback buffer: heap type READBACK (%#lx, type %d)", h, (int)hp.Type);
+        h = ID3D12Resource_GetHeapProperties(rt, &hp, &hf);
+        CHECK(h == S_OK && hp.Type == D3D12_HEAP_TYPE_DEFAULT, "[5b] render target: heap type DEFAULT (%#lx, type %d)", h, (int)hp.Type);
+    }
+    {
+        static const float green[4] = { 0, 1, 0, 1 };
+        ID3D12GraphicsCommandList1 *l1 = NULL;
+        ID3D12GraphicsCommandList_QueryInterface(list, &IID_ID3D12GraphicsCommandList1, (void **)&l1);
+        ID3D12CommandQueue_BeginEvent(queue, 0, "q", 2);
+        ID3D12GraphicsCommandList_BeginEvent(list, 0, "frame", 6);
+        ID3D12GraphicsCommandList_SetMarker(list, 0, "m", 2);
+        ID3D12GraphicsCommandList_SetPredication(list, rb, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        if (l1) ID3D12GraphicsCommandList1_OMSetDepthBounds(l1, 0.25f, 0.75f);
+        ID3D12GraphicsCommandList_ClearRenderTargetView(list, heap_cpu(rtvh, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 0), green, 0, NULL);
+        ID3D12GraphicsCommandList_SetPredication(list, NULL, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        ID3D12GraphicsCommandList_EndEvent(list);
+        barrier(rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_to_rb(rt, DXGI_FORMAT_R8G8B8A8_UNORM);
+        barrier(rt, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        poison_rb();
+        BOOL ran = submit_and_wait();
+        ID3D12CommandQueue_SetMarker(queue, 0, "q", 2);
+        ID3D12CommandQueue_EndEvent(queue);
+        UINT32 t = rb_texel(5, 5);
+        CHECK(ran && l1 && t == 0xFF00FF00u, "[5c] markers, predication and depth bounds accepted; the predicated clear still ran (texel %08x)", t);
+        if (l1) ID3D12GraphicsCommandList1_Release(l1);
+    }
+    {
+        ID3D12Device5 *d5 = NULL;
+        ID3D12Device_QueryInterface(dev, &IID_ID3D12Device5, (void **)&d5);
+        D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER id; ZeroMemory(&id, sizeof id);
+        D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS st = d5 ? ID3D12Device5_CheckDriverMatchingIdentifier(d5, D3D12_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE, &id)
+                                                        : D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE;
+        CHECK(d5 && st == D3D12_DRIVER_MATCHING_IDENTIFIER_UNRECOGNIZED, "[5d] CheckDriverMatchingIdentifier: unrecognized (%d)", (int)st);
+        if (d5) ID3D12Device5_Release(d5);
+    }
+}
+
 int main(void) {
     HRESULT hr;
-    printf("wine-lab d3d12: regression checks for the 2026-10-12/13 ROTTR fixes\n\n");
+    printf("wine-lab d3d12: regression checks for the 2026-10-12/13 ROTTR fixes and the 2026-10-16 stub audit\n\n");
     HMODULE dcc = LoadLibraryA("d3dcompiler_47.dll");
     p_compile = dcc ? (pD3DCompile)GetProcAddress(dcc, "D3DCompile") : NULL;
     HMODULE d12 = LoadLibraryA("d3d12.dll");
@@ -474,6 +553,7 @@ int main(void) {
     case_null_srv(rt);
     case_step_rate(rt);
     case_rect_clears();
+    case_stub_audit(rt);
 done:
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails;

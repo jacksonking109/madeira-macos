@@ -16,6 +16,7 @@ void madeira_d3d12_note_unimplemented(const char *iface, const char *method);
 static HRESULT mad_pd_get(const void *obj, REFGUID guid, UINT *data_size, void *data);
 static HRESULT mad_pd_set(const void *obj, REFGUID guid, UINT data_size, const void *data);
 static HRESULT mad_pd_set_iface(const void *obj, REFGUID guid, const IUnknown *data);
+static HRESULT mad_set_name(const void *obj, const WCHAR *name);   /* wine-lab port: WKPDID_D3DDebugObjectNameW */
 
 /* ---- ID3D12Device10: 79 slots ---- */
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_QueryInterface(ID3D12Device10 *This, REFIID riid, void **ppvObject) {
@@ -40,7 +41,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_SetPrivateDataInterface(ID3
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Device10_SetName(ID3D12Device10 *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static UINT STDMETHODCALLTYPE stub_ID3D12Device10_GetNodeCount(ID3D12Device10 *This) {
     madeira_d3d12_note_unimplemented("ID3D12Device10", "GetNodeCount");
@@ -422,7 +423,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandQueue_SetPrivateDataInterface
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandQueue_SetName(ID3D12CommandQueue *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandQueue_GetDevice(ID3D12CommandQueue *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12CommandQueue", "GetDevice");
@@ -512,7 +513,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandAllocator_SetPrivateDataInter
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandAllocator_SetName(ID3D12CommandAllocator *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12CommandAllocator_GetDevice(ID3D12CommandAllocator *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12CommandAllocator", "GetDevice");
@@ -558,7 +559,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetPrivateDataI
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_SetName(ID3D12GraphicsCommandList7 *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12GraphicsCommandList7_GetDevice(ID3D12GraphicsCommandList7 *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12GraphicsCommandList7", "GetDevice");
@@ -894,7 +895,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12Fence_SetPrivateDataInterface(ID3D12
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Fence_SetName(ID3D12Fence *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Fence_GetDevice(ID3D12Fence *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12Fence", "GetDevice");
@@ -950,7 +951,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12Resource2_SetPrivateDataInterface(ID
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Resource2_SetName(ID3D12Resource2 *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12Resource2_GetDevice(ID3D12Resource2 *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12Resource2", "GetDevice");
@@ -1035,7 +1036,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12RootSignature_SetPrivateDataInterfac
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12RootSignature_SetName(ID3D12RootSignature *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12RootSignature_GetDevice(ID3D12RootSignature *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12RootSignature", "GetDevice");
@@ -1076,7 +1077,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12PipelineState_SetPrivateDataInterfac
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12PipelineState_SetName(ID3D12PipelineState *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12PipelineState_GetDevice(ID3D12PipelineState *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12PipelineState", "GetDevice");
@@ -1122,7 +1123,7 @@ static HRESULT STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_SetPrivateDataInterfa
     return mad_pd_set_iface(This, guid, data);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_SetName(ID3D12DescriptorHeap *This, const WCHAR *name) {
-    return S_OK;
+    return mad_set_name(This, name);
 }
 static HRESULT STDMETHODCALLTYPE stub_ID3D12DescriptorHeap_GetDevice(ID3D12DescriptorHeap *This, REFIID riid, void **device) {
     madeira_d3d12_note_unimplemented("ID3D12DescriptorHeap", "GetDevice");
