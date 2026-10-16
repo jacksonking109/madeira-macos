@@ -154,7 +154,7 @@ samplers, StructuredBuffer / ByteAddressBuffer / Buffer<uint4> with FirstElement
 another keep their own depths, depth-only and stencil-only rect clears leave the other aspect and the rest alone, and SRVs with a component mapping on R8 and RGBA16F render targets; needs
 d3d12.so's newClearPipeline unix call). Replay bench: `d3d12-bench-x64.exe draws frames draws-per-list dispatches-per-list`, e.g. `2400 100 150 12`
 (16 lists, TLOU-like mix), prints ExecuteCommandLists wall time, submit-to-GPU-done latency and image/UAV hashes.
-d3d12-regress-x64.exe (tests/windows/regress_test.c, 0 failures, 57 checks, also with ds-rect-inpass/ds-rect-defer/
+d3d12-regress-x64.exe (tests/windows/regress_test.c, 0 failures, 63 checks, also with ds-rect-inpass/ds-rect-defer/
 store-defer = 0: the 2026-10-12/13 ROTTR fixes - buffer GetCopyableFootprints total = width at the base offset; NULL
 texture and buffer SRVs read zeros; per-instance step rate 0 = element 0 for every instance (DXBC); rect depth clears
 in an open depth-only pass and held for the next pass, ordered against draws, a full clear and a barrier; and the
@@ -168,6 +168,8 @@ pipelines across UAV barriers (A, B, A, B, ...) and checks every value B read; r
 which splits compute encoders per pipeline for timing (40 -> 45 encoders, same results). Case 7 runs two lists in ONE
 ExecuteCommandLists call, the second ordered after the first only by its own UAV barrier; run it once with
 ecl-list-overlap = 1, under which later lists of one call skip the list-start sync (D3D12 lets them overlap).
+Case 7b puts the barrier at the END of the first list (barriers are queue-wide), after a blit that is the list's
+sync point; fencepost reports the lost barrier on a runtime without f6_sync_owed (TLOU Part I's AO/shadow blurs).
 
 The tests build with `$M/x86_64-w64-mingw32-clang -O2 -Wall -o out/<exe> tests/windows/<file>.c -Itests/windows -luuid -lole32` (the cube demo, cube_window.c, adds -mwindows).
 

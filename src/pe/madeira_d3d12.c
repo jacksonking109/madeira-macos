@@ -1531,6 +1531,7 @@ struct mad_stream {
     struct mad_f6_pend f6_pend[40]; unsigned f6_npend;
     unsigned f6_root; int f6_root_valid;   /* wine-lab port: the last sync point's fence, which every later encoder waits for */
     LONG last_ecl;   /* wine-lab port: ecl-list-overlap -- the ExecuteCommandLists call this stream last replayed a list of */
+    int f6_sync_owed;   /* wine-lab port: the last list ended with a sync point no encoder took up (a barrier as its last command) */
     /* wine-lab port: the render pass the previous list of this replay left open
      * (pass-carry), see mad_exec_list. */
     struct mad_exec *carry; int carry_live;
@@ -6522,7 +6523,12 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
         st->last_ecl = q->ecl_id;
         if (on < 0) { on = mad_cfg_int_pe("ecl-list-overlap", 0) ? 1 : 0;
                       if (on) d3d12_log("[madeira-d3d12] ecl-list-overlap = 1: lists of one ExecuteCommandLists call may overlap on the GPU\n"); }
-        if (on && !first && e.mode == 6 && st->f6_root_valid && g_f6_root_wait > 0) {   /* > 0: still -1 before the first f6_begin reads its key */
+        /* A barrier recorded as the LAST command of the previous list still orders this one:
+         * barriers are queue-wide. It set f6_sync_needed in that list's exec, which no encoder
+         * took up; f6_sync_owed carries it over (TLOU Part I: AO and shadow blurs read what the
+         * pass before them wrote across exactly such a boundary -- fencepost reported 23
+         * encoders, the screen black blotches). */
+        if (on && !first && e.mode == 6 && st->f6_root_valid && g_f6_root_wait > 0 && !st->f6_sync_owed) {   /* > 0: still -1 before the first f6_begin reads its key */
             e.f6_sync_needed = 0; e.f6_list_start = 0; e.f7_reason = 0;
             InterlockedIncrement(&g_ecl_overlap_lists);
         } else mad_fp_barrier(&e);   /* the list start is a sync point (fencepost) */
@@ -6752,6 +6758,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
             d3d12_log("[madeira-d3d12] list executed: %u commands, %u draws, %u skipped\n", l->ncmds, e.draws, e.skipped);
         }
     }
+    st->f6_sync_owed = e.f6_sync_needed;   /* wine-lab port: ecl-list-overlap, see the list start */
 }
 
 static void mad_exec_list(struct mad_queue *q, struct mad_stream *st, struct mad_list *l, obj_handle_t cb) {
