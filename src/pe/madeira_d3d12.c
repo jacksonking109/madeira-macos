@@ -1081,7 +1081,7 @@ static ULONG mad_release(struct mad_obj *o) {
 /* wine-lab port: pending SetEventOnCompletion waits grow without a cap. The
  * fixed 16 refused the 17th with a silent E_OUTOFMEMORY, and a caller that
  * ignores the HRESULT then waits forever on an event nobody sets. */
-struct mad_fence_waiter { UINT64 value; HANDLE event; LONGLONG t_reg; };   /* ml1109: t_reg = registration time */
+struct mad_fence_waiter { UINT64 value; HANDLE event; LONGLONG t_reg; int phase; };   /* ml1109: t_reg = registration time; phase: see mad_fence_phase */
 struct mad_fence {
     ID3D12FenceVtbl *vtbl;
     LONG refs;
@@ -1098,6 +1098,9 @@ struct mad_fence {
     UINT64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
+    /* wine-lab port: per-fence wait census (fence-waits report, every 5 s): how long the game sat
+     * on this fence, by where the awaited value was when it started waiting (mad_fence_phase). */
+    volatile LONG64 st_ticks[3]; volatile LONG st_waits, st_polls;
     struct mad_fence_waiter *waiters;   /* wine-lab port: grown on demand, freed with the fence */
     unsigned nwaiters, cap_waiters;
 };
@@ -1135,6 +1138,18 @@ static void mad_fence_stuck_report(void) {
     }
     ReleaseSRWLockShared(&g_fences_lock);
 }
+/* Where an awaited value stood when the wait began: 0 no queue had been asked to signal it yet
+ * (the game's own ordering), 1 a queue was asked but the batch was still open in this runtime
+ * (not committed to Metal: our batching), 2 committed, so the GPU was running it. */
+static int mad_fence_phase(const struct mad_fence *f, UINT64 value) {
+    if ((LONG64)value <= f->committed) return 2;
+    if ((LONG64)value <= f->submitted) return 1;
+    return 0;
+}
+static void mad_fence_waited(struct mad_fence *f, int phase, LONGLONG ticks) {
+    InterlockedExchangeAdd64(&g_perf_wait_ticks, ticks);
+    InterlockedExchangeAdd64(&f->st_ticks[phase], ticks);
+}
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
     f->value = v;
     WakeAllConditionVariable(&f->cv);
@@ -1142,7 +1157,7 @@ static void fence_set_locked(struct mad_fence *f, UINT64 v) {
     for (unsigned i = 0; i < f->nwaiters; i++) {
         if (f->waiters[i].value <= v) {
             LARGE_INTEGER t; QueryPerformanceCounter(&t);   /* ml1109: how long the game sat on this fence */
-            InterlockedExchangeAdd64(&g_perf_wait_ticks, t.QuadPart - f->waiters[i].t_reg);
+            mad_fence_waited(f, f->waiters[i].phase, t.QuadPart - f->waiters[i].t_reg);
             SetEvent(f->waiters[i].event);
         }
         else f->waiters[w++] = f->waiters[i];
@@ -1205,6 +1220,7 @@ static void mad_gcv_sample(struct mad_fence *f, UINT64 v) {
 static UINT64 STDMETHODCALLTYPE fence_GetCompletedValue(ID3D12Fence *This) {
     struct mad_fence *f = (struct mad_fence *)This;
     InterlockedIncrement(&g_perf_polls);   /* ml1109 */
+    InterlockedIncrement(&f->st_polls);    /* wine-lab port: fence-waits report */
     if ((InterlockedIncrement(&g_gcv_calls) & 0x3ffff) == 0) mad_gcv_sample(f, f->value);   /* ml1142 */
     EnterCriticalSection(&f->lock);
     UINT64 v = f->value;
@@ -1227,12 +1243,17 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
          * may wake spuriously and because an intervening signal may not have
          * reached our value yet. */
         int said_slow = 0;   /* wine-lab port: say when a blocking wait runs long */
+        LARGE_INTEGER t0, t1; int ph = mad_fence_phase(f, value);   /* wine-lab port: counted like event waits (they were not) */
+        QueryPerformanceCounter(&t0);
+        InterlockedIncrement(&g_perf_waits); InterlockedIncrement(&f->st_waits);
         while (f->value < value)
             if (!SleepConditionVariableCS(&f->cv, &f->lock, 3000) && !said_slow && f->value < value) {
                 said_slow = 1;
                 d3d12_log("[stuck-wait] fence %p: BLOCKING wait (null event) for %llu still waiting after 3 s; fence at %llu, asked up to %lld (committed %lld)\n",
                           (void *)f, (unsigned long long)value, (unsigned long long)f->value, (long long)f->submitted, (long long)f->committed);
             }
+        QueryPerformanceCounter(&t1);
+        mad_fence_waited(f, ph, t1.QuadPart - t0.QuadPart);
     } else {
         if (f->nwaiters == f->cap_waiters) {
             unsigned ncap = f->cap_waiters ? f->cap_waiters * 2 : 16;
@@ -1247,7 +1268,8 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
             }
         }
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); f->waiters[f->nwaiters].t_reg = t.QuadPart; }   /* ml1109 */
-        InterlockedIncrement(&g_perf_waits);
+        f->waiters[f->nwaiters].phase = mad_fence_phase(f, value);   /* wine-lab port */
+        InterlockedIncrement(&g_perf_waits); InterlockedIncrement(&f->st_waits);
         f->waiters[f->nwaiters].value = value;
         f->waiters[f->nwaiters].event = event;
         f->nwaiters++;
@@ -7152,6 +7174,39 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     }
     mad_perf_unlock();
 }
+/* wine-lab port: the fences the game waits on longest, every 5 s with the ml1109 line. Per fence:
+ * waits and ms per frame, split by where the awaited value stood when the wait began
+ * (mad_fence_phase: not yet asked of a queue / asked but still in our open batch / on the GPU),
+ * and GetCompletedValue polls per frame. Named by the game's SetName when it gave one. */
+static void mad_fence_waits_report(LONG presents, double freq) {
+    struct { struct mad_fence *f; LONG64 t[3]; LONG w, p; } top[5];
+    unsigned i, k, n = 0;
+    if (presents <= 0 || freq <= 0) return;
+    memset(top, 0, sizeof top);
+    AcquireSRWLockShared(&g_fences_lock);
+    for (i = 0; i < g_nfences; i++) {
+        struct mad_fence *f = g_fences[i];
+        LONG64 t0 = InterlockedExchange64(&f->st_ticks[0], 0), t1 = InterlockedExchange64(&f->st_ticks[1], 0), t2 = InterlockedExchange64(&f->st_ticks[2], 0);
+        LONG w = InterlockedExchange(&f->st_waits, 0), p = InterlockedExchange(&f->st_polls, 0);
+        LONG64 sum = t0 + t1 + t2;
+        if (!sum && !w && !p) continue;
+        for (k = 0; k < n && k < 5; k++) if (sum > top[k].t[0] + top[k].t[1] + top[k].t[2]) break;
+        if (k >= 5) continue;
+        memmove(&top[k + 1], &top[k], (size_t)(4 - k) * sizeof top[0]);
+        top[k].f = f; top[k].t[0] = t0; top[k].t[1] = t1; top[k].t[2] = t2; top[k].w = w; top[k].p = p;
+        if (n < 5) n++;
+    }
+    for (k = 0; k < n; k++) {
+        WCHAR wn[64] = { 0 }; UINT sz = sizeof wn - sizeof(WCHAR); char nm[96];
+        double ms = 1000.0 / freq / presents;
+        if (SUCCEEDED(mad_pd_get(top[k].f, &mad_wkpdid_name_w, &sz, wn)) && wn[0]) WideCharToMultiByte(CP_UTF8, 0, wn, -1, nm, sizeof nm, NULL, NULL);
+        else snprintf(nm, sizeof nm, "unnamed %p", (void *)top[k].f);
+        d3d12_log("[perf] fence-waits %u: %.2f ms/frame in %.1f waits/frame (not yet asked %.2f, in our open batch %.2f, on the GPU %.2f ms), "
+                  "%.1f polls/frame: %s\n", k + 1, (top[k].t[0] + top[k].t[1] + top[k].t[2]) * ms, (double)top[k].w / presents,
+                  top[k].t[0] * ms, top[k].t[1] * ms, top[k].t[2] * ms, (double)top[k].p / presents, nm);
+    }
+    ReleaseSRWLockShared(&g_fences_lock);
+}
 static void mad_perf_present(void) {
     LARGE_INTEGER now, fq; double wall;
     if (g_perf_enabled <= 0) return;
@@ -7241,6 +7296,7 @@ static void mad_perf_present(void) {
                   g_perf_presents ? 1000.0 * g_perf_wait_ticks / (double)fq.QuadPart / g_perf_presents : 0.0, 100.0 * g_perf_wait_ticks / (double)fq.QuadPart / wall,
                   g_perf_presents ? (double)g_perf_polls / g_perf_presents : 0.0, g_perf_presents ? (double)g_perf_qwait_sleeps / g_perf_presents : 0.0,
                   g_perf_sig_lat_n ? 1000.0 * g_perf_sig_lat_ticks / (double)fq.QuadPart / g_perf_sig_lat_n : 0.0, g_perf_sig_lat_n);
+        mad_fence_waits_report(g_perf_presents, (double)fq.QuadPart);   /* wine-lab port */
         g_perf_t0 = now.QuadPart; g_perf_presents = 0; g_perf_cbs = 0; g_perf_gpu_sum = g_perf_gpu_union = g_perf_wait_s = 0; g_perf_first_start = 0;
         g_perf_ecl = g_perf_signals = g_perf_waits = g_perf_polls = g_perf_qwait_sleeps = 0; g_perf_wait_ticks = g_perf_sig_lat_ticks = 0; g_perf_sig_lat_n = 0;
     }
