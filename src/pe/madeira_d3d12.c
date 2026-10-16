@@ -1101,6 +1101,7 @@ struct mad_fence {
     /* wine-lab port: per-fence wait census (fence-waits report, every 5 s): how long the game sat
      * on this fence, by where the awaited value was when it started waiting (mad_fence_phase). */
     volatile LONG64 st_ticks[3]; volatile LONG st_waits, st_polls;
+    volatile LONG64 st_lag;   /* sum over waits of (newest value asked of a queue - awaited value): 0 = the newest */
     struct mad_fence_waiter *waiters;   /* wine-lab port: grown on demand, freed with the fence */
     unsigned nwaiters, cap_waiters;
 };
@@ -1145,6 +1146,9 @@ static int mad_fence_phase(const struct mad_fence *f, UINT64 value) {
     if ((LONG64)value <= f->committed) return 2;
     if ((LONG64)value <= f->submitted) return 1;
     return 0;
+}
+static void mad_fence_lag(struct mad_fence *f, UINT64 value) {   /* at the start of a wait */
+    if ((LONG64)value <= f->submitted) InterlockedExchangeAdd64(&f->st_lag, f->submitted - (LONG64)value);
 }
 static void mad_fence_waited(struct mad_fence *f, int phase, LONGLONG ticks) {
     InterlockedExchangeAdd64(&g_perf_wait_ticks, ticks);
@@ -1245,7 +1249,7 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
         int said_slow = 0;   /* wine-lab port: say when a blocking wait runs long */
         LARGE_INTEGER t0, t1; int ph = mad_fence_phase(f, value);   /* wine-lab port: counted like event waits (they were not) */
         QueryPerformanceCounter(&t0);
-        InterlockedIncrement(&g_perf_waits); InterlockedIncrement(&f->st_waits);
+        InterlockedIncrement(&g_perf_waits); InterlockedIncrement(&f->st_waits); mad_fence_lag(f, value);
         while (f->value < value)
             if (!SleepConditionVariableCS(&f->cv, &f->lock, 3000) && !said_slow && f->value < value) {
                 said_slow = 1;
@@ -1269,7 +1273,7 @@ static HRESULT STDMETHODCALLTYPE fence_SetEventOnCompletion(ID3D12Fence *This, U
         }
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); f->waiters[f->nwaiters].t_reg = t.QuadPart; }   /* ml1109 */
         f->waiters[f->nwaiters].phase = mad_fence_phase(f, value);   /* wine-lab port */
-        InterlockedIncrement(&g_perf_waits); InterlockedIncrement(&f->st_waits);
+        InterlockedIncrement(&g_perf_waits); InterlockedIncrement(&f->st_waits); mad_fence_lag(f, value);
         f->waiters[f->nwaiters].value = value;
         f->waiters[f->nwaiters].event = event;
         f->nwaiters++;
@@ -7179,7 +7183,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
  * (mad_fence_phase: not yet asked of a queue / asked but still in our open batch / on the GPU),
  * and GetCompletedValue polls per frame. Named by the game's SetName when it gave one. */
 static void mad_fence_waits_report(LONG presents, double freq) {
-    struct { struct mad_fence *f; LONG64 t[3]; LONG w, p; } top[5];
+    struct { struct mad_fence *f; LONG64 t[3], lag; LONG w, p; } top[5];
     unsigned i, k, n = 0;
     if (presents <= 0 || freq <= 0) return;
     memset(top, 0, sizeof top);
@@ -7188,12 +7192,13 @@ static void mad_fence_waits_report(LONG presents, double freq) {
         struct mad_fence *f = g_fences[i];
         LONG64 t0 = InterlockedExchange64(&f->st_ticks[0], 0), t1 = InterlockedExchange64(&f->st_ticks[1], 0), t2 = InterlockedExchange64(&f->st_ticks[2], 0);
         LONG w = InterlockedExchange(&f->st_waits, 0), p = InterlockedExchange(&f->st_polls, 0);
+        LONG64 lag = InterlockedExchange64(&f->st_lag, 0);
         LONG64 sum = t0 + t1 + t2;
         if (!sum && !w && !p) continue;
         for (k = 0; k < n && k < 5; k++) if (sum > top[k].t[0] + top[k].t[1] + top[k].t[2]) break;
         if (k >= 5) continue;
         memmove(&top[k + 1], &top[k], (size_t)(4 - k) * sizeof top[0]);
-        top[k].f = f; top[k].t[0] = t0; top[k].t[1] = t1; top[k].t[2] = t2; top[k].w = w; top[k].p = p;
+        top[k].f = f; top[k].t[0] = t0; top[k].t[1] = t1; top[k].t[2] = t2; top[k].w = w; top[k].p = p; top[k].lag = lag;
         if (n < 5) n++;
     }
     for (k = 0; k < n; k++) {
@@ -7202,8 +7207,9 @@ static void mad_fence_waits_report(LONG presents, double freq) {
         if (SUCCEEDED(mad_pd_get(top[k].f, &mad_wkpdid_name_w, &sz, wn)) && wn[0]) WideCharToMultiByte(CP_UTF8, 0, wn, -1, nm, sizeof nm, NULL, NULL);
         else snprintf(nm, sizeof nm, "unnamed %p", (void *)top[k].f);
         d3d12_log("[perf] fence-waits %u: %.2f ms/frame in %.1f waits/frame (not yet asked %.2f, in our open batch %.2f, on the GPU %.2f ms), "
-                  "%.1f polls/frame: %s\n", k + 1, (top[k].t[0] + top[k].t[1] + top[k].t[2]) * ms, (double)top[k].w / presents,
-                  top[k].t[0] * ms, top[k].t[1] * ms, top[k].t[2] * ms, (double)top[k].p / presents, nm);
+                  "%.1f polls/frame, awaited value %.1f behind the newest asked: %s\n", k + 1, (top[k].t[0] + top[k].t[1] + top[k].t[2]) * ms,
+                  (double)top[k].w / presents, top[k].t[0] * ms, top[k].t[1] * ms, top[k].t[2] * ms, (double)top[k].p / presents,
+                  top[k].w ? (double)top[k].lag / top[k].w : 0.0, nm);
     }
     ReleaseSRWLockShared(&g_fences_lock);
 }
@@ -16039,8 +16045,8 @@ static HRESULT mad_swap_make_buffers(struct mad_swapchain *s) {
      * copy. framebuffer_only must be off: a framebuffer-only drawable cannot
      * be a blit destination. */
     mad_swap_apply_layer(s);
-    d3d12_log("[madeira-d3d12] swapchain: %ux%u, %u buffers, format %u, hwnd %p\n",
-              s->desc.Width, s->desc.Height, n, (unsigned)s->desc.Format, (void *)s->hwnd);
+    d3d12_log("[madeira-d3d12] swapchain: %ux%u, %u buffers, format %u, hwnd %p, flags %#x, max frame latency %u\n",
+              s->desc.Width, s->desc.Height, n, (unsigned)s->desc.Format, (void *)s->hwnd, (unsigned)s->desc.Flags, s->max_latency);
     return S_OK;
 }
 
@@ -16423,12 +16429,24 @@ static HRESULT STDMETHODCALLTYPE swap_GetSourceSize(IDXGISwapChain4 *T, UINT *w,
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     if (w) *w = s->desc.Width; if (h) *h = s->desc.Height; return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE swap_SetMaximumFrameLatency(IDXGISwapChain4 *T, UINT n) { ((struct mad_swapchain *)T)->max_latency = n ? n : 1; return S_OK; }
-static HRESULT STDMETHODCALLTYPE swap_GetMaximumFrameLatency(IDXGISwapChain4 *T, UINT *n) { if (!n) return E_INVALIDARG; *n = ((struct mad_swapchain *)T)->max_latency; return S_OK; }
+static HRESULT STDMETHODCALLTYPE swap_SetMaximumFrameLatency(IDXGISwapChain4 *T, UINT n) {
+    static LONG said;   /* wine-lab port: frame pacing questions (TLOU1 waits ~once a frame on the GPU) */
+    if (InterlockedIncrement(&said) <= 4) d3d12_log("[madeira-d3d12] SetMaximumFrameLatency(%u)\n", n);
+    ((struct mad_swapchain *)T)->max_latency = n ? n : 1; return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE swap_GetMaximumFrameLatency(IDXGISwapChain4 *T, UINT *n) {
+    static LONG said;
+    if (!n) return E_INVALIDARG;
+    *n = ((struct mad_swapchain *)T)->max_latency;
+    if (InterlockedIncrement(&said) <= 4) d3d12_log("[madeira-d3d12] GetMaximumFrameLatency -> %u\n", *n);
+    return S_OK;
+}
 static HANDLE STDMETHODCALLTYPE swap_GetFrameLatencyWaitableObject(IDXGISwapChain4 *T) {
     /* Always signalled: presentation never applies back-pressure here, so a
      * waiter must never block on it. */
     struct mad_swapchain *s = (struct mad_swapchain *)T;
+    static LONG said;
+    if (InterlockedIncrement(&said) <= 2) d3d12_log("[madeira-d3d12] GetFrameLatencyWaitableObject (always signalled here)\n");
     if (!s->latency_event) s->latency_event = CreateEventW(NULL, TRUE, TRUE, NULL);
     return s->latency_event;
 }
