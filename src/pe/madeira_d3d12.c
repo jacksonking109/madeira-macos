@@ -559,6 +559,7 @@ static void mad_skip_at(LONG line) {
     }
 }
 static LONG g_cb_errors, g_cb_retired, g_null_cbv_bound, g_vis_fallback, g_null_srv_views;
+static LONG g_air_root_buf;   /* wine-lab port: DXBC root SRV/UAV bindings bounded by their buffer */
 /* ml1109: sync census -- what the game does per frame and how long it waits for us */
 static LONGLONG g_perf_ecl_ticks, g_perf_present_ticks;   /* ml1119 */
 static int g_async_submit;   /* ml1120: defined with the worker below */
@@ -599,7 +600,8 @@ static void mad_skip_report(void) {
     for (i = 0; i < 32 && g_skip_why[i].why; i++)
         d3d12_log("[madeira-d3d12] ml1049 bind failure x%ld: %s\n", g_skip_why[i].n, g_skip_why[i].why);
     d3d12_log("[madeira-d3d12] ml1049 command buffers: %ld retired, %ld ENDED IN ERROR; null CBVs bound to zeros %ld; "
-              "visibility fallbacks %ld; null SRVs on zero dummies %ld\n", g_cb_retired, g_cb_errors, g_null_cbv_bound, g_vis_fallback, g_null_srv_views);
+              "visibility fallbacks %ld; null SRVs on zero dummies %ld; DXBC root SRV/UAV buffers bound %ld\n", g_cb_retired, g_cb_errors,
+              g_null_cbv_bound, g_vis_fallback, g_null_srv_views, g_air_root_buf);
     d3d12_log("[madeira-d3d12] ml1088 occlusion queries: %ld begun, %ld results delivered, %ld queries counted samples > 0, %ld pass restarts; "
               "resolved into GPU-only buffers: %ld copied, %ld answered visible; "
               "ml1089 SRVs with a min-LOD clamp folded into the view: %ld (largest clamp %.1f)\n",
@@ -876,6 +878,7 @@ struct mad_descriptor {
 
 static enum WMTCompareFunction mad_compare(D3D12_COMPARISON_FUNC f);
 static UINT64 mad_uavctr_get(UINT64 va);   /* UAV counters, see CreateUnorderedAccessView */
+static void mad_set_buffer_descriptor(struct mad_descriptor *e, UINT64 va, UINT64 size);
 static void mad_sampler_info(struct WMTSamplerInfo *si, UINT filter, UINT au, UINT av, UINT aw, UINT aniso, UINT cmp, UINT border, float minlod, float maxlod);
 
 /* RTV and DSV heaps hold resource pointers and never reach the GPU; the other
@@ -4495,10 +4498,18 @@ static int mad_air_resolve(struct mad_exec *e, const struct mad_rootsig *rs, con
             if (pp->shader_register != rg->lower_bound || pp->register_space != rg->space) continue;
             e->dep_acc |= 1u << i;
             if (!root[i]) { *why = "root descriptor never set"; return 0; }
-            /* A root SRV/UAV carries an address and no length, and the backend
-             * needs a byte length for buffer bindings. Refuse rather than
-             * invent a bound. */
-            if (rg->type != MADEIRA_IR_AIR_CBV) { *why = "root SRV/UAV has no length for this binding"; return 0; }
+            if (rg->type != MADEIRA_IR_AIR_CBV) {
+                /* wine-lab port: a root SRV/UAV carries an address and no length,
+                 * and this backend needs a byte length for buffer bindings. Bound
+                 * it by the rest of the buffer the address points into, as
+                 * vkd3d-proton does; D3D12 leaves reads past the end undefined. */
+                UINT64 roff = 0;
+                struct mad_resource *rr = mad_resolve_address(e->q->device, root[i], &roff);
+                if (!rr || !rr->buffer || roff >= rr->size) { *why = "root SRV/UAV address is not inside a buffer"; return 0; }
+                mad_set_buffer_descriptor(desc, root[i], rr->size - roff > 0xffffffffull ? 0xffffffffull : rr->size - roff);
+                InterlockedIncrement(&g_air_root_buf);
+                return 1;
+            }
             *direct_va = root[i];
             return 1;
         }

@@ -31,6 +31,10 @@
  *       orders it after the first, also with ecl-list-overlap = 1 (run it once with it on).
  *       7b: the barrier is the LAST command of the first list instead (barriers are
  *       queue-wide); TLOU Part I's AO and shadow blurs, black blotches when it was lost.
+ *    8  Root SRV and UAV buffers in DXBC shaders (no descriptor, only an address): kernel A
+ *       writes through a root UAV 256 bytes into a buffer, kernel B reads it back through a
+ *       raw root SRV at the same address and writes through another root UAV. The DXBC
+ *       backend used to refuse them ("root SRV/UAV has no length") and skip the dispatch.
  *
  *  Shaders are compiled at run time by Wine's d3dcompiler_47 (SM 5.0 DXBC, the
  *  airconv path ROTTR uses). Exit code = number of failed checks.
@@ -552,8 +556,7 @@ static ID3D12PipelineState *make_cpso(const char *name, ID3D12RootSignature *rs,
 static void case_compute_pair(void) {
     enum { N = 1024 };
     printf("\n[6] two compute pipelines across a UAV barrier: B sees all of A's writes\n");
-    /* A descriptor table of two UAVs. (Root UAVs would be the shorter test, but the DXBC
-     * backend refuses root SRV/UAV buffers: no length, see README-lab TODO.) */
+    /* A descriptor table of two UAVs (root UAVs have their own case, 8). */
     D3D12_DESCRIPTOR_RANGE range; ZeroMemory(&range, sizeof range);
     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; range.NumDescriptors = 2; range.BaseShaderRegister = 0;
     D3D12_ROOT_PARAMETER rp; ZeroMemory(&rp, sizeof rp);
@@ -686,6 +689,54 @@ static void case_ecl_pair(int barrier_at_end_of_a) {
     ID3D12RootSignature_Release(rs); ID3D12DescriptorHeap_Release(uh);
 }
 
+/* 8. Root SRV/UAV buffers through the DXBC backend (2026-10-16). Kernel A writes
+ * a[i] = i + 1 through a root UAV that starts 256 bytes into buffer a; kernel B reads that
+ * through a raw root SRV at the same address and writes b[i] = 2 * a[i] through a root UAV.
+ * The bound length is the rest of the buffer, exactly N elements here, so a length taken
+ * from the wrong end would zero the tail. */
+static const char hlsl_ra[] =
+    "RWStructuredBuffer<uint> a : register(u0);\n"
+    "[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) { a[i] = i + 1; }\n";
+static const char hlsl_rb[] =
+    "ByteAddressBuffer t : register(t0);\n"
+    "RWStructuredBuffer<uint> b : register(u0);\n"
+    "[numthreads(64, 1, 1)] void main(uint i : SV_DispatchThreadID) { b[i] = t.Load(i * 4) * 2; }\n";
+static void case_root_buffers(void) {
+    enum { N = 1024, OFF = 256 };
+    printf("\n[8] root SRV and UAV buffers in DXBC shaders\n");
+    D3D12_ROOT_PARAMETER rp[2]; ZeroMemory(rp, sizeof rp);
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV; rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV; rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd; ZeroMemory(&rd, sizeof rd); rd.NumParameters = 2; rd.pParameters = rp;
+    ID3D12RootSignature *rs = make_rs("[8] root buffers", &rd);
+    ID3DBlob *ca = compile("[8] kernel A", hlsl_ra, "main", "cs_5_0"), *cb = compile("[8] kernel B", hlsl_rb, "main", "cs_5_0");
+    ID3D12PipelineState *pa = rs && ca ? make_cpso("[8] kernel A", rs, ca) : NULL, *pb = rs && cb ? make_cpso("[8] kernel B", rs, cb) : NULL;
+    ID3D12Resource *a = make_uav_buffer(OFF + N * 4), *b = make_uav_buffer(N * 4);
+    if (!pa || !pb || !a || !b) { CHECK(0, "[8] setup failed"); return; }
+    D3D12_GPU_VIRTUAL_ADDRESS va = ID3D12Resource_GetGPUVirtualAddress(a) + OFF, vb = ID3D12Resource_GetGPUVirtualAddress(b);
+    ID3D12GraphicsCommandList_SetComputeRootSignature(list, rs);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pa);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0, va);
+    ID3D12GraphicsCommandList_Dispatch(list, N / 64, 1, 1);
+    barrier(a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    ID3D12GraphicsCommandList_SetPipelineState(list, pb);
+    ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 0, vb);
+    ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(list, 1, va);
+    ID3D12GraphicsCommandList_Dispatch(list, N / 64, 1, 1);
+    barrier(b, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, b, 0, N * 4);
+    poison_rb();
+    BOOL ran = submit_and_wait();
+    UINT32 *p = NULL, got[4] = { 0 }; unsigned bad = 0, first = ~0u;
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&p);
+    for (unsigned i = 0; p && i < N; i++) if (p[i] != 2 * (i + 1)) { bad++; if (first == ~0u) first = i; }
+    if (p) { memcpy(got, p, sizeof got); ID3D12Resource_Unmap(rb, 0, NULL); }
+    CHECK(ran && p && !bad, "[8] b[i] = 2 * (i + 1) for all %d elements (%u wrong, first %d)", N, bad, (int)first);
+    if (bad) printf("        got %08x %08x %08x %08x ...\n", got[0], got[1], got[2], got[3]);
+    ID3D12Resource_Release(a); ID3D12Resource_Release(b); ID3D12PipelineState_Release(pa); ID3D12PipelineState_Release(pb);
+    ID3D12RootSignature_Release(rs);
+}
+
 int main(void) {
     HRESULT hr;
     printf("wine-lab d3d12: regression checks for the 2026-10-12/13 ROTTR fixes and the 2026-10-16 stub audit\n\n");
@@ -730,6 +781,7 @@ int main(void) {
     case_compute_pair();
     case_ecl_pair(0);
     case_ecl_pair(1);
+    case_root_buffers();
 done:
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails;
