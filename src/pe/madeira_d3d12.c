@@ -16154,7 +16154,20 @@ static HRESULT STDMETHODCALLTYPE swap_GetDevice(IDXGISwapChain4 *T, REFIID riid,
  * It also stops leaking one command buffer per frame. */
 static HRESULT swap_Present_inner(IDXGISwapChain4 *T, UINT sync, UINT flags);
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags);
-static HRESULT STDMETHODCALLTYPE swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
+/* wine-lab port: Present/Present1 and ResizeBuffers/ResizeBuffers1 each share one body
+ * (mad_swap_present, mad_swap_resize), but every vtable method keeps a prologue of its own:
+ * no method may compile to a bare jmp into another. Overlays hook both methods of a pair,
+ * and Steam's follows a leading jmp: its 7-argument ResizeBuffers1 hook then sat on
+ * ResizeBuffers, read two stack arguments RDR2 never passed (its mode description) as the
+ * present-queue array and crashed the game when it resized its swapchain. */
+#define MAD_OWN_ENTRY __attribute__((disable_tail_calls))
+static HRESULT mad_swap_present(IDXGISwapChain4 *T, UINT sync, UINT flags);
+static HRESULT mad_swap_resize(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags);
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_Present(IDXGISwapChain4 *T, UINT sync, UINT flags) { return mad_swap_present(T, sync, flags); }
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
+    return mad_swap_resize(T, count, w, h, fmt, flags);
+}
+static __attribute__((noinline)) HRESULT mad_swap_present(IDXGISwapChain4 *T, UINT sync, UINT flags) {   /* ml1119: timed wrapper */
     LARGE_INTEGER t0, t1; HRESULT hr;
     mad_xp_role('P'); InterlockedIncrement64(&g_xp.pres_enq);   /* ml1128 */
     InterlockedIncrement(&g_shadow_frames); InterlockedIncrement64(&g_present_seq);   /* wine-lab port: per-frame RGB32 shadow figures and rules */
@@ -16401,7 +16414,7 @@ static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAI
     d->Flags = s->desc.Flags;
     return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
+static __attribute__((noinline)) HRESULT mad_swap_resize(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     UINT i;
     if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1120: no list may still reference the old buffers */
@@ -16460,7 +16473,7 @@ static HRESULT STDMETHODCALLTYPE swap_GetHwnd(IDXGISwapChain4 *T, HWND *h) {
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_GetCoreWindow(IDXGISwapChain4 *T, REFIID riid, void **out) { (void)T; (void)riid; if (out) *out = NULL; return DXGI_ERROR_INVALID_CALL; }
-static HRESULT STDMETHODCALLTYPE swap_Present1(IDXGISwapChain4 *T, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p) { (void)p; return swap_Present(T, sync, flags); }
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_Present1(IDXGISwapChain4 *T, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS *p) { (void)p; return mad_swap_present(T, sync, flags); }
 static BOOL STDMETHODCALLTYPE swap_IsTemporaryMonoSupported(IDXGISwapChain4 *T) { (void)T; return FALSE; }
 static HRESULT STDMETHODCALLTYPE swap_GetRestrictToOutput(IDXGISwapChain4 *T, IDXGIOutput **out) { (void)T; if (out) *out = NULL; return S_OK; }
 static HRESULT STDMETHODCALLTYPE swap_SetBackgroundColor(IDXGISwapChain4 *T, const DXGI_RGBA *c) { (void)T; (void)c; return S_OK; }
@@ -16508,10 +16521,10 @@ static HRESULT STDMETHODCALLTYPE swap_SetColorSpace1(IDXGISwapChain4 *T, DXGI_CO
     d3d12_log("[madeira-d3d12] SetColorSpace1(%u) refused: only sRGB is presented\n", (unsigned)cs);
     return E_INVALIDARG;
 }
-static HRESULT STDMETHODCALLTYPE swap_ResizeBuffers1(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_ResizeBuffers1(IDXGISwapChain4 *T, UINT count, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags,
                                                      const UINT *node_masks, IUnknown *const *queues) {
     (void)node_masks; (void)queues;
-    return swap_ResizeBuffers(T, count, w, h, fmt, flags);
+    return mad_swap_resize(T, count, w, h, fmt, flags);
 }
 static HRESULT STDMETHODCALLTYPE swap_SetHDRMetaData(IDXGISwapChain4 *T, DXGI_HDR_METADATA_TYPE type, UINT n, void *d) { (void)T; (void)type; (void)n; (void)d; return S_OK; }
 
