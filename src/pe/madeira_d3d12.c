@@ -15957,8 +15957,13 @@ struct mad_swapchain {
     /* MetalFX spatial upscaling of the presented image (madeira.cfg metalfx-upscale) */
     obj_handle_t fx_scaler, fx_out, fx_view[MAD_SWAP_MAX_BUFFERS];
     UINT fx_w, fx_h;
+    /* wine-lab port: fullscreen (SetFullscreenState), as DXMT's D3D11 swapchain: the window
+     * state to restore, the monitor covered, and whether we changed its display mode */
+    HMONITOR fs_monitor; LONG fs_style, fs_exstyle; RECT fs_rect; BOOL fs_mode_set;
+    WCHAR fs_device[CCHDEVICENAME];
 };
 static IDXGISwapChain4Vtbl g_swap_vtbl;
+static void mad_fs_leave(struct mad_swapchain *s, const char *why);   /* wine-lab port */
 
 static void mad_swap_release_fx(struct mad_swapchain *s) {
     UINT i;
@@ -16113,6 +16118,7 @@ static ULONG STDMETHODCALLTYPE swap_Release(IDXGISwapChain4 *T) {
     LONG n = InterlockedDecrement(&s->refs);
     if (n == 0) { mad_pd_purge(T);   /* ml1143 */
         if (s->queue && s->queue->sub_thread) mad_queue_drain(s->queue);   /* ml1121: queued presents name this swapchain */
+        mad_fs_leave(s, "swapchain released");   /* wine-lab port: the display mode and the window come back */
         mad_swap_release_buffers(s);
         if (g_layer_cfg_owner == s) g_layer_cfg_owner = NULL;   /* the next Present re-applies its own layer settings */
         if (s->view) ReleaseMetalView(s->view);
@@ -16382,18 +16388,182 @@ static HRESULT STDMETHODCALLTYPE swap_GetBuffer(IDXGISwapChain4 *T, UINT i, REFI
     if (i >= s->nbuf) return DXGI_ERROR_INVALID_CALL;
     return res_QI((ID3D12Resource *)s->buffers[i], riid, out);
 }
-static HRESULT STDMETHODCALLTYPE swap_SetFullscreenState(IDXGISwapChain4 *T, BOOL fs, IDXGIOutput *target) {
+/* wine-lab port: FULLSCREEN, as DXMT's D3D11 swapchain (d3d11_swapchain.cpp EnterFullscreenMode /
+ * LeaveFullscreenMode, util/wsi_window_win32.cpp). Entering remembers the window's style and rect,
+ * changes the display mode to the back buffer size if the swapchain allows mode switches, then
+ * makes the window a topmost popup covering the monitor. Under Wine's EmulateModeset the mode
+ * change is virtual: the game sees e.g. a 1920x1200 desktop, the Mac keeps its own mode, and
+ * win32u maps the window to the whole physical screen with the client area scaled aspect-correct
+ * (the Metal layer follows it). Without it, macdrv would really switch the Mac's display mode, so
+ * by default we only change modes when Wine emulates them; madeira.cfg fullscreen-modeset = 1
+ * (always) or 0 (never) overrides. The present-rect escape DXMT sends is left out: win32u treats a
+ * window covering the monitor as fullscreen by itself (map_window_rects_virt_to_raw). Windows of
+ * other processes (Steam's cross-process swapchains) only record the state. */
+static int mad_reg_option(const WCHAR *path, const WCHAR *name, int *val) {
+    HKEY k; WCHAR buf[16]; DWORD type = 0, size = sizeof buf - sizeof(WCHAR); LONG r;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_QUERY_VALUE, &k)) return 0;
+    memset(buf, 0, sizeof buf);
+    r = RegQueryValueExW(k, name, NULL, &type, (BYTE *)buf, &size);
+    RegCloseKey(k);
+    if (r || type != REG_SZ || !buf[0]) return 0;
+    *val = buf[0] == 'y' || buf[0] == 'Y' || buf[0] == 't' || buf[0] == 'T' || buf[0] == '1';   /* win32u's IS_OPTION_TRUE */
+    return 1;
+}
+static int mad_fs_modeset_allowed(void) {
+    static int on = -1;
+    if (on < 0) {
+        char v[16]; int emu = 0;
+        WCHAR exe[MAX_PATH], path[MAX_PATH + 64], *base;
+        DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+        if (n && n < MAX_PATH) {   /* the keys win32u reads: AppDefaults\<exe>\X11 Driver, then X11 Driver */
+            base = wcsrchr(exe, L'\\'); base = base ? base + 1 : exe;
+            wcscpy(path, L"Software\\Wine\\AppDefaults\\"); wcscat(path, base); wcscat(path, L"\\X11 Driver");
+            if (!mad_reg_option(path, L"EmulateModeset", &emu)) mad_reg_option(L"Software\\Wine\\X11 Driver", L"EmulateModeset", &emu);
+        }
+        if (mad_cfg_str_pe("fullscreen-modeset", v, sizeof v) && (v[0] == '0' || v[0] == '1')) on = v[0] == '1';
+        else on = emu;
+        d3d12_log("[madeira-d3d12] fullscreen-modeset = %d (Wine EmulateModeset %d%s)\n", on, emu,
+                  on ? (emu ? ": mode changes are virtual, the window is scaled to the screen" : ": REAL macOS display mode switches")
+                     : ": the display mode is never changed");
+    }
+    return on;
+}
+static BOOL mad_fs_foreign(HWND hwnd) { DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid); return pid != GetCurrentProcessId(); }
+/* SetWindowPos from a thread other than the window's: posted, so a window thread that waits on us cannot deadlock */
+static UINT mad_fs_swp_async(HWND hwnd) { return GetWindowThreadProcessId(hwnd, NULL) == GetCurrentThreadId() ? 0 : SWP_ASYNCWINDOWPOS; }
+/* The display mode closest to w x h (exact size first, then the refresh rate asked for or the current one). */
+static void mad_fs_set_mode(struct mad_swapchain *s, UINT w, UINT h, DXGI_RATIONAL rr, const char *why) {
+    DEVMODEW cur, dm, best; DWORD i; LONG r; UINT hz; LONG64 score, best_score = -1;
+    static LONG said;
+    memset(&cur, 0, sizeof cur); cur.dmSize = sizeof cur;
+    if (!s->fs_device[0] || !EnumDisplaySettingsW(s->fs_device, ENUM_CURRENT_SETTINGS, &cur)) return;
+    hz = rr.Denominator && rr.Numerator ? (rr.Numerator + rr.Denominator / 2) / rr.Denominator : cur.dmDisplayFrequency;
+    for (i = 0; ; i++) {
+        memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+        if (!EnumDisplaySettingsW(s->fs_device, i, &dm)) break;
+        if (dm.dmBitsPerPel != cur.dmBitsPerPel || (dm.dmDisplayFlags & DM_INTERLACED)) continue;
+        score = ((LONG64)labs((LONG)dm.dmPelsWidth - (LONG)w) + labs((LONG)dm.dmPelsHeight - (LONG)h)) * 1000 +
+                labs((LONG)dm.dmDisplayFrequency - (LONG)hz);
+        if (best_score < 0 || score < best_score) { best = dm; best_score = score; }
+    }
+    if (best_score < 0) return;
+    if (best.dmPelsWidth == cur.dmPelsWidth && best.dmPelsHeight == cur.dmPelsHeight && best.dmDisplayFrequency == cur.dmDisplayFrequency) {
+        if (InterlockedIncrement(&said) <= 4)
+            d3d12_log("[madeira-d3d12] fullscreen %s: %ux%u asked, the display is already %lux%lu@%lu\n", why, w, h,
+                      cur.dmPelsWidth, cur.dmPelsHeight, cur.dmDisplayFrequency);
+        return;
+    }
+    best.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    r = ChangeDisplaySettingsExW(s->fs_device, &best, NULL, CDS_FULLSCREEN, NULL);
+    if (r != DISP_CHANGE_SUCCESSFUL) {   /* as DXMT: once more without the refresh rate */
+        best.dmFields &= ~DM_DISPLAYFREQUENCY;
+        r = ChangeDisplaySettingsExW(s->fs_device, &best, NULL, CDS_FULLSCREEN, NULL);
+    }
+    if (r == DISP_CHANGE_SUCCESSFUL) s->fs_mode_set = TRUE;
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] fullscreen %s: %ux%u asked, display mode %lux%lu@%lu -> %lux%lu@%lu: ChangeDisplaySettingsEx %ld\n",
+                  why, w, h, cur.dmPelsWidth, cur.dmPelsHeight, cur.dmDisplayFrequency,
+                  best.dmPelsWidth, best.dmPelsHeight, best.dmDisplayFrequency, r);
+}
+/* Move the window over its monitor, taken after any mode change. */
+static void mad_fs_cover(struct mad_swapchain *s, HWND after, UINT flags) {
+    MONITORINFO mi;
+    s->fs_monitor = MonitorFromWindow(s->hwnd, MONITOR_DEFAULTTONEAREST);
+    mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoW(s->fs_monitor, &mi)) return;
+    SetWindowPos(s->hwnd, after, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top, flags | SWP_NOACTIVATE | mad_fs_swp_async(s->hwnd));
+}
+static void mad_fs_enter(struct mad_swapchain *s, HMONITOR mon, const char *why) {
+    MONITORINFOEXW mi; LONG style, ex;
+    static LONG said;
+    if (!s->fs.Windowed) return;
+    s->fs.Windowed = FALSE;
+    if (!IsWindow(s->hwnd) || mad_fs_foreign(s->hwnd)) {
+        if (InterlockedIncrement(&said) <= 4) d3d12_log("[madeira-d3d12] fullscreen %s: hwnd %p is not ours, state recorded only\n", why, (void *)s->hwnd);
+        return;
+    }
+    if (!mon) mon = MonitorFromWindow(s->hwnd, MONITOR_DEFAULTTOPRIMARY);
+    mi.cbSize = sizeof mi;
+    s->fs_device[0] = 0;
+    if (GetMonitorInfoW(mon, (MONITORINFO *)&mi)) memcpy(s->fs_device, mi.szDevice, sizeof s->fs_device);
+    s->fs_monitor = mon; s->fs_mode_set = FALSE;
+    GetWindowRect(s->hwnd, &s->fs_rect);
+    s->fs_style = GetWindowLongW(s->hwnd, GWL_STYLE);
+    s->fs_exstyle = GetWindowLongW(s->hwnd, GWL_EXSTYLE);
+    if ((s->desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) && mad_fs_modeset_allowed())
+        mad_fs_set_mode(s, s->desc.Width, s->desc.Height, s->fs.RefreshRate, why);
+    style = s->fs_style & ~WS_OVERLAPPEDWINDOW; ex = s->fs_exstyle & ~WS_EX_OVERLAPPEDWINDOW;
+    SetWindowLongW(s->hwnd, GWL_STYLE, style);
+    SetWindowLongW(s->hwnd, GWL_EXSTYLE, ex);
+    mad_fs_cover(s, HWND_TOPMOST, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    if (InterlockedIncrement(&said) <= 4) {
+        MONITORINFO m2; m2.cbSize = sizeof m2;
+        if (!GetMonitorInfoW(s->fs_monitor, &m2)) SetRectEmpty(&m2.rcMonitor);
+        d3d12_log("[madeira-d3d12] fullscreen %s: hwnd %p, buffers %ux%u, flags %#x, mode %s; window %ld,%ld %ldx%ld (style %#lx) -> monitor %ld,%ld %ldx%ld\n",
+                  why, (void *)s->hwnd, s->desc.Width, s->desc.Height, (unsigned)s->desc.Flags, s->fs_mode_set ? "changed" : "kept",
+                  s->fs_rect.left, s->fs_rect.top, s->fs_rect.right - s->fs_rect.left, s->fs_rect.bottom - s->fs_rect.top,
+                  (unsigned long)s->fs_style, m2.rcMonitor.left, m2.rcMonitor.top,
+                  m2.rcMonitor.right - m2.rcMonitor.left, m2.rcMonitor.bottom - m2.rcMonitor.top);
+    }
+}
+static void mad_fs_leave(struct mad_swapchain *s, const char *why) {
+    LONG r = DISP_CHANGE_SUCCESSFUL, style, ex;
+    static LONG said;
+    if (s->fs.Windowed) return;
+    s->fs.Windowed = TRUE;
+    if (!s->fs_monitor) return;   /* recorded only */
+    s->fs_monitor = NULL;
+    if (s->fs_mode_set) { r = ChangeDisplaySettingsExW(s->fs_device, NULL, NULL, 0, NULL); s->fs_mode_set = FALSE; }
+    if (IsWindow(s->hwnd)) {
+        /* as native DXGI (and DXMT): the style comes back only if the application left ours alone */
+        style = GetWindowLongW(s->hwnd, GWL_STYLE) & ~WS_VISIBLE;
+        ex = GetWindowLongW(s->hwnd, GWL_EXSTYLE) & ~WS_EX_TOPMOST;
+        if (style == (s->fs_style & ~(WS_VISIBLE | WS_OVERLAPPEDWINDOW)) && ex == (s->fs_exstyle & ~(WS_EX_TOPMOST | WS_EX_OVERLAPPEDWINDOW))) {
+            SetWindowLongW(s->hwnd, GWL_STYLE, s->fs_style);
+            SetWindowLongW(s->hwnd, GWL_EXSTYLE, s->fs_exstyle);
+        }
+        SetWindowPos(s->hwnd, (s->fs_exstyle & WS_EX_TOPMOST) ? HWND_TOPMOST : HWND_NOTOPMOST, s->fs_rect.left, s->fs_rect.top,
+                     s->fs_rect.right - s->fs_rect.left, s->fs_rect.bottom - s->fs_rect.top,
+                     SWP_FRAMECHANGED | SWP_NOACTIVATE | mad_fs_swp_async(s->hwnd));
+    }
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] fullscreen left (%s): hwnd %p, display mode restore %ld, window back to %ld,%ld %ldx%ld\n",
+                  why, (void *)s->hwnd, r, s->fs_rect.left, s->fs_rect.top,
+                  s->fs_rect.right - s->fs_rect.left, s->fs_rect.bottom - s->fs_rect.top);
+}
+/* The output showing monitor `mon` (the first one if none matches), AddRef'd. */
+static HRESULT mad_swap_output(struct mad_swapchain *s, HMONITOR mon, IDXGIOutput **out) {
+    IDXGIAdapter1 *adapter = NULL; IDXGIOutput *o = NULL, *first = NULL; DXGI_OUTPUT_DESC od; UINT i; HRESULT hr;
+    *out = NULL;
+    if (!s->factory) return DXGI_ERROR_UNSUPPORTED;
+    hr = IDXGIFactory1_EnumAdapters1(s->factory, 0, &adapter);
+    if (FAILED(hr)) return hr;
+    for (i = 0; SUCCEEDED(IDXGIAdapter1_EnumOutputs(adapter, i, &o)); i++) {
+        if (mon && SUCCEEDED(IDXGIOutput_GetDesc(o, &od)) && od.Monitor == mon) { *out = o; break; }
+        if (!first) first = o; else IDXGIOutput_Release(o);
+    }
+    IDXGIAdapter1_Release(adapter);
+    if (*out) { if (first) IDXGIOutput_Release(first); }
+    else *out = first;
+    return *out ? S_OK : DXGI_ERROR_NOT_FOUND;
+}
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_SetFullscreenState(IDXGISwapChain4 *T, BOOL fs, IDXGIOutput *target) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
-    (void)target;
-    /* The window is what the desktop says it is; fullscreen is recorded so the
-     * application reads back what it set, and changes nothing else. */
-    s->fs.Windowed = !fs;
+    HMONITOR mon = NULL; DXGI_OUTPUT_DESC od;
+    if (target && SUCCEEDED(IDXGIOutput_GetDesc(target, &od))) mon = od.Monitor;
+    if (fs && !s->fs.Windowed && mon && s->fs_monitor && mon != s->fs_monitor) mad_fs_leave(s, "output change");
+    if (fs) mad_fs_enter(s, mon, "SetFullscreenState");
+    else mad_fs_leave(s, "SetFullscreenState");
     return S_OK;
 }
-static HRESULT STDMETHODCALLTYPE swap_GetFullscreenState(IDXGISwapChain4 *T, BOOL *fs, IDXGIOutput **target) {
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_GetFullscreenState(IDXGISwapChain4 *T, BOOL *fs, IDXGIOutput **target) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
     if (fs) *fs = !s->fs.Windowed;
-    if (target) *target = NULL;
+    if (target) {   /* wine-lab port: native DXGI hands the output out while fullscreen */
+        *target = NULL;
+        if (!s->fs.Windowed) mad_swap_output(s, s->fs_monitor ? s->fs_monitor : MonitorFromWindow(s->hwnd, MONITOR_DEFAULTTOPRIMARY), target);
+    }
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE swap_GetDesc(IDXGISwapChain4 *T, DXGI_SWAP_CHAIN_DESC *d) {
@@ -16429,19 +16599,37 @@ static __attribute__((noinline)) HRESULT mad_swap_resize(IDXGISwapChain4 *T, UIN
     s->desc.Flags = flags;
     return mad_swap_make_buffers(s);
 }
-static HRESULT STDMETHODCALLTYPE swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) { (void)T; (void)m; return S_OK; }
-static HRESULT STDMETHODCALLTYPE swap_GetContainingOutput(IDXGISwapChain4 *T, IDXGIOutput **out) {
+/* wine-lab port: windowed, the client area takes the mode's size; fullscreen, the display mode
+ * changes (with ALLOW_MODE_SWITCH, see mad_fs_enter) and the window covers the monitor again. */
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_ResizeTarget(IDXGISwapChain4 *T, const DXGI_MODE_DESC *m) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
-    IDXGIAdapter1 *adapter = NULL;
-    HRESULT hr;
+    static LONG said;
+    if (!m) return DXGI_ERROR_INVALID_CALL;
+    if (!IsWindow(s->hwnd)) return DXGI_ERROR_INVALID_CALL;
+    if (m->RefreshRate.Numerator) s->fs.RefreshRate = m->RefreshRate;
+    s->fs.ScanlineOrdering = m->ScanlineOrdering;
+    s->fs.Scaling = m->Scaling;
+    if (mad_fs_foreign(s->hwnd)) return S_OK;
+    if (InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] ResizeTarget %ux%u (%s): hwnd %p\n", m->Width, m->Height, s->fs.Windowed ? "windowed" : "fullscreen", (void *)s->hwnd);
+    if (s->fs.Windowed) {
+        RECT r = {0, 0, (LONG)m->Width, (LONG)m->Height};
+        if (!m->Width || !m->Height) return S_OK;
+        AdjustWindowRectEx(&r, GetWindowLongW(s->hwnd, GWL_STYLE), GetMenu(s->hwnd) != NULL, GetWindowLongW(s->hwnd, GWL_EXSTYLE));
+        SetWindowPos(s->hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | mad_fs_swp_async(s->hwnd));
+    } else if (s->fs_monitor) {
+        if ((s->desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH) && mad_fs_modeset_allowed())
+            mad_fs_set_mode(s, m->Width ? m->Width : s->desc.Width, m->Height ? m->Height : s->desc.Height, m->RefreshRate, "ResizeTarget");
+        mad_fs_cover(s, NULL, SWP_NOZORDER);
+    }
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE MAD_OWN_ENTRY swap_GetContainingOutput(IDXGISwapChain4 *T, IDXGIOutput **out) {
+    struct mad_swapchain *s = (struct mad_swapchain *)T;
     if (!out) return E_POINTER;
     *out = NULL;
-    if (!s->factory) return DXGI_ERROR_UNSUPPORTED;
-    hr = IDXGIFactory1_EnumAdapters1(s->factory, 0, &adapter);
-    if (FAILED(hr)) return hr;
-    hr = IDXGIAdapter1_EnumOutputs(adapter, 0, out);
-    IDXGIAdapter1_Release(adapter);
-    return hr;
+    return mad_swap_output(s, MonitorFromWindow(s->hwnd, MONITOR_DEFAULTTOPRIMARY), out);   /* wine-lab port: the window's output */
 }
 static HRESULT STDMETHODCALLTYPE swap_GetFrameStatistics(IDXGISwapChain4 *T, DXGI_FRAME_STATISTICS *st) {
     struct mad_swapchain *s = (struct mad_swapchain *)T;
@@ -16555,6 +16743,7 @@ static HRESULT mad_swapchain_create(struct mad_queue *q, IDXGIFactory1 *factory,
     }
     hr = mad_swap_make_buffers(s);
     if (FAILED(hr)) { swap_Release((IDXGISwapChain4 *)s); return hr; }
+    if (!s->fs.Windowed) { s->fs.Windowed = TRUE; mad_fs_enter(s, NULL, "created fullscreen"); }   /* wine-lab port */
     *out = (IDXGISwapChain1 *)s;
     return S_OK;
 }
