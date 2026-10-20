@@ -1542,6 +1542,7 @@ struct mad_stream {
     struct mad_vis_batch *vis;     /* ml1088: the open batch's query slots, NULL until a query heap exists */
     UINT64 batch_no;      /* parallel-encode: the batch number its command buffer gets (0: the queue's open batch) */
     obj_handle_t cb;      /* parallel-encode: that command buffer */
+    UINT64 serial;        /* parallel-encode: GPU-timeline serial reserved when its command buffer was enqueued (0: take one at commit) */
 };
 struct mad_queue {
     ID3D12CommandQueueVtbl *vtbl;
@@ -6964,7 +6965,25 @@ static void mad_ecl_run_parallel(struct mad_queue *q, struct mad_list *const *vl
         for (k = 1; k < r; k++) { NSObject_release(q->pst[k - 1].cb); q->pst[k - 1].cb = 0; q->pst[k - 1].batch_no = 0; }
         nr = 1;
     }
-    if (nr > 1) madeira_cb_enqueue(cbs, nr);   /* GPU order = run order, fixed before anything is encoded */
+    if (nr > 1) {   /* GPU order = run order, fixed before anything is encoded */
+        /* wine-lab port: and their SERIALS, in the same step. All D3D12 queues feed one Metal
+         * queue, and a buffer another queue (TLOU1: three compute queues) commits while these
+         * runs are still being encoded lands BEHIND them on the GPU. A serial taken at commit
+         * gave it a LOWER serial than the runs it follows, so the shared event passed it as
+         * soon as run 1 finished: its list's argument-ring chunks went back to the pool
+         * (mad_ring_chunk_get, mad_list_rings_rewind) and were rewritten before it ran, and
+         * its own signal later moved the event backwards. Enqueue and reservation under
+         * fence_lock, as every commit takes its serial, keep serial order = GPU order. */
+        struct mad_device *sd = q->device;
+        EnterCriticalSection(&sd->fence_lock);
+        madeira_cb_enqueue(cbs, nr);
+        if (sd->gpu_event) {
+            UINT64 base = (UINT64)InterlockedExchangeAdd64(&sd->gpu_serial, (LONG64)nr);   /* the value before: run r gets base + 1 + r */
+            q->st.serial = base + 1;
+            for (r = 1; r < nr; r++) q->pst[r - 1].serial = base + 1 + r;
+        }
+        LeaveCriticalSection(&sd->fence_lock);
+    }
     AcquireSRWLockExclusive(&g_pw_lock);
     for (r = 1; r < nr; r++) {
         struct mad_pjob *j = &jobs[r];
@@ -7453,12 +7472,18 @@ static void mad_commit_stream(struct mad_queue *q, struct mad_stream *st, obj_ha
         if (sd->resset && InterlockedExchange(&sd->resset_dirty, 0)) mad_resident_commit(sd);
         EnterCriticalSection(&sd->fence_lock);
         if (sd->gpu_event) {
-            serial = (UINT64)InterlockedIncrement64(&sd->gpu_serial);
+            /* wine-lab port: a parallel-encode run already holds the serial of its enqueued slot */
+            serial = st->serial ? st->serial : (UINT64)InterlockedIncrement64(&sd->gpu_serial);
             MTLCommandBuffer_encodeSignalEvent(cb, sd->gpu_event, serial);
         }
-        mad_vis_flush(q, st, cb);            /* ml1099: under fence_lock, so the pending list is in SERIAL order (Astra) */
+        st->serial = 0;
+        mad_vis_flush(q, st, cb);            /* ml1099: under fence_lock, so the pending list is in commit order (Astra) */
         MTLCommandBuffer_commit(cb);
-        if (serial) { q->last_serial = serial; InterlockedExchange64(&sd->gpu_serial_committed, (LONG64)serial); }
+        if (serial) {
+            q->last_serial = serial;
+            /* wine-lab port: a run's reserved serial can be below one another queue committed meanwhile */
+            if ((LONG64)serial > sd->gpu_serial_committed) InterlockedExchange64(&sd->gpu_serial_committed, (LONG64)serial);
+        }
         LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
     }
