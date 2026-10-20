@@ -562,6 +562,10 @@ static LONG g_cb_errors, g_cb_retired, g_null_cbv_bound, g_vis_fallback, g_null_
 static LONG g_air_root_buf;   /* wine-lab port: DXBC root SRV/UAV bindings bounded by their buffer */
 /* ml1109: sync census -- what the game does per frame and how long it waits for us */
 static LONGLONG g_perf_ecl_ticks, g_perf_present_ticks;   /* ml1119 */
+/* wine-lab port: what the current frame did (since the last Present), logged when it turns out
+ * to be a spike (madeira.cfg spike-ms, default 100); reset at every Present */
+static LONG64 g_spk_pso, g_spk_pso_ticks, g_spk_tex, g_spk_buf, g_spk_buf_bytes, g_spk_res_ticks,
+              g_spk_heap, g_spk_heap_bytes, g_spk_wait_ticks, g_spk_ecl, g_spk_ecl_ticks, g_spk_present_ticks;
 static int g_async_submit;   /* ml1120: defined with the worker below */
 static LONGLONG g_perf_worker_ticks, g_perf_drain_ticks, g_perf_resetwait_ticks, g_perf_waitjob_ticks; static LONG g_perf_resetwaits, g_perf_jobs;   /* ml1120 */
 /* ml1128: TRANSITION PROBE (measurement only). Cumulative QPC ticks / counts,
@@ -1156,6 +1160,7 @@ static void mad_fence_lag(struct mad_fence *f, UINT64 value) {   /* at the start
 }
 static void mad_fence_waited(struct mad_fence *f, int phase, LONGLONG ticks) {
     InterlockedExchangeAdd64(&g_perf_wait_ticks, ticks);
+    InterlockedExchangeAdd64(&g_spk_wait_ticks, ticks);   /* wine-lab port: spike stats */
     InterlockedExchangeAdd64(&f->st_ticks[phase], ticks);
 }
 static void fence_set_locked(struct mad_fence *f, UINT64 v) {
@@ -7162,6 +7167,7 @@ static void STDMETHODCALLTYPE queue_ExecuteCommandLists(ID3D12CommandQueue *This
 done:
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_ecl_ticks, t1.QuadPart - t0.QuadPart);
+    InterlockedIncrement64(&g_spk_ecl); InterlockedExchangeAdd64(&g_spk_ecl_ticks, t1.QuadPart - t0.QuadPart);   /* wine-lab port */
     InterlockedExchangeAdd64(&g_xp.t_ecl_caller, t1.QuadPart - t0.QuadPart);   /* ml1128 */
 }
 /* Cross-queue synchronisation. Every queue here submits to the one Metal
@@ -7294,7 +7300,26 @@ static void mad_perf_present(void) {
     if (g_perf_enabled <= 0) return;
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     mad_perf_lock();
-    if (g_ft_last && g_nft < MAD_FT_MAX) g_ft[g_nft++] = (float)((double)(now.QuadPart - g_ft_last) * 1000.0 / (double)fq.QuadPart);
+    {   /* wine-lab port: a frame over spike-ms says what it did */
+        static int spike_ms = -1; static LONG said;
+        double ms = g_ft_last ? (double)(now.QuadPart - g_ft_last) * 1000.0 / (double)fq.QuadPart : 0.0, tick_ms = 1000.0 / (double)fq.QuadPart;
+        LONG64 pso = InterlockedExchange64(&g_spk_pso, 0), pso_t = InterlockedExchange64(&g_spk_pso_ticks, 0);
+        LONG64 tex = InterlockedExchange64(&g_spk_tex, 0), buf = InterlockedExchange64(&g_spk_buf, 0);
+        LONG64 bufb = InterlockedExchange64(&g_spk_buf_bytes, 0), res_t = InterlockedExchange64(&g_spk_res_ticks, 0);
+        LONG64 heap = InterlockedExchange64(&g_spk_heap, 0), heapb = InterlockedExchange64(&g_spk_heap_bytes, 0);
+        LONG64 wait_t = InterlockedExchange64(&g_spk_wait_ticks, 0), ecl = InterlockedExchange64(&g_spk_ecl, 0);
+        LONG64 ecl_t = InterlockedExchange64(&g_spk_ecl_ticks, 0), pres_t = InterlockedExchange64(&g_spk_present_ticks, 0);
+        if (spike_ms < 0) spike_ms = (int)mad_cfg_int_pe("spike-ms", 100);
+        if (g_ft_last && g_nft < MAD_FT_MAX) g_ft[g_nft++] = (float)ms;
+        if (spike_ms > 0 && ms > spike_ms && said < 500) {
+            said++;
+            d3d12_log("[perf] spike %.0f ms frame: pipelines %lld (%.0f ms creating), resources %lld tex + %lld buf (%.1f MB) "
+                      "in %.0f ms, heaps %lld (%.0f MB), fence waits %.0f ms (all threads), ExecuteCommandLists %lld (%.0f ms), "
+                      "Present %.0f ms\n", ms, (long long)pso, pso_t * tick_ms, (long long)tex, (long long)buf, bufb / 1048576.0,
+                      res_t * tick_ms, (long long)heap, heapb / 1048576.0, wait_t * tick_ms, (long long)ecl, ecl_t * tick_ms,
+                      pres_t * tick_ms);
+        }
+    }
     g_ft_last = now.QuadPart;
     g_perf_presents++;
     if (!g_perf_t0) { g_perf_t0 = now.QuadPart; mad_perf_unlock(); return; }
@@ -10209,9 +10234,25 @@ static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_ty
                                    const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out) {
     return mad_create_resource_at(d, heap_type, desc, riid, out, NULL, 0);
 }
+static HRESULT mad_create_resource_at_impl(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
+                                           const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
+                                           struct mad_memheap *ph, UINT64 poff);
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
-                                      struct mad_memheap *ph, UINT64 poff) {
+                                      struct mad_memheap *ph, UINT64 poff) {   /* wine-lab port: spike stats */
+    LARGE_INTEGER t0, t1; HRESULT hr;
+    QueryPerformanceCounter(&t0);
+    hr = mad_create_resource_at_impl(d, heap_type, desc, riid, out, ph, poff);
+    QueryPerformanceCounter(&t1);
+    InterlockedExchangeAdd64(&g_spk_res_ticks, t1.QuadPart - t0.QuadPart);
+    if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        InterlockedIncrement64(&g_spk_buf); InterlockedExchangeAdd64(&g_spk_buf_bytes, (LONG64)desc->Width);
+    } else InterlockedIncrement64(&g_spk_tex);
+    return hr;
+}
+static HRESULT mad_create_resource_at_impl(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
+                                           const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
+                                           struct mad_memheap *ph, UINT64 poff) {
     struct mad_resource *r;
     HRESULT hr;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) { mad_refuse_log(desc, heap_type, "dimension UNKNOWN"); return E_INVALIDARG; }
@@ -10450,6 +10491,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
     struct mad_memheap *h;
     HRESULT hr;
     static unsigned said;
+    if (desc) { InterlockedIncrement64(&g_spk_heap); InterlockedExchangeAdd64(&g_spk_heap_bytes, (LONG64)desc->SizeInBytes); }   /* wine-lab port */
     if (!desc || !out) return E_INVALIDARG;
     *out = NULL;
     h = calloc(1, sizeof *h);
@@ -12965,7 +13007,17 @@ static HRESULT mad_check_cached_pso(const D3D12_CACHED_PIPELINE_STATE *c) {
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
 }
 
+static HRESULT mad_create_graphics_pso_impl(ID3D12Device *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out);
 static HRESULT mad_create_graphics_pso(ID3D12Device *This,
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {   /* wine-lab port: spike stats */
+    LARGE_INTEGER t0, t1; HRESULT hr;
+    QueryPerformanceCounter(&t0);
+    hr = mad_create_graphics_pso_impl(This, desc, riid, out);
+    QueryPerformanceCounter(&t1);
+    InterlockedIncrement64(&g_spk_pso); InterlockedExchangeAdd64(&g_spk_pso_ticks, t1.QuadPart - t0.QuadPart);
+    return hr;
+}
+static HRESULT mad_create_graphics_pso_impl(ID3D12Device *This,
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     struct mad_device *d = (struct mad_device *)This;
     struct mad_rootsig *rs;
@@ -13473,7 +13525,17 @@ static HRESULT mad_create_graphics_pso(ID3D12Device *This,
 }
 
 
+static HRESULT mad_create_compute_pso_impl(ID3D12Device *This, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out);
 static HRESULT mad_create_compute_pso(ID3D12Device *This,
+        const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {   /* wine-lab port: spike stats */
+    LARGE_INTEGER t0, t1; HRESULT hr;
+    QueryPerformanceCounter(&t0);
+    hr = mad_create_compute_pso_impl(This, desc, riid, out);
+    QueryPerformanceCounter(&t1);
+    InterlockedIncrement64(&g_spk_pso); InterlockedExchangeAdd64(&g_spk_pso_ticks, t1.QuadPart - t0.QuadPart);
+    return hr;
+}
+static HRESULT mad_create_compute_pso_impl(ID3D12Device *This,
         const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **out) {
     struct mad_device *d = (struct mad_device *)This;
     struct mad_pso *p;
@@ -16224,6 +16286,7 @@ static __attribute__((noinline)) HRESULT mad_swap_present(IDXGISwapChain4 *T, UI
     hr = swap_Present_pool(T, sync, flags);
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_perf_present_ticks, t1.QuadPart - t0.QuadPart);
+    InterlockedExchangeAdd64(&g_spk_present_ticks, t1.QuadPart - t0.QuadPart);   /* wine-lab port */
     return hr;
 }
 static HRESULT swap_Present_pool(IDXGISwapChain4 *T, UINT sync, UINT flags) {
