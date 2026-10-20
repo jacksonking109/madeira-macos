@@ -7255,11 +7255,28 @@ static void mad_fence_waits_report(LONG presents, double freq) {
     }
     ReleaseSRWLockShared(&g_fences_lock);
 }
+/* wine-lab port: frame times between presents, so stutter shows: 5-second averages hide it */
+#define MAD_FT_MAX 4096
+static float g_ft[MAD_FT_MAX]; static unsigned g_nft; static LONG64 g_ft_last; static long g_ft_total50, g_ft_total100;
+static int mad_ft_cmp(const void *a, const void *b) { float x = *(const float *)a, y = *(const float *)b; return (x > y) - (x < y); }
+static void mad_ft_report(void) {
+    unsigned i, n = g_nft, o33 = 0, o50 = 0, o100 = 0; float worst, p99, p50;
+    if (!n) return;
+    for (i = 0; i < n; i++) { o33 += g_ft[i] > 33.4f; o50 += g_ft[i] > 50.0f; o100 += g_ft[i] > 100.0f; }
+    g_ft_total50 += o50; g_ft_total100 += o100;
+    qsort(g_ft, n, sizeof *g_ft, mad_ft_cmp);
+    worst = g_ft[n - 1]; p99 = g_ft[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]; p50 = g_ft[n / 2];
+    d3d12_log("[perf] frame-times: median %.1f ms, 99th %.1f ms, worst %.1f ms; over 33 ms %u, over 50 ms %u, over 100 ms %u "
+              "of %u frames (session: %ld over 50 ms, %ld over 100 ms)\n", p50, p99, worst, o33, o50, o100, n, g_ft_total50, g_ft_total100);
+    g_nft = 0;
+}
 static void mad_perf_present(void) {
     LARGE_INTEGER now, fq; double wall;
     if (g_perf_enabled <= 0) return;
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     mad_perf_lock();
+    if (g_ft_last && g_nft < MAD_FT_MAX) g_ft[g_nft++] = (float)((double)(now.QuadPart - g_ft_last) * 1000.0 / (double)fq.QuadPart);
+    g_ft_last = now.QuadPart;
     g_perf_presents++;
     if (!g_perf_t0) { g_perf_t0 = now.QuadPart; mad_perf_unlock(); return; }
     wall = (double)(now.QuadPart - g_perf_t0) / (double)fq.QuadPart;
@@ -7268,6 +7285,7 @@ static void mad_perf_present(void) {
                   wall, g_perf_presents, g_perf_presents / wall, g_perf_cbs, g_perf_gpu_union * 1000, 100.0 * g_perf_gpu_union / wall,
                   g_perf_gpu_sum * 1000, g_perf_wait_s * 1000, 100.0 * g_perf_wait_s / wall,
                   g_perf_presents ? g_perf_gpu_union * 1000 / g_perf_presents : 0.0, g_perf_presents ? g_perf_wait_s * 1000 / g_perf_presents : 0.0);
+        mad_ft_report();
         if (g_perf_presents) {   /* wine-lab port: store-defer and gpu-pass-profile */
             LONG64 sk = InterlockedExchange64(&g_store_skipped, 0);
             if (g_store_defer > 0) d3d12_log("[perf] store-defer: %.1f MB/frame of render-target stores skipped (cleared next)\n", (double)sk / 1048576.0 / g_perf_presents);
