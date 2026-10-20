@@ -6905,12 +6905,20 @@ static DWORD WINAPI mad_pw_main(void *arg) {
     }
     return 0;
 }
+/* wine-lab port: madeira.cfg thread-boost = 1 raises our own threads (encode workers, the fence
+ * worker that wakes the game when GPU work finishes, submission workers) to HIGHEST, which
+ * wineserver maps to macOS's top QoS tier (keeps them on performance cores, lowest latency). */
+static int mad_thread_prio(int dflt) {
+    static int boost = -1;
+    if (boost < 0) { boost = mad_cfg_int_pe("thread-boost", 0) ? 1 : 0; d3d12_log("[madeira-d3d12] thread-boost = %d\n", boost); }
+    return boost ? THREAD_PRIORITY_HIGHEST : dflt;
+}
 static int mad_pw_start(int n) {   /* under some queue's submit_lock; the pool is process-wide */
     AcquireSRWLockExclusive(&g_pw_lock);
     while (g_pw_threads < n) {
         HANDLE h = CreateThread(NULL, 0, mad_pw_main, NULL, 0, NULL);
         if (!h) break;
-        SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+        SetThreadPriority(h, mad_thread_prio(THREAD_PRIORITY_ABOVE_NORMAL));
         CloseHandle(h);
         g_pw_threads++;
     }
@@ -7636,6 +7644,7 @@ static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 valu
     if (!d->fence_thread) {
         d->fence_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
         d->fence_thread = d->fence_wake ? CreateThread(NULL, 0, mad_fence_worker, d, 0, NULL) : NULL;
+        if (d->fence_thread) SetThreadPriority(d->fence_thread, mad_thread_prio(THREAD_PRIORITY_NORMAL));   /* wine-lab port */
     }
     if (d->fence_thread && mad_grow((void **)&d->fence_jobs, &d->fence_jobs_cap, d->nfence_jobs + 1, sizeof *d->fence_jobs)) {
         job = &d->fence_jobs[d->nfence_jobs++];
@@ -8334,6 +8343,7 @@ static HRESULT STDMETHODCALLTYPE device_CreateCommandQueue(ID3D12Device *This,
         InitializeCriticalSection(&q->sub_lock);
         InitializeConditionVariable(&q->sub_work); InitializeConditionVariable(&q->sub_idle); InitializeConditionVariable(&q->sub_presented);
         q->sub_thread = CreateThread(NULL, 0, mad_sub_worker, q, 0, NULL);
+        if (q->sub_thread) SetThreadPriority(q->sub_thread, mad_thread_prio(THREAD_PRIORITY_NORMAL));   /* wine-lab port */
         d3d12_log("[madeira-d3d12] ml1120 queue type %d: submission worker %s\n", desc->Type, q->sub_thread ? "started" : "FAILED to start (replaying on the caller)");
     }
     {   /* ml1021: a pure locking change has no other runtime signature, so it
