@@ -10247,12 +10247,73 @@ static HRESULT mad_create_resource(struct mad_device *d, D3D12_HEAP_TYPE heap_ty
 static HRESULT mad_create_resource_at_impl(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                            const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                            struct mad_memheap *ph, UINT64 poff);
+/* wine-lab port: madeira.cfg zero-new-textures = 1 (experiment). D3D12 gives a new COMMITTED
+ * resource zeroed memory; a new Metal texture may hold memory the process freed a moment ago
+ * (the last area's data when a game streams a new one). A texture the GPU writes (render
+ * target or UAV) can be read before the game first writes it -- a temporal history, a
+ * lighting cache -- and then reads that garbage. Each such texture is cleared here, on a side
+ * queue, and waited for before the resource is handed out, so no ordering can be wrong. */
+static obj_handle_t g_zt_queue, g_zt_buf; static UINT64 g_zt_size; static SRWLOCK g_zt_lock = SRWLOCK_INIT;
+static volatile LONG g_zt_count; static volatile LONG64 g_zt_bytes;
+static void mad_zero_new_texture(struct mad_device *d, struct mad_resource *r) {
+    static int on = -1;
+    UINT bytes = 0, block = 1, lvl, sl, mips, layers;
+    obj_handle_t cb, benc;
+    if (on < 0) on = mad_cfg_int_pe("zero-new-textures", 0) ? 1 : 0;
+    if (!on || !r || !r->texture || r->desc.SampleDesc.Count > 1) return;
+    if (!(r->desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) return;
+    if (r->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) return;
+    mad_format_info(r->desc.Format, &bytes, &block);
+    if (!bytes || block != 1) return;
+    mips = r->tex_mips ? r->tex_mips : 1;
+    layers = r->tex_type == WMTTextureType3D ? 1 : (r->tex_layers ? r->tex_layers : 1);
+    AcquireSRWLockExclusive(&g_zt_lock);
+    if (!g_zt_queue) g_zt_queue = MTLDevice_newCommandQueue(d->mtl_device, 16);
+    {   /* the largest single copy: mip 0 of one slice (all of its depth for a 3D texture) */
+        UINT64 need = (UINT64)r->width * bytes * r->height * (r->tex_type == WMTTextureType3D && r->tex_depth ? r->tex_depth : 1);
+        if (need > g_zt_size) {
+            struct WMTBufferInfo bi;
+            if (g_zt_buf) NSObject_release(g_zt_buf);
+            memset(&bi, 0, sizeof bi); bi.length = need; bi.options = WMTResourceStorageModeShared;   /* new buffers are zero-filled */
+            g_zt_buf = MTLDevice_newBuffer(d->mtl_device, &bi);
+            g_zt_size = g_zt_buf ? need : 0;
+        }
+    }
+    if (!g_zt_queue || !g_zt_buf || !(cb = MTLCommandQueue_commandBuffer(g_zt_queue))) { ReleaseSRWLockExclusive(&g_zt_lock); return; }
+    benc = MTLCommandBuffer_blitCommandEncoder(cb);
+    for (lvl = 0; lvl < mips; lvl++) {
+        UINT w = r->width >> lvl ? r->width >> lvl : 1, h = r->height >> lvl ? r->height >> lvl : 1;
+        UINT dep = r->tex_type == WMTTextureType3D ? ((r->tex_depth >> lvl) ? r->tex_depth >> lvl : 1) : 1;
+        for (sl = 0; sl < layers; sl++) {
+            struct wmtcmd_blit_copy_from_buffer_to_texture c;
+            memset(&c, 0, sizeof c);
+            c.type = WMTBlitCommandCopyFromBufferToTexture;
+            c.src = g_zt_buf; c.src_offset = 0; c.bytes_per_row = w * bytes; c.bytes_per_image = w * bytes * h;
+            c.size.width = w; c.size.height = h; c.size.depth = dep;
+            c.dst = r->texture; c.slice = sl; c.level = lvl;
+            MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&c);
+        }
+    }
+    MTLCommandEncoder_endEncoding(benc);
+    MTLCommandBuffer_commit(cb);
+    MTLCommandBuffer_waitUntilCompleted(cb);
+    NSObject_release(cb);
+    ReleaseSRWLockExclusive(&g_zt_lock);
+    InterlockedIncrement(&g_zt_count);
+    InterlockedExchangeAdd64(&g_zt_bytes, (LONG64)r->width * r->height * bytes * layers);
+    if (g_zt_count <= 8 || (g_zt_count % 200) == 0)
+        d3d12_log("[madeira-d3d12] zero-new-textures: %ld cleared so far (%lld MB); latest %ux%u x%u layers, %u mips, format %u\n",
+                  (long)g_zt_count, (long long)(g_zt_bytes >> 20), r->width, r->height, layers, mips, (unsigned)r->desc.Format);
+}
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                       struct mad_memheap *ph, UINT64 poff) {   /* wine-lab port: spike stats */
     LARGE_INTEGER t0, t1; HRESULT hr;
     QueryPerformanceCounter(&t0);
     hr = mad_create_resource_at_impl(d, heap_type, desc, riid, out, ph, poff);
+    if (SUCCEEDED(hr) && !ph && heap_type == D3D12_HEAP_TYPE_DEFAULT && out && *out && desc &&
+        desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+        mad_zero_new_texture(d, (struct mad_resource *)*out);   /* wine-lab port: experiment, off by default */
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_spk_res_ticks, t1.QuadPart - t0.QuadPart);
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
