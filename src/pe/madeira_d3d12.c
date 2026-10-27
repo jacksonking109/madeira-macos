@@ -345,6 +345,9 @@ struct mad_device {
     unsigned ntheaps, theaps_cap;
     struct mad_hret { unsigned heap; UINT64 off, size, serial; } *hret; unsigned nhret, hret_cap;
     struct mad_mhret { obj_handle_t heap; UINT64 serial; void *mem; } *mhret; unsigned nmhret, mhret_cap;   /* ml1148: Metal heaps waiting for the GPU */
+    /* wine-lab port: Metal objects of released resources, waiting for the GPU (mad_dfree_*) */
+    struct mad_dfree { obj_handle_t obj; UINT64 serial, gen; int unres, hp; unsigned hp_heap; UINT64 hp_off, hp_size; } *dfree; unsigned ndfree, dfree_cap;
+    UINT64 dfree_gen;
     struct { UINT32 value[12]; obj_handle_t buf; } fillpat[64]; unsigned nfillpat; SRWLOCK fillpat_lock;   /* ml1151: exact UAV clear patterns (a 48-byte period: whole 4-, 8-, 12- and 16-byte elements) */
     LONG64 hp_live_bytes, hp_total_bytes; LONG hp_textures, hp_fallbacks;
 };
@@ -7572,6 +7575,70 @@ static void mad_queue_flush_impl(struct mad_queue *q) {
     }
     LeaveCriticalSection(&q->submit_lock);   /* ml1021 */
 }
+/* wine-lab port: DEFERRED TEARDOWN OF RELEASED RESOURCES. res_Release released the Metal texture
+ * or buffer (and dropped it from the residency set) at once, and returned a runtime-heap block once
+ * the GPU passed the newest COMMITTED batch. A command buffer keeps a reference only to what was
+ * bound to it directly; a texture read bindlessly, through its GPU resource ID in a descriptor heap,
+ * or a buffer through its address, has no reference from the work that reads it. Work recorded
+ * before the release could still be in flight, or still in a queue's open batch, and read an ID or
+ * a block the next resource had already been given. The Last of Us Part I creates its per-object
+ * light-probe textures anew every frame and releases the old ones: characters lit with another
+ * object's probes, purple and green for a frame. Windows keeps freed memory until the GPU is done
+ * with it, and games lean on that. Here the Metal side waits: an entry is armed by the first
+ * mad_device_flush_all that starts after it (two with async-submit, whose FIFOs a flush does not
+ * drain), which commits every open batch, with the serial of the last commit; it is freed once the
+ * GPU has passed that serial. */
+static int mad_async_on(void);
+static void mad_hp_release(struct mad_device *d, struct mad_resource *r);
+static void mad_dfree_push(struct mad_device *d, obj_handle_t obj, int unres, const struct mad_resource *hpr) {
+    struct mad_dfree *e;
+    if (!d || (!obj && !hpr)) return;
+    EnterCriticalSection(&d->heap_lock);
+    if (!mad_grow((void **)&d->dfree, &d->dfree_cap, d->ndfree + 1, sizeof *d->dfree)) {
+        LeaveCriticalSection(&d->heap_lock);
+        if (hpr) mad_hp_release(d, (struct mad_resource *)hpr);   /* the old behaviour, rather than a leak */
+        if (obj) { if (unres) mad_unresident(d, obj); NSObject_release(obj); }
+        return;
+    }
+    e = &d->dfree[d->ndfree++]; memset(e, 0, sizeof *e);
+    e->obj = obj; e->unres = unres; e->gen = d->dfree_gen;
+    if (hpr) { e->hp = 1; e->hp_heap = hpr->hp_heap; e->hp_off = hpr->hp_off; e->hp_size = hpr->hp_size; }
+    LeaveCriticalSection(&d->heap_lock);
+}
+static void mad_dfree_reclaim(struct mad_device *d, int all) {
+    obj_handle_t rel[128]; int unres[128]; unsigned nr = 0, i = 0;
+    UINT64 done;
+    if (!d) return;
+    done = mad_gpu_completed(d);
+    EnterCriticalSection(&d->heap_lock);
+    while (i < d->ndfree && nr < 128) {
+        struct mad_dfree *e = &d->dfree[i];
+        if (all || (e->serial && e->serial <= done)) {
+            if (e->hp && mad_grow((void **)&d->hret, &d->hret_cap, d->nhret + 1, sizeof *d->hret)) {   /* passed: reusable at once */
+                struct mad_hret *h = &d->hret[d->nhret++];
+                h->heap = e->hp_heap; h->off = e->hp_off; h->size = e->hp_size; h->serial = 0;
+            }
+            if (e->obj) { rel[nr] = e->obj; unres[nr++] = e->unres; }
+            *e = d->dfree[--d->ndfree];
+        } else i++;
+    }
+    LeaveCriticalSection(&d->heap_lock);
+    for (i = 0; i < nr; i++) { if (unres[i]) mad_unresident(d, rel[i]); NSObject_release(rel[i]); }
+    if (nr == 128) mad_dfree_reclaim(d, all);
+}
+/* After a flush_all that started at generation g: arm what was released before it. */
+static void mad_dfree_arm(struct mad_device *d, UINT64 g) {
+    UINT64 lag = mad_async_on() ? 2 : 1, serial = (UINT64)d->gpu_serial; unsigned i;
+    static LONG said;
+    if (!d->ndfree) return;
+    EnterCriticalSection(&d->heap_lock);
+    for (i = 0; i < d->ndfree; i++)
+        if (!d->dfree[i].serial && d->dfree[i].gen + lag <= g) d->dfree[i].serial = serial ? serial : 1;
+    if (d->ndfree > 20000 && InterlockedIncrement(&said) <= 4)
+        d3d12_log("[madeira-d3d12] deferred teardown: %u released resources waiting for the GPU\n", d->ndfree);
+    LeaveCriticalSection(&d->heap_lock);
+}
+
 static void mad_device_flush_all(struct mad_device *d) {
     /* ml1021: the queue registry was read with no lock while creation and
      * destruction mutate it under live_lock, so this could flush a queue that
@@ -7580,13 +7647,17 @@ static void mad_device_flush_all(struct mad_device *d) {
      * lock order against the creation path. */
     struct mad_queue *snap[16];
     unsigned n = 0, i;
+    UINT64 g;
     if (!d) return;
+    EnterCriticalSection(&d->heap_lock); g = ++d->dfree_gen; LeaveCriticalSection(&d->heap_lock);   /* wine-lab port: deferred teardown */
     EnterCriticalSection(&d->live_lock);
     for (i = 0; i < d->nqueues && n < 16; i++)
         if (d->queues[i]) { snap[n] = d->queues[i]; InterlockedIncrement(&snap[n]->refs); n++; }
     LeaveCriticalSection(&d->live_lock);
     for (i = 0; i < n; i++) mad_queue_flush(snap[i]);
     for (i = 0; i < n; i++) queue_Release((ID3D12CommandQueue *)snap[i]);
+    mad_dfree_arm(d, g);        /* wine-lab port: every batch open before g is committed now */
+    mad_dfree_reclaim(d, 0);
 }
 
 static void mad_list_rings_rewind(struct mad_list *l) {
@@ -8334,6 +8405,7 @@ static ULONG STDMETHODCALLTYPE device_Release(ID3D12Device *This) {
         {   /* ml1072: the runtime's texture heaps die with the device */
             unsigned k;
             if (g_hp_dev == d) g_hp_dev = NULL;
+            mad_dfree_reclaim(d, 1); free(d->dfree);   /* wine-lab port: placed textures go before their heaps */
             for (k = 0; k < d->ntheaps; k++) { if (d->theaps[k].heap) NSObject_release(d->theaps[k].heap); free(d->theaps[k].fl); }
             mad_mheap_reclaim(d, 1); free(d->mhret);   /* ml1148 */
             for (k = 0; k < d->nfillpat; k++) if (d->fillpat[k].buf) NSObject_release(d->fillpat[k].buf);   /* ml1151 */
@@ -10021,16 +10093,25 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
             for (k = 0; k < r->nxview; k++) mad_uavtex_forget(r, r->xview[k].id);
         }
         if (r->nshadow && r->owner) mad_shadow_free(r->owner, r);   /* wine-lab port */
-        { unsigned k; for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); } }   /* ml905; ml1126: never set members */
-        { unsigned k; for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_unresident(r->owner, r->xview[k].tex); NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); } }   /* ml913 */
-        if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
-        if (r->buffer && !r->placed_heap) mad_unresident(r->owner, r->buffer);
-        if (r->texture && !r->borrowed && !r->hp_used && !r->placed_heap) mad_unresident(r->owner, r->texture);
-        if (r->hp_used && r->owner) mad_hp_release(r->owner, r);   /* ml1072: block returns after the GPU is done with it */
+        if (r->owner) {   /* wine-lab port: deferred teardown (mad_dfree_push): work already recorded may still read these */
+            struct mad_device *od = r->owner; unsigned k;
+            for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { mad_dfree_push(od, r->tview[k].tex, 0, NULL); InterlockedDecrement(&g_tview_live); }   /* ml905; ml1126 */
+            for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { mad_dfree_push(od, r->xview[k].tex, 1, NULL); InterlockedDecrement(&g_xview_live); }   /* ml913 */
+            if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);   /* ml1057 */
+            if (r->buffer) mad_dfree_push(od, r->buffer, !r->placed_heap, NULL);
+            if (r->texture && !r->borrowed) mad_dfree_push(od, r->texture, !r->hp_used && !r->placed_heap, NULL);
+            if (r->hp_used) mad_dfree_push(od, 0, 0, r);   /* ml1072: the block, after the texture */
+            if (r->resolve_tmp) mad_dfree_push(od, r->resolve_tmp, 0, NULL);
+        } else {
+            unsigned k;
+            for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { NSObject_release(r->tview[k].tex); InterlockedDecrement(&g_tview_live); }
+            for (k = 0; k < r->nxview; k++) if (r->xview[k].tex) { NSObject_release(r->xview[k].tex); InterlockedDecrement(&g_xview_live); }
+            if (r->acct_bytes) mad_acct(r, r->acct_cat, r->acct_bytes, -1);
+            if (r->buffer) NSObject_release(r->buffer);
+            if (r->texture && !r->borrowed) NSObject_release(r->texture);
+            if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
+        }
         { unsigned k; for (k = 0; k < r->nview_old; k++) free(r->view_old[k]); free(r->tview); free(r->xview); }
-        if (r->buffer) NSObject_release(r->buffer);
-        if (r->texture && !r->borrowed) NSObject_release(r->texture);
-        if (r->resolve_tmp) NSObject_release(r->resolve_tmp);
         if (r->placed_heap) ID3D12Heap_Release((ID3D12Heap *)r->placed_heap);   /* ml1145 */
         if (r->own_mem) {   /* ml1154: the GPU may still read it; free after its serial (reclaimed with the ml1148 list) */
             struct mad_device *md = r->owner; int queued = 0;
