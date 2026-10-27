@@ -10258,7 +10258,7 @@ static volatile LONG g_zt_count; static volatile LONG64 g_zt_bytes;
 static void mad_zero_new_texture(struct mad_device *d, struct mad_resource *r) {
     static int on = -1;
     UINT bytes = 0, block = 1, lvl, sl, mips, layers;
-    obj_handle_t cb, benc;
+    obj_handle_t cb, benc, pool;
     if (on < 0) on = mad_cfg_int_pe("zero-new-textures", 0) ? 1 : 0;
     if (!on || !r || !r->texture || r->desc.SampleDesc.Count > 1) return;
     if (!(r->desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) return;
@@ -10279,9 +10279,18 @@ static void mad_zero_new_texture(struct mad_device *d, struct mad_resource *r) {
             g_zt_size = g_zt_buf ? need : 0;
         }
     }
-    if (!g_zt_queue || !g_zt_buf || !(cb = MTLCommandQueue_commandBuffer(g_zt_queue))) { ReleaseSRWLockExclusive(&g_zt_lock); return; }
+    /* The command buffer and encoder come back autoreleased (+0), and this runs on whichever game
+     * thread creates the resource, which has no pool: a pool of our own drains them here. Releasing
+     * the command buffer ourselves (the first version) over-released it, and the thread's implicit
+     * pool later released whatever object reused its memory -- an open encoder, so Metal aborted
+     * with "Command encoder released without endEncoding" during a TLOU1 load. */
+    pool = NSAutoreleasePool_alloc_init();
+    if (!g_zt_queue || !g_zt_buf || !(cb = MTLCommandQueue_commandBuffer(g_zt_queue))) {
+        if (pool) NSObject_release(pool);
+        ReleaseSRWLockExclusive(&g_zt_lock); return;
+    }
     benc = MTLCommandBuffer_blitCommandEncoder(cb);
-    for (lvl = 0; lvl < mips; lvl++) {
+    for (lvl = 0; benc && lvl < mips; lvl++) {
         UINT w = r->width >> lvl ? r->width >> lvl : 1, h = r->height >> lvl ? r->height >> lvl : 1;
         UINT dep = r->tex_type == WMTTextureType3D ? ((r->tex_depth >> lvl) ? r->tex_depth >> lvl : 1) : 1;
         for (sl = 0; sl < layers; sl++) {
@@ -10294,10 +10303,10 @@ static void mad_zero_new_texture(struct mad_device *d, struct mad_resource *r) {
             MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&c);
         }
     }
-    MTLCommandEncoder_endEncoding(benc);
+    if (benc) MTLCommandEncoder_endEncoding(benc);
     MTLCommandBuffer_commit(cb);
     MTLCommandBuffer_waitUntilCompleted(cb);
-    NSObject_release(cb);
+    if (pool) NSObject_release(pool);
     ReleaseSRWLockExclusive(&g_zt_lock);
     InterlockedIncrement(&g_zt_count);
     InterlockedExchangeAdd64(&g_zt_bytes, (LONG64)r->width * r->height * bytes * layers);
