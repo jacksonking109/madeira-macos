@@ -7526,8 +7526,10 @@ static void mad_queue_flush(struct mad_queue *q) {
 }
 /* Commits one stream's command buffer as the queue's next batch (the open batch's,
  * or a parallel-encode run's, in submission order). Under submit_lock. */
+static void mad_zt_sync(void);
 static void mad_commit_stream(struct mad_queue *q, struct mad_stream *st, obj_handle_t cb) {
     mad_carry_end(st);   /* wine-lab port: pass-carry */
+    mad_zt_sync();       /* wine-lab port: zero-new-textures, clears before anything that may read them */
     if (q->npending == sizeof q->pending / sizeof q->pending[0]) {
         for (unsigned k = 0; k < q->npending; k++) mad_cb_retire(q->device, q->pending[k]);
         q->npending = 0;
@@ -10406,9 +10408,28 @@ static HRESULT mad_create_resource_at_impl(struct mad_device *d, D3D12_HEAP_TYPE
  * (the last area's data when a game streams a new one). A texture the GPU writes (render
  * target or UAV) can be read before the game first writes it -- a temporal history, a
  * lighting cache -- and then reads that garbage. Each such texture is cleared here, on a side
- * queue, and waited for before the resource is handed out, so no ordering can be wrong. */
+ * queue; every queue commit first waits for the clears still pending (mad_zt_sync), so nothing
+ * that may read the texture reaches the GPU before its clear has run. 2026-10-27: TLOU Part I
+ * creates its per-object light-probe textures (256xN, RGBA8_SNORM) anew every frame and reads
+ * rows it did not write that frame; zeros on Windows, other objects' old probes here -- the
+ * wrong-coloured characters. */
 static obj_handle_t g_zt_queue, g_zt_buf; static UINT64 g_zt_size; static SRWLOCK g_zt_lock = SRWLOCK_INIT;
 static volatile LONG g_zt_count; static volatile LONG64 g_zt_bytes;
+/* Clears committed but not yet known complete (our own references). Every command buffer of a queue
+ * waits for them on the CPU before it is committed (mad_zt_sync), which is all the ordering a resource
+ * handed out before its clear finished needs; by then the clear has almost always run already. */
+static obj_handle_t g_zt_pend[64]; static unsigned g_zt_npend; static volatile LONG g_zt_waits;
+static void mad_zt_sync(void) {
+    obj_handle_t pend[64]; unsigned n, i;
+    if (!g_zt_npend) return;   /* unlocked peek: the common case */
+    AcquireSRWLockExclusive(&g_zt_lock);
+    n = g_zt_npend; memcpy(pend, g_zt_pend, n * sizeof pend[0]); g_zt_npend = 0;
+    ReleaseSRWLockExclusive(&g_zt_lock);
+    for (i = 0; i < n; i++) {
+        if (MTLCommandBuffer_status(pend[i]) < WMTCommandBufferStatusCompleted) { InterlockedIncrement(&g_zt_waits); MTLCommandBuffer_waitUntilCompleted(pend[i]); }
+        NSObject_release(pend[i]);
+    }
+}
 static void mad_zero_new_texture(struct mad_device *d, struct mad_resource *r) {
     static int on = -1;
     UINT bytes = 0, block = 1, lvl, sl, mips, layers;
@@ -10459,14 +10480,19 @@ static void mad_zero_new_texture(struct mad_device *d, struct mad_resource *r) {
     }
     if (benc) MTLCommandEncoder_endEncoding(benc);
     MTLCommandBuffer_commit(cb);
-    MTLCommandBuffer_waitUntilCompleted(cb);
+    if (g_zt_npend == 64) {   /* full (a burst of creations): wait for the oldest here */
+        MTLCommandBuffer_waitUntilCompleted(g_zt_pend[0]); NSObject_release(g_zt_pend[0]);
+        memmove(&g_zt_pend[0], &g_zt_pend[1], 63 * sizeof g_zt_pend[0]); g_zt_npend--;
+    }
+    NSObject_retain(cb); g_zt_pend[g_zt_npend++] = cb;   /* waited for before the next queue commit */
     if (pool) NSObject_release(pool);
     ReleaseSRWLockExclusive(&g_zt_lock);
     InterlockedIncrement(&g_zt_count);
     InterlockedExchangeAdd64(&g_zt_bytes, (LONG64)r->width * r->height * bytes * layers);
-    if (g_zt_count <= 8 || (g_zt_count % 200) == 0)
-        d3d12_log("[madeira-d3d12] zero-new-textures: %ld cleared so far (%lld MB); latest %ux%u x%u layers, %u mips, format %u\n",
-                  (long)g_zt_count, (long long)(g_zt_bytes >> 20), r->width, r->height, layers, mips, (unsigned)r->desc.Format);
+    if (g_zt_count <= 8 || (g_zt_count % 2000) == 0)
+        d3d12_log("[madeira-d3d12] zero-new-textures: %ld cleared so far (%lld MB); latest %ux%u x%u layers (depth %u), %u mips, format %u; "
+                  "a commit waited for a clear %ld times\n",
+                  (long)g_zt_count, (long long)(g_zt_bytes >> 20), r->width, r->height, layers, r->tex_depth, mips, (unsigned)r->desc.Format, (long)g_zt_waits);
 }
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
