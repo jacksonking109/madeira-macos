@@ -1114,6 +1114,7 @@ struct mad_fence {
     UINT64 value;
     volatile LONG64 submitted;   /* ml1061: highest value a queue has been ASKED to signal */
     volatile LONG64 committed;   /* ml1120: highest value whose Signal batch has been COMMITTED to Metal (or signalled on the CPU) */
+    volatile LONG64 commit_serial;   /* wine-lab port: GPU serial that covers the highest committed Signal (see mad_wait_serial) */
     /* wine-lab port: per-fence wait census (fence-waits report, every 5 s): how long the game sat
      * on this fence, by where the awaited value was when it started waiting (mad_fence_phase). */
     volatile LONG64 st_ticks[3]; volatile LONG st_waits, st_polls;
@@ -1584,6 +1585,7 @@ struct mad_queue {
      * wine-lab port: or earlier, see mad_batch_lists. */
     obj_handle_t open_cb;
     UINT64 last_serial;            /* ml1061: serial of the newest committed batch */
+    volatile LONG64 wait_serial;   /* wine-lab port: GPU serial this queue's next Signal must also cover (its Waits, see mad_wait_serial) */
     UINT64 batch_serial[64];       /* serial of batch n at [n & 63] */
     unsigned open_lists;
     unsigned open_draws;           /* wine-lab port: draws and dispatches encoded into open_cb (batch-draws) */
@@ -7742,6 +7744,32 @@ static DWORD WINAPI mad_fence_worker(void *arg) {
     return 0;
 }
 
+/* wine-lab port: WAIT, THEN SIGNAL. A queue Wait passes once the awaited Signal is COMMITTED (every D3D
+ * queue feeds one Metal queue, so later work runs behind it), but a Signal took only the queue's OWN
+ * last batch. "Wait(F1, v); Signal(F2, w)" with nothing executed between -- how engines hand a fence
+ * from one queue to another -- signalled F2 as soon as this queue's old batch was done, before F1
+ * reached v on the GPU, and the game then reused what that work was still using. Now a passed Wait
+ * raises the queue's wait_serial to the serial covering the awaited Signal, and the queue's next
+ * Signal covers it too. */
+static LONG g_wait_fwd;
+static void mad_serial_max(volatile LONG64 *p, UINT64 v) {
+    LONG64 cur;
+    do { cur = *p; } while ((UINT64)cur < v && InterlockedCompareExchange64(p, (LONG64)v, cur) != cur);
+}
+static void mad_wait_serial(struct mad_queue *q, struct mad_fence *f, UINT64 value) {
+    if (q && f && f->value < value) mad_serial_max(&q->wait_serial, (UINT64)f->commit_serial);
+}
+static UINT64 mad_signal_serial(struct mad_queue *q) {
+    UINT64 s = q->last_serial, w = (UINT64)q->wait_serial;
+    if (w > s) {
+        LONG n = InterlockedIncrement(&g_wait_fwd);
+        if (n <= 6 || (n % 2000) == 0)
+            d3d12_log("[madeira-d3d12] Signal after Wait: covers serial %llu (the awaited Signal's), not only this queue's %llu (%ld so far)\n",
+                      (unsigned long long)w, (unsigned long long)s, (long)n);
+        s = w;
+    }
+    return s;
+}
 static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 value) {
     struct mad_device *d = q->device;
     struct mad_fence_job *job;
@@ -7757,7 +7785,8 @@ static int mad_signal_async(struct mad_queue *q, ID3D12Fence *fence, UINT64 valu
     if (d->fence_thread && mad_grow((void **)&d->fence_jobs, &d->fence_jobs_cap, d->nfence_jobs + 1, sizeof *d->fence_jobs)) {
         job = &d->fence_jobs[d->nfence_jobs++];
         memset(job, 0, sizeof *job);
-        job->serial = q->last_serial; job->fence = fence; job->value = value;
+        job->serial = mad_signal_serial(q); job->fence = fence; job->value = value;   /* wine-lab port: and its Waits */
+        mad_serial_max(&((struct mad_fence *)fence)->commit_serial, job->serial);
         ID3D12Fence_AddRef(fence);
         job->ncbs = q->npending;
         memcpy(job->cbs, q->pending, q->npending * sizeof q->pending[0]);
@@ -7793,13 +7822,13 @@ static HRESULT STDMETHODCALLTYPE queue_Wait(ID3D12CommandQueue *This, ID3D12Fenc
      * flushes: a Wait on another thread in that window returned at once, and
      * the waiting queue's next batch could reach Metal ahead of the batch it
      * waits for (a copy-queue upload landing after the draw that reads it). */
-    if ((UINT64)f->committed >= value) return S_OK;
+    if ((UINT64)f->committed >= value) { mad_wait_serial((struct mad_queue *)This, f, value); return S_OK; }   /* wine-lab port */
     while (waited < 5000) {
         UINT64 v;
         EnterCriticalSection(&f->lock);
         v = f->value;
         LeaveCriticalSection(&f->lock);
-        if (v >= value || (UINT64)f->committed >= value) return S_OK;
+        if (v >= value || (UINT64)f->committed >= value) { mad_wait_serial((struct mad_queue *)This, f, value); return S_OK; }
         InterlockedIncrement(&g_perf_qwait_sleeps);   /* ml1109 */
         Sleep(1);
         waited++;
@@ -7848,6 +7877,12 @@ static HRESULT mad_signal_run(struct mad_queue *q, ID3D12Fence *fence, UINT64 va
     for (unsigned i = 0; i < q->npending; i++) mad_cb_retire(q->device, q->pending[i]);   /* ml1049: checks status */
     q->npending = 0;
     LeaveCriticalSection(&q->submit_lock);
+    {   /* wine-lab port: and whatever this queue waited for (mad_wait_serial) */
+        UINT64 w = mad_signal_serial(q); unsigned tries = 0;
+        if (q->device->gpu_event)
+            while (w && mad_gpu_completed(q->device) < w && tries++ < 100) MTLSharedEvent_waitUntilSignaledValue(q->device->gpu_event, w, 50);
+        mad_serial_max(&((struct mad_fence *)fence)->commit_serial, w);
+    }
     mad_capture_flush(q->device);   /* ml910 */
     return ID3D12Fence_Signal(fence, value);
 }
@@ -7931,6 +7966,7 @@ static DWORD WINAPI mad_sub_worker(void *arg) {
         case MAD_SUB_WAIT:
             mad_device_flush_all(q->device);   /* as queue_Wait did: a CPU-side or other-path signal may sit in an open buffer */
             mad_wait_committed((struct mad_fence *)j->fence, j->value);
+            mad_wait_serial(q, (struct mad_fence *)j->fence, j->value);   /* wine-lab port */
             ID3D12Fence_Release(j->fence);
             break;
         case MAD_SUB_PRESENT:   /* ml1121 */

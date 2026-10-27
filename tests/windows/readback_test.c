@@ -279,6 +279,30 @@ static void case_compute_queue(void) {
     CHECK(bad_iters == 0, "dispatch and copy on a compute queue: %d of %d iterations read wrong data", bad_iters, ITERS);
 }
 
+/* wine-lab port: a fence handed from one queue to another with nothing executed between --
+ * direct: dispatch + copy, Signal(a); copy queue: Wait(a), Signal(b) at once. b must not
+ * complete before a's work has (the runtime used to signal b with the copy queue's own last
+ * batch, long finished). */
+static void case_forward(void) {
+    int bad_iters = 0, reports = 0;
+    UINT it;
+    for (it = 1; it <= ITERS; it++) {
+        poison(rb, 0, BYTES);
+        dispatch(l_direct, pso_fill, def, it, N, SPIN);
+        barrier(l_direct, def, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(l_direct, rb, 0, def, 0, BYTES);
+        barrier(l_direct, def, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        execute(q_direct, l_direct);
+        ID3D12CommandQueue_Signal(q_direct, fence, ++fence_v);
+        ID3D12CommandQueue_Wait(q_copy, fence, fence_v);
+        ID3D12CommandQueue_Signal(q_copy, fence_b, ++fence_bv);
+        if (!spin_until(fence_b, fence_bv)) { bad_iters = ITERS; break; }
+        if (verify_fill(rb, 0, it, "forwarded fence", &reports)) bad_iters++;
+        reopen(a_direct, l_direct);
+    }
+    CHECK(bad_iters == 0, "Wait then Signal on another queue (a forwarded fence): %d of %d iterations read wrong data", bad_iters, ITERS);
+}
+
 static void case_ring(void) {
     int bad_iters = 0, reports = 0, checked = 0;
     UINT64 sig[ITERS + 2];
@@ -513,6 +537,7 @@ int main(void) {
     case_copy_queue();
     printf("\n[4] compute queue\n");
     case_compute_queue();
+    case_forward();
     printf("\n[5] frames in flight, 16 MB readback buffer\n");
     case_ring();
     printf("\n[6] 64-bit InterlockedMin, %d threads onto %d slots\n", CANDIDATES, SLOTS);
