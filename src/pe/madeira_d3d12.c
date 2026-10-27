@@ -198,6 +198,11 @@ static char g_capture_ps[512]; static int g_capture_ps_loaded, g_capture_ps_shot
  * a compute-only pass that produces an artefact is found (render passes are
  * dumped by the frame capture itself, compute passes are not). */
 static char g_capture_cs[512]; static int g_capture_cs_shots, g_capture_cs_max = 12, g_capture_cs_ind, g_capture_cs_out;
+/* wine-lab port: capture-cs-buf-kb = N (default 0 = off) also copies the BUFFERS a matched dispatch
+ * names, up to N KB each from the view's address: raw/structured SRVs and UAVs and root SRV/UAVs
+ * before it runs (kinds srvb / uavb_in), and its UAV buffers again after it (uavb, with
+ * capture-cs-out = 1). Probe and light lists live in structured buffers, not textures. */
+static UINT64 g_capture_cs_buf;
 static LONG g_barrier_renc_closed, g_stencil_srv, g_barrier_seen;
 static LONG g_said_rt_unwritten;   /* wine-lab port */
 struct mad_obj {
@@ -2549,6 +2554,8 @@ static void mad_capture_buffer(struct mad_exec *e, obj_handle_t benc, struct mad
     UINT64 len = r->size > off ? r->size - off : 0; obj_handle_t buf; struct WMTBufferInfo bi; struct wmtcmd_blit_copy_from_buffer_to_buffer k; struct mad_capbuf *cb;
     if (!r->buffer || !len) return;
     if (len > max) len = max;
+    {   static UINT64 budget; if (!budget) budget = (UINT64)mad_cfg_int_pe("capture-budget-mb", 384) << 20;   /* wine-lab port: buffers count too */
+        if (g_cap_bytes + len > budget) return; }
     memset(&bi, 0, sizeof bi); bi.length = len; bi.options = WMTResourceStorageModeShared;
     buf = MTLDevice_newBuffer(e->q->device->mtl_device, &bi);
     if (!buf || !bi.memory.ptr) { if (buf) NSObject_release(buf); return; }
@@ -2676,6 +2683,8 @@ static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd
                       p->type == MADEIRA_IR_PARAM_CBV ? "CBV" : p->type == MADEIRA_IR_PARAM_SRV ? "SRV" : "UAV", p->shader_register, p->register_space,
                       (unsigned long long)va, r ? (r->name ? r->name : "buffer") : "NOTHING LIVE", r ? (unsigned long long)r->size : 0ull, (unsigned long long)off);
             if (r && r->buffer && p->type == MADEIRA_IR_PARAM_CBV) mad_capture_buffer(e, benc, r, off, 1024, "cb", i, seq);
+            else if (r && r->buffer && g_capture_cs_buf)   /* wine-lab port: capture-cs-buf-kb */
+                mad_capture_buffer(e, benc, r, off, g_capture_cs_buf, p->type == MADEIRA_IR_PARAM_SRV ? "srvb" : "uavb_in", i, seq);
             continue;
         }
         {   /* descriptor table: which heap, then every range */
@@ -2722,6 +2731,9 @@ static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd
                                   br ? (br->name ? br->name : "buffer") : "NOTHING LIVE", br ? (unsigned long long)br->size : 0ull,
                                   (unsigned long long)boff, (unsigned long long)de->metadata, (de->metadata >> 63) ? " (typed)" : "");
                         if (br && br->buffer && rg->range_type == MADEIRA_IR_RANGE_CBV) mad_capture_buffer(e, benc, br, boff, 1024, "cb", i * 1000 + off + k, seq);
+                        else if (br && br->buffer && g_capture_cs_buf && (rg->range_type == MADEIRA_IR_RANGE_SRV || rg->range_type == MADEIRA_IR_RANGE_UAV))
+                            mad_capture_buffer(e, benc, br, boff, g_capture_cs_buf, rg->range_type == MADEIRA_IR_RANGE_SRV ? "srvb" : "uavb_in",
+                                               i * 1000 + off + k, seq);   /* wine-lab port: capture-cs-buf-kb */
                     } else if (de->texture_view_id) {
                         d3d12_log("[capture-cs] p%u %s %c%u space%u: typed buffer view %llx, metadata 0x%llx\n", i, rn, rg->range_type == 1 ? 'u' : 't',
                                   reg, rg->register_space, (unsigned long long)de->texture_view_id, (unsigned long long)de->metadata);
@@ -2761,6 +2773,15 @@ static void mad_capture_dispatch_outputs(struct mad_exec *e, const struct mad_cm
     for (i = 0; i < rs->nparams && i < MAD_ROOT_PARAM_MAX; i++) {
         const struct madeira_ir_root_param *p = &rs->params[i]; UINT64 va = e->croot[i];
         const struct mad_heap *h = e->srv; unsigned base, run = 0;
+        if (p->type == MADEIRA_IR_PARAM_UAV && va && g_capture_cs_buf) {   /* wine-lab port: capture-cs-buf-kb, a root UAV */
+            UINT64 boff = 0; struct mad_resource *br = mad_resolve_address(d, va, &boff);
+            if (br && br->buffer) {
+                d3d12_log("[capture-cs] out enc#%u after '%s' (list#%u): p%u root UAV = %s %llu bytes +%llu\n", seq, e->cpso->vs_name, g_list_seq, i,
+                          br->name ? br->name : "buffer", (unsigned long long)br->size, (unsigned long long)boff);
+                mad_capture_buffer(e, benc, br, boff, g_capture_cs_buf, "uavb", i * 1000, seq); nout++;
+            }
+            continue;
+        }
         if (p->type != MADEIRA_IR_PARAM_TABLE) continue;
         if (!h || !h->cpu || va < h->gpu_address || va >= h->gpu_address + (UINT64)h->count * sizeof(struct mad_descriptor)) continue;
         base = (unsigned)((va - h->gpu_address) / sizeof(struct mad_descriptor));
@@ -2773,6 +2794,16 @@ static void mad_capture_dispatch_outputs(struct mad_exec *e, const struct mad_cm
             for (k = 0; k < nd && base + off + k < h->count; k++) {
                 const struct mad_descriptor *de = &h->cpu[base + off + k];
                 struct mad_resource *r; struct mad_rtvp v; int xv = -1;
+                if (de->gpu_va && !de->texture_view_id && g_capture_cs_buf) {   /* wine-lab port: capture-cs-buf-kb, a raw/structured UAV */
+                    UINT64 boff = 0; struct mad_resource *br = mad_resolve_address(d, de->gpu_va, &boff);
+                    if (br && br->buffer) {
+                        d3d12_log("[capture-cs] out enc#%u after '%s' (list#%u): p%u u%u space%u = buffer %s %llu bytes +%llu\n", seq,
+                                  e->cpso->vs_name, g_list_seq, i, rg->base_register + k, rg->register_space, br->name ? br->name : "buffer",
+                                  (unsigned long long)br->size, (unsigned long long)boff);
+                        mad_capture_buffer(e, benc, br, boff, g_capture_cs_buf, "uavb", i * 1000 + off + k, seq); nout++;
+                    }
+                    continue;
+                }
                 if (!de->texture_view_id || (de->metadata >> 63) || de->gpu_va) continue;   /* textures only */
                 if (!(r = mad_texture_of_view(d, de->texture_view_id, &xv))) continue;
                 memset(&v, 0, sizeof v); v.layers = 1;
@@ -2785,7 +2816,7 @@ static void mad_capture_dispatch_outputs(struct mad_exec *e, const struct mad_cm
             }
         }
     }
-    if (!nout) d3d12_log("[capture-cs] out enc#%u after '%s' (list#%u): no texture UAV in its tables\n", seq, e->cpso->vs_name, g_list_seq);
+    if (!nout) d3d12_log("[capture-cs] out enc#%u after '%s' (list#%u): no UAV captured\n", seq, e->cpso->vs_name, g_list_seq);
     (void)c;
     exec_fence_blit(e, benc, 1);
     MTLCommandEncoder_endEncoding(benc);
@@ -6037,6 +6068,7 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     UINT sb = mad_aspect_bpp(s, c->u.tt.splane), db = mad_aspect_bpp(d, c->u.tt.dplane);
     UINT64 row = (UINT64)c->u.tt.w * sb, img = row * c->u.tt.h, need = img * (c->u.tt.d ? c->u.tt.d : 1);
     struct wmtcmd_blit_copy_from_texture_to_buffer k1; struct wmtcmd_blit_copy_from_buffer_to_texture k2;
+    obj_handle_t scratch;
     static LONG said;
     if (!sb || sb != db || !need) {
         if (InterlockedIncrement(&said) <= 16)
@@ -6053,8 +6085,12 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
         dev->ds_scratch = MTLDevice_newBuffer(dev->mtl_device, &bi);
         dev->ds_scratch_size = dev->ds_scratch ? sz : 0;
     }
+    /* wine-lab port: our own reference, taken under the lock. Two queues (or parallel-encode runs)
+     * copy planes at once; one growing the buffer released the one the other was about to encode. */
+    scratch = dev->ds_scratch;
+    if (scratch) NSObject_retain(scratch);
     LeaveCriticalSection(&dev->heap_lock);
-    if (!dev->ds_scratch) { MAD_SKIP(e); return; }
+    if (!scratch) { MAD_SKIP(e); return; }
     if (InterlockedIncrement(&said) <= 16)
         d3d12_log("[madeira-d3d12] plane copy '%s' %s -> '%s' %s, %ux%u through a staging buffer\n",
                   s->name ? s->name : "?", s->is_depth ? (c->u.tt.splane ? "stencil" : "depth") : "colour",
@@ -6064,17 +6100,18 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
     k1.src = s->texture; k1.slice = c->u.tt.sslice; k1.level = c->u.tt.slevel;
     k1.origin.x = c->u.tt.sx; k1.origin.y = c->u.tt.sy; k1.origin.z = c->u.tt.sz;
     k1.size.width = c->u.tt.w; k1.size.height = c->u.tt.h; k1.size.depth = c->u.tt.d ? c->u.tt.d : 1;
-    k1.dst = dev->ds_scratch; k1.offset = 0; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
+    k1.dst = scratch; k1.offset = 0; k1.bytes_per_row = (UINT32)row; k1.bytes_per_image = (UINT32)img;
     madeira_blit_t2b(e->benc, &k1, mad_aspect_opt(s, c->u.tt.splane));   /* wine-lab port: options via d3d12.so */
     exec_end(e);   /* the staging buffer is written, then read: two encoders */
-    if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
+    if (!exec_begin_blit(e)) { NSObject_release(scratch); MAD_SKIP(e); return; }
     memset(&k2, 0, sizeof k2);
     k2.type = WMTBlitCommandCopyFromBufferToTexture;
-    k2.src = dev->ds_scratch; k2.src_offset = 0; k2.bytes_per_row = (UINT32)row; k2.bytes_per_image = (UINT32)img;
+    k2.src = scratch; k2.src_offset = 0; k2.bytes_per_row = (UINT32)row; k2.bytes_per_image = (UINT32)img;
     k2.size.width = c->u.tt.w; k2.size.height = c->u.tt.h; k2.size.depth = c->u.tt.d ? c->u.tt.d : 1;
     k2.dst = d->texture; k2.slice = c->u.tt.dslice; k2.level = c->u.tt.dlevel;
     k2.origin.x = c->u.tt.dx; k2.origin.y = c->u.tt.dy; k2.origin.z = c->u.tt.dz;
     madeira_blit_b2t(e->benc, &k2, mad_aspect_opt(d, c->u.tt.dplane));   /* wine-lab port: winemetal drops the MTLBlitOption */
+    NSObject_release(scratch);   /* the command buffer holds it now */
 }
 
 /* ml1151: one exact UAV-clear pattern buffer. wine-lab port: 12 KB (256 periods), 64 of them for the values a title
@@ -16437,6 +16474,20 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                 d3d12_log("[capture] trigger file: %u frame(s), one every %u present(s), requested at present #%llu\n",
                           n, k, (unsigned long long)s->presents);
             }
+            /* wine-lab port: a hitch on demand -- C:\madeira-stall-now holding "MS" stalls this Present for
+             * MS milliseconds (default 1500, at most 10000), once. TLOU Part I's wrong-coloured characters
+             * follow long frames (the 3rd frame of a capture, which stalls every frame); this tests that
+             * without a capture. */
+            if ((s->presents % 15) == 0 && GetFileAttributesW(L"C:\\madeira-stall-now") != INVALID_FILE_ATTRIBUTES) {
+                char txt[32] = ""; DWORD got = 0; unsigned ms = 1500;
+                HANDLE h = CreateFileW(L"C:\\madeira-stall-now", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+                if (h != INVALID_HANDLE_VALUE) { ReadFile(h, txt, sizeof txt - 1, &got, NULL); CloseHandle(h); txt[got] = 0; }
+                if (txt[0]) sscanf(txt, "%u", &ms);
+                if (ms > 10000) ms = 10000;
+                DeleteFileW(L"C:\\madeira-stall-now");
+                d3d12_log("[madeira-d3d12] stall trigger: present #%llu sleeps %u ms\n", (unsigned long long)s->presents, ms);
+                Sleep(ms);
+            }
         }
         {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
             int want;
@@ -16469,6 +16520,7 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
                 g_capture_cs_ind = mad_cfg_int_pe("capture-cs-indirect", 0) ? 1 : 0;
                 g_capture_cs_max = (int)mad_cfg_int_pe("capture-cs-max", 12);
                 g_capture_cs_out = mad_cfg_int_pe("capture-cs-out", 0) ? 1 : 0;   /* wine-lab port */
+                g_capture_cs_buf = (UINT64)mad_cfg_int_pe("capture-cs-buf-kb", 0) << 10;   /* wine-lab port */
                 if (g_capture_cs[0]) d3d12_log("[capture] ml1141 targeted dispatch capture for cs='%s' (%s, first %d%s)\n", g_capture_cs,
                                               g_capture_cs_ind ? "indirect only" : "direct and indirect", g_capture_cs_max,
                                               g_capture_cs_out ? ", UAV textures after each" : "");
