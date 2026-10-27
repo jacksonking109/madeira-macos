@@ -16595,15 +16595,27 @@ static void mad_present_run(struct mad_swapchain *s, UINT idx) {
              * MS milliseconds (default 1500, at most 10000), once. TLOU Part I's wrong-coloured characters
              * follow long frames (the 3rd frame of a capture, which stalls every frame); this tests that
              * without a capture. */
-            if ((s->presents % 15) == 0 && GetFileAttributesW(L"C:\\madeira-stall-now") != INVALID_FILE_ATTRIBUTES) {
-                char txt[32] = ""; DWORD got = 0; unsigned ms = 1500;
+            /* "MS N D": N consecutive presents (default 1, at most 8) each stall MS ms; D = 1 first drains
+             * the GPU (every queue flushed, then wait for the newest commit), as a frame capture does. */
+            static unsigned stall_left, stall_ms, stall_drain;
+            if ((s->presents % 15) == 0 && !stall_left && GetFileAttributesW(L"C:\\madeira-stall-now") != INVALID_FILE_ATTRIBUTES) {
+                char txt[32] = ""; DWORD got = 0; unsigned ms = 1500, nfr = 1, dr = 0;
                 HANDLE h = CreateFileW(L"C:\\madeira-stall-now", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
                 if (h != INVALID_HANDLE_VALUE) { ReadFile(h, txt, sizeof txt - 1, &got, NULL); CloseHandle(h); txt[got] = 0; }
-                if (txt[0]) sscanf(txt, "%u", &ms);
+                if (txt[0]) sscanf(txt, "%u %u %u", &ms, &nfr, &dr);
                 if (ms > 10000) ms = 10000;
+                if (!nfr) nfr = 1;
+                if (nfr > 8) nfr = 8;
                 DeleteFileW(L"C:\\madeira-stall-now");
-                d3d12_log("[madeira-d3d12] stall trigger: present #%llu sleeps %u ms\n", (unsigned long long)s->presents, ms);
-                Sleep(ms);
+                stall_left = nfr; stall_ms = ms; stall_drain = dr;
+            }
+            if (stall_left) {
+                struct mad_device *sd = s->queue->device;
+                d3d12_log("[madeira-d3d12] stall trigger: present #%llu sleeps %u ms%s (%u more)\n", (unsigned long long)s->presents, stall_ms,
+                          stall_drain ? " after draining the GPU" : "", stall_left - 1);
+                if (stall_drain && sd->gpu_event) MTLSharedEvent_waitUntilSignaledValue(sd->gpu_event, (UINT64)sd->gpu_serial_committed, 10000);
+                Sleep(stall_ms);
+                stall_left--;
             }
         }
         {   /* ml1136: live fence-chain switch from the overlay; lists already running keep their mode */
