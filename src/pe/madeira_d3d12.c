@@ -10494,6 +10494,40 @@ static void mad_zero_new_texture(struct mad_device *d, struct mad_resource *r) {
                   "a commit waited for a clear %ld times\n",
                   (long)g_zt_count, (long long)(g_zt_bytes >> 20), r->width, r->height, layers, r->tex_depth, mips, (unsigned)r->desc.Format, (long)g_zt_waits);
 }
+/* wine-lab port: madeira.cfg zero-new-buffers = 1 (experiment). The buffer twin of the above: a new
+ * committed DEFAULT-heap buffer is zeroed in D3D12, a new private MTLBuffer may hold recycled memory.
+ * Filled with zeros on the same side queue, waited for before the next queue commit. */
+static volatile LONG g_zb_count; static volatile LONG64 g_zb_bytes;
+static void mad_zero_new_buffer(struct mad_device *d, struct mad_resource *r) {
+    static int on = -1;
+    obj_handle_t cb, benc, pool;
+    struct wmtcmd_blit_fillbuffer k;
+    if (on < 0) { on = mad_cfg_int_pe("zero-new-buffers", 0) ? 1 : 0; d3d12_log("[madeira-d3d12] zero-new-buffers = %d\n", on); }
+    if (!on || !r || !r->buffer || r->cpu || !r->size) return;
+    AcquireSRWLockExclusive(&g_zt_lock);
+    if (!g_zt_queue) g_zt_queue = MTLDevice_newCommandQueue(d->mtl_device, 16);
+    pool = NSAutoreleasePool_alloc_init();   /* +0 command buffer and encoder, as in mad_zero_new_texture */
+    if (!g_zt_queue || !(cb = MTLCommandQueue_commandBuffer(g_zt_queue)) || !(benc = MTLCommandBuffer_blitCommandEncoder(cb))) {
+        if (pool) NSObject_release(pool);
+        ReleaseSRWLockExclusive(&g_zt_lock); return;
+    }
+    memset(&k, 0, sizeof k);
+    k.type = WMTBlitCommandFillBuffer; k.buffer = r->buffer; k.offset = 0; k.length = r->size; k.value = 0;
+    MTLBlitCommandEncoder_encodeCommands(benc, (const struct wmtcmd_base *)&k);
+    MTLCommandEncoder_endEncoding(benc);
+    MTLCommandBuffer_commit(cb);
+    if (g_zt_npend == 64) {
+        MTLCommandBuffer_waitUntilCompleted(g_zt_pend[0]); NSObject_release(g_zt_pend[0]);
+        memmove(&g_zt_pend[0], &g_zt_pend[1], 63 * sizeof g_zt_pend[0]); g_zt_npend--;
+    }
+    NSObject_retain(cb); g_zt_pend[g_zt_npend++] = cb;
+    if (pool) NSObject_release(pool);
+    ReleaseSRWLockExclusive(&g_zt_lock);
+    InterlockedIncrement(&g_zb_count); InterlockedExchangeAdd64(&g_zb_bytes, (LONG64)r->size);
+    if (g_zb_count <= 8 || (g_zb_count % 500) == 0)
+        d3d12_log("[madeira-d3d12] zero-new-buffers: %ld cleared so far (%lld MB); latest %llu bytes\n",
+                  (long)g_zb_count, (long long)(g_zb_bytes >> 20), (unsigned long long)r->size);
+}
 static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap_type,
                                       const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out,
                                       struct mad_memheap *ph, UINT64 poff) {   /* wine-lab port: spike stats */
@@ -10503,6 +10537,9 @@ static HRESULT mad_create_resource_at(struct mad_device *d, D3D12_HEAP_TYPE heap
     if (SUCCEEDED(hr) && !ph && heap_type == D3D12_HEAP_TYPE_DEFAULT && out && *out && desc &&
         desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
         mad_zero_new_texture(d, (struct mad_resource *)*out);   /* wine-lab port: experiment, off by default */
+    if (SUCCEEDED(hr) && !ph && heap_type == D3D12_HEAP_TYPE_DEFAULT && out && *out && desc &&
+        desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+        mad_zero_new_buffer(d, (struct mad_resource *)*out);    /* wine-lab port: experiment, off by default */
     QueryPerformanceCounter(&t1);
     InterlockedExchangeAdd64(&g_spk_res_ticks, t1.QuadPart - t0.QuadPart);
     if (desc && desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
