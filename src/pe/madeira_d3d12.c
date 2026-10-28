@@ -6125,6 +6125,27 @@ static void exec_copy_aspect(struct mad_exec *e, const struct mad_cmd *c) {
  * bound (0xb01 a few minutes in) and validates the 0xDEAD guards. */
 #define MAD_FILLPAT_BYTES (12u << 10)
 #define MAD_FILLPAT_RUN (MAD_FILLPAT_BYTES / 48u * 48u)   /* wine-lab port: the longest copy from it that ends on a whole period */
+/* wine-lab port: a copy region clamped to the mip it touches. D3D12 copies of a block-compressed
+ * texture's small mips (2x2, 1x1) name the whole 4x4 block; Metal wants the size cut at the mip's
+ * edge, and without its validation layer it wrote past the mip -- into whatever the runtime's
+ * texture heap placed next to it (TLOU Part I streams tail mips constantly; Metal's validation
+ * layer counted ~50 000 such copies a minute, and small textures there turned to garbage).
+ * 0: the origin lies outside the mip (nothing to copy). */
+static LONG g_copy_clamped;
+static int mad_copy_clamp(const struct mad_resource *r, UINT level, UINT x, UINT y, UINT z, UINT *w, UINT *h, UINT *d) {
+    UINT mw = r->width >> level, mh = r->height >> level, md = 1, c = 0;
+    if (!mw) mw = 1;
+    if (!mh) mh = 1;
+    if (r->tex_type == WMTTextureType3D) { md = r->tex_depth >> level; if (!md) md = 1; }
+    if (x >= mw || y >= mh || z >= md) return 0;
+    if (*w > mw - x) { *w = mw - x; c = 1; }
+    if (*h > mh - y) { *h = mh - y; c = 1; }
+    if (r->tex_type == WMTTextureType3D && *d > md - z) { *d = md - z; c = 1; }
+    if (c && InterlockedIncrement(&g_copy_clamped) <= 4)
+        d3d12_log("[madeira-d3d12] copy region clamped to '%s' mip %u (%ux%u): now %ux%ux%u\n",
+                  r->name ? r->name : "?", level, mw, mh, *w, *h, *d);
+    return 1;
+}
 static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     if (!exec_begin_blit(e)) { MAD_SKIP(e); return; }
     switch (c->kind) {   /* ml1116: the destination is written */
@@ -6210,12 +6231,14 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
     case MC_COPY_B2T: {
         struct wmtcmd_blit_copy_from_buffer_to_texture k;
+        UINT cw = c->u.bt.w, ch = c->u.bt.h, cd = c->u.bt.d;
         if (!c->u.bt.tex->texture || !c->u.bt.buf->buffer) { MAD_SKIP(e); return; }
+        if (!mad_copy_clamp(c->u.bt.tex, c->u.bt.level, c->u.bt.x, c->u.bt.y, c->u.bt.z, &cw, &ch, &cd)) { MAD_SKIP(e); return; }
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromBufferToTexture;
         k.src = c->u.bt.buf->buffer; k.src_offset = c->u.bt.off;
         k.bytes_per_row = c->u.bt.row; k.bytes_per_image = c->u.bt.row * c->u.bt.rows;
-        k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = c->u.bt.d;
+        k.size.width = cw; k.size.height = ch; k.size.depth = cd;
         k.dst = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
         k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
         madeira_blit_b2t(e->benc, &k, mad_aspect_opt(c->u.bt.tex, c->u.bt.plane));   /* wine-lab port: the MTLBlitOption via d3d12.so */
@@ -6223,12 +6246,14 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
     case MC_COPY_T2B: {
         struct wmtcmd_blit_copy_from_texture_to_buffer k;
+        UINT cw = c->u.bt.w, ch = c->u.bt.h, cd = c->u.bt.d;
         if (!c->u.bt.tex->texture || !c->u.bt.buf->buffer) { MAD_SKIP(e); return; }
+        if (!mad_copy_clamp(c->u.bt.tex, c->u.bt.level, c->u.bt.x, c->u.bt.y, c->u.bt.z, &cw, &ch, &cd)) { MAD_SKIP(e); return; }
         memset(&k, 0, sizeof k);
         k.type = WMTBlitCommandCopyFromTextureToBuffer;
         k.src = c->u.bt.tex->texture; k.slice = c->u.bt.slice; k.level = c->u.bt.level;
         k.origin.x = c->u.bt.x; k.origin.y = c->u.bt.y; k.origin.z = c->u.bt.z;
-        k.size.width = c->u.bt.w; k.size.height = c->u.bt.h; k.size.depth = c->u.bt.d;
+        k.size.width = cw; k.size.height = ch; k.size.depth = cd;
         k.dst = c->u.bt.buf->buffer; k.offset = c->u.bt.off;
         k.bytes_per_row = c->u.bt.row; k.bytes_per_image = c->u.bt.row * c->u.bt.rows;
         madeira_blit_t2b(e->benc, &k, mad_aspect_opt(c->u.bt.tex, c->u.bt.plane));   /* wine-lab port: options via d3d12.so */
@@ -6237,7 +6262,10 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     }
     case MC_COPY_T2T: {
         struct wmtcmd_blit_copy_from_texture_to_texture k;
+        UINT cw = c->u.tt.w, ch = c->u.tt.h, cd = c->u.tt.d;
         if (!c->u.tt.dst->texture || !c->u.tt.src->texture) { MAD_SKIP(e); return; }
+        if (!mad_copy_clamp(c->u.tt.src, c->u.tt.slevel, c->u.tt.sx, c->u.tt.sy, c->u.tt.sz, &cw, &ch, &cd) ||
+            !mad_copy_clamp(c->u.tt.dst, c->u.tt.dlevel, c->u.tt.dx, c->u.tt.dy, c->u.tt.dz, &cw, &ch, &cd)) { MAD_SKIP(e); return; }
         if ((c->u.tt.src->is_depth || c->u.tt.dst->is_depth) &&
             (c->u.tt.src->tex_pf != c->u.tt.dst->tex_pf || c->u.tt.splane || c->u.tt.dplane ||
              (c->u.tt.src->is_depth && c->u.tt.src->has_stencil))) {
@@ -6250,7 +6278,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         k.type = WMTBlitCommandCopyFromTextureToTexture;
         k.src = c->u.tt.src->texture; k.src_slice = c->u.tt.sslice; k.src_level = c->u.tt.slevel;
         k.src_origin.x = c->u.tt.sx; k.src_origin.y = c->u.tt.sy; k.src_origin.z = c->u.tt.sz;
-        k.src_size.width = c->u.tt.w; k.src_size.height = c->u.tt.h; k.src_size.depth = c->u.tt.d;
+        k.src_size.width = cw; k.src_size.height = ch; k.src_size.depth = cd;
         k.dst = c->u.tt.dst->texture; k.dst_slice = c->u.tt.dslice; k.dst_level = c->u.tt.dlevel;
         k.dst_origin.x = c->u.tt.dx; k.dst_origin.y = c->u.tt.dy; k.dst_origin.z = c->u.tt.dz;
         MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
