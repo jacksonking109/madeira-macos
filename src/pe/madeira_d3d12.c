@@ -7591,6 +7591,13 @@ static void mad_commit_stream(struct mad_queue *q, struct mad_stream *st, obj_ha
         }
         LeaveCriticalSection(&sd->fence_lock);
         q->batch_serial[(q->batches + 1) & 63] = serial;
+        /* wine-lab port: serialize-gpu (experiment) -- wait for every batch before going on, so
+         * nothing the CPU writes next and no later command buffer can overlap this one */
+        {
+            static int ser = -1;
+            if (ser < 0) { ser = mad_cfg_int_pe("serialize-gpu", 0); if (ser) d3d12_log("[madeira-d3d12] serialize-gpu = %d: every batch is waited for at commit\n", ser); }
+            if (ser && serial && sd->gpu_event) MTLSharedEvent_waitUntilSignaledValue(sd->gpu_event, serial, 10000);
+        }
     }
     q->pending[q->npending++] = cb;      /* the reference taken at open moves here */
     q->batches++;
