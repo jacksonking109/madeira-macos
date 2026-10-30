@@ -8729,6 +8729,23 @@ static void mad_format_info(DXGI_FORMAT f, UINT *bytes, UINT *block) {
 
 static UINT64 mad_align(UINT64 v, UINT64 a) { return (v + a - 1) & ~(a - 1); }
 
+/* wine-lab port: a texture's mip count as D3D12 means it. MipLevels = 0 asks for
+ * the FULL chain (down to 1x1), not one level. It was read as 1: FSR 3.1 makes its
+ * SPD pyramid (R16G16_FLOAT, render/2, mipCount 0) that way, got a one-level
+ * texture, and its mip 1-5 UAVs became views past the texture's end -- the SPD
+ * passes wrote into the neighbouring FSR textures in the heap (FarthestDepthMip1,
+ * the luma history), and the accumulated history turned whole objects green,
+ * blue, magenta or orange (TLOU Part I). */
+static UINT mad_desc_mips(const D3D12_RESOURCE_DESC *desc) {
+    UINT64 m; UINT n = 1;
+    if (desc->MipLevels || desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) return desc->MipLevels ? desc->MipLevels : 1;
+    m = desc->Width;
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && desc->Height > m) m = desc->Height;
+    if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && desc->DepthOrArraySize > m) m = desc->DepthOrArraySize;
+    while (m > 1) { m >>= 1; n++; }
+    return n;
+}
+
 /* The standard subresource layout: rows padded to 256 bytes, each subresource
  * starting on a 512-byte boundary. Both constants are the API's own. */
 static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
@@ -8737,7 +8754,7 @@ static void STDMETHODCALLTYPE device_GetCopyableFootprints(ID3D12Device *This,
         UINT64 *total_bytes) {
     UINT bytes, block, i;
     UINT64 offset = base_offset;
-    UINT mips = desc->MipLevels ? desc->MipLevels : 1;
+    UINT mips = mad_desc_mips(desc);
     (void)This;
     /* wine-lab port: a buffer has one footprint at the base offset, and its
      * size is its width -- only the row PITCH is 256-aligned. Reporting the
@@ -8806,7 +8823,7 @@ static D3D12_RESOURCE_ALLOCATION_INFO * STDMETHODCALLTYPE device_GetResourceAllo
             MTLDevice_heapBufferSizeAndAlign(md->mtl_device, d->Width ? d->Width : 1, WMTResourceStorageModePrivate, &msz, &mal);   /* ml1145 */
         } else {
             struct WMTTextureInfo ti; enum WMTPixelFormat pf; int isd;
-            UINT subs = (d->MipLevels ? d->MipLevels : 1) *
+            UINT subs = mad_desc_mips(d) *
                         (d->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : (d->DepthOrArraySize ? d->DepthOrArraySize : 1));
             device_GetCopyableFootprints(This, d, 0, subs, 0, NULL, NULL, NULL, &bytes);
             if (d->SampleDesc.Count > 1) a = D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT;
@@ -9238,6 +9255,13 @@ static UINT64 mad_texture_view_id(struct mad_device *d, struct mad_resource *r, 
     if (!r->texture) return 0;
     if (!swz) swz = MAD_SWZ_IDENTITY;
     if (!pf || (r->is_depth && pf != WMTPixelFormatX32_Stencil8)) pf = r->tex_pf;   /* depth textures keep their format: sampled as depth; ml1101: unless a stencil view */
+    if (lvl0 >= r->tex_mips || sl0 >= r->tex_layers) {   /* wine-lab port: a view past the texture's end reads and writes whatever lies beyond it */
+        static unsigned said_oob;
+        if (said_oob++ < 8)
+            d3d12_log("[madeira-d3d12] texture view out of range: level %u of %u, slice %u of %u (%ux%u %s); the base texture is bound instead\n",
+                      lvl0, r->tex_mips, sl0, r->tex_layers, r->width, r->height, r->name);
+        return r->gpu_resource_id;
+    }
     if (nlvl == 0 || nlvl == ~0u || lvl0 + nlvl > r->tex_mips) nlvl = r->tex_mips > lvl0 ? r->tex_mips - lvl0 : 1;
     if (nsl == 0 || nsl == ~0u || sl0 + nsl > r->tex_layers) nsl = r->tex_layers > sl0 ? r->tex_layers - sl0 : 1;
     if (want == r->tex_type && lvl0 == 0 && nlvl == r->tex_mips && sl0 == 0 && nsl == r->tex_layers && pf == r->tex_pf && swz == MAD_SWZ_IDENTITY)
@@ -10395,7 +10419,7 @@ static int mad_texinfo_from_desc(const D3D12_RESOURCE_DESC *desc, struct WMTText
     ti->height = desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ? 1 : desc->Height;
     ti->depth = 1;
     ti->array_length = 1;
-    ti->mipmap_level_count = desc->MipLevels ? desc->MipLevels : 1;
+    ti->mipmap_level_count = mad_desc_mips(desc);
     /* ml1030: same clamp as the PSO, or a 4x pipeline meets an 8x target. */
     ti->sample_count = mad_clamp_sample_count(desc->SampleDesc.Count ? desc->SampleDesc.Count : 1);
     /* ml932: every 1D/2D texture is allocated as an ARRAY (length >= 1),
@@ -10595,6 +10619,7 @@ static HRESULT mad_create_resource_at_impl(struct mad_device *d, D3D12_HEAP_TYPE
     r->size = desc->Width;
     r->heap = heap_type;
     r->desc = *desc;
+    r->desc.MipLevels = (UINT16)mad_desc_mips(desc);   /* wine-lab port: 0 = full chain, reported back by GetDesc as D3D12 does */
     r->owner = d;
 
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -15151,7 +15176,7 @@ static int mad_tiling_compute(unsigned dim, unsigned long long width, unsigned h
 static int mad_tiling_of_desc(const D3D12_RESOURCE_DESC *desc, struct mad_tiling *t) {
     UINT bytes = 0, block = 1;
     if (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) mad_format_info(desc->Format, &bytes, &block);
-    return mad_tiling_compute((unsigned)desc->Dimension, desc->Width, desc->Height, desc->DepthOrArraySize, desc->MipLevels,
+    return mad_tiling_compute((unsigned)desc->Dimension, desc->Width, desc->Height, desc->DepthOrArraySize, mad_desc_mips(desc),
                               bytes, block, desc->SampleDesc.Count, t);
 }
 static HRESULT mad_create_reserved(struct mad_device *d, const D3D12_RESOURCE_DESC *desc, REFIID riid, void **out, const char *api) {
