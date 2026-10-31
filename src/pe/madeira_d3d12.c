@@ -9162,6 +9162,7 @@ static void mad_stride_and_format(const char *what, DXGI_FORMAT fmt, UINT stride
         d3d12_log("[madeira-d3d12] buffer %s with Format %u AND StructureByteStride %u (invalid D3D12): the format wins, the stride is ignored\n",
                   what, (unsigned)fmt, stride);
 }
+#define MAD_TBUF_MAX_TEXELS (1u << 28)
 static int mad_is_rgb32(DXGI_FORMAT f) {
     return f == DXGI_FORMAT_R32G32B32_TYPELESS || f == DXGI_FORMAT_R32G32B32_FLOAT || f == DXGI_FORMAT_R32G32B32_UINT || f == DXGI_FORMAT_R32G32B32_SINT;
 }
@@ -9177,7 +9178,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
                           (unsigned)fmt, (unsigned long long)first, (unsigned long long)num);
             return 0;
         }
-        if (mad_rgb32_shader_on() && !g_rgb32_unsafe && num && num <= (1u << 28) / 3) {
+        if (mad_rgb32_shader_on() && !g_rgb32_unsafe && num && num <= MAD_TBUF_MAX_TEXELS / 3) {
             DXGI_FORMAT r32 = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? DXGI_FORMAT_R32_FLOAT : fmt == DXGI_FORMAT_R32G32B32_SINT ? DXGI_FORMAT_R32_SINT : DXGI_FORMAT_R32_UINT;
             UINT kind = fmt == DXGI_FORMAT_R32G32B32_FLOAT ? 0 : fmt == DXGI_FORMAT_R32G32B32_SINT ? 2 : 1;
             static unsigned said_sh;
@@ -9201,10 +9202,10 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         return s != NULL;
     }
     enum WMTPixelFormat pf; int is_depth = 0; UINT bytes, block; unsigned k;
-    UINT64 byte_off, aligned, elem_off, width, bpr;
+    UINT64 byte_off, aligned, elem_off, width, bpr, vnum;
     struct WMTTextureInfo ti;
     obj_handle_t tex;
-    static unsigned said_fail, said_ok, said_nofmt;
+    static unsigned said_fail, said_ok, said_nofmt, said_clamp, said_wide;
     if (!r->buffer) return 0;
     if (!mad_map_texture_format(fmt, 0, &pf, &is_depth) || is_depth) {
         /* wine-lab port: the view falls back to a raw descriptor; the converter's
@@ -9217,15 +9218,36 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
     mad_format_info(fmt, &bytes, &block);
     if (!bytes || block != 1) return 0;
     byte_off = first * bytes;
+    /* wine-lab port: the elements the texture buffer really holds. A view past
+     * the buffer's end is clipped to it, and one wider than a Metal texture
+     * buffer can be (2^28 texels on every Apple and Mac GPU family, Metal
+     * feature set tables; MTLDevice has no query for it) to that. The
+     * descriptor's size and the DXBC count said the requested num, so reads
+     * past the clip passed the converter's bounds check and read past the
+     * texture; a too-wide view became a raw descriptor without a word. */
+    aligned = byte_off & ~(UINT64)63;                   /* linear texture alignment on Apple GPUs is <= 64 */
+    elem_off = (byte_off - aligned) / bytes;
+    width = aligned < r->size ? (r->size - aligned) / bytes : 0;
+    if (width > MAD_TBUF_MAX_TEXELS) width = MAD_TBUF_MAX_TEXELS;
+    vnum = width > elem_off ? width - elem_off : 0;
+    if (vnum > num) vnum = num;
+    if (vnum < num) {
+        if (num + elem_off > MAD_TBUF_MAX_TEXELS && aligned + (num + elem_off) * bytes <= r->size) {
+            if (!said_wide++)
+                d3d12_log("[madeira-d3d12] typed buffer view: fmt %u first %llu num %llu%s is wider than a Metal texture buffer "
+                          "(%u texels); its first %llu elements are viewed, loads past them read 0\n", (unsigned)fmt,
+                          (unsigned long long)first, (unsigned long long)num, uav ? " (UAV)" : "", MAD_TBUF_MAX_TEXELS, (unsigned long long)vnum);
+        } else if (said_clamp++ < 8)
+            d3d12_log("[madeira-d3d12] typed buffer view: fmt %u first %llu num %llu%s runs past the end of '%s' (%llu bytes): "
+                      "%llu elements viewed\n", (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, uav ? " (UAV)" : "",
+                      r->name ? r->name : "?", (unsigned long long)r->size, (unsigned long long)vnum);
+    }
+    if (!vnum) return 0;
     EnterCriticalSection(&d->view_lock);   /* ml1049: creation races creation on another thread */
     for (k = 0; k < r->ntview; k++)
         if (r->tview[k].fmt == (UINT)fmt && r->tview[k].off == byte_off && r->tview[k].num == num && r->tview[k].uav == (UINT8)uav) break;
     if (k == r->ntview) {
-        aligned = byte_off & ~(UINT64)63;                   /* linear texture alignment on Apple GPUs is <= 64 */
-        elem_off = (byte_off - aligned) / bytes;
-        width = num + elem_off;
-        if (aligned + width * bytes > r->size) width = (r->size - aligned) / bytes;
-        if (!width || width > (1u << 28)) { LeaveCriticalSection(&d->view_lock); return 0; }
+        width = vnum + elem_off;
         bpr = width * bytes;
         memset(&ti, 0, sizeof ti);
         ti.pixel_format = pf; ti.width = (uint32_t)width; ti.height = 1; ti.depth = 1; ti.array_length = 1;
@@ -9257,17 +9279,16 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
         r->tview[k].fmt = (UINT)fmt; r->tview[k].off = byte_off; r->tview[k].num = num; r->tview[k].uav = (UINT8)uav;
         r->tview[k].tex = tex; r->tview[k].id = ti.gpu_resource_id;
         r->ntview = k + 1;   /* published last: a reader never sees a half-written entry */
-        mad_vmap_put_locked(d, ti.gpu_resource_id, (UINT32)num, (UINT32)elem_off);
+        mad_vmap_put_locked(d, ti.gpu_resource_id, (UINT32)vnum, (UINT32)elem_off);
         mad_view_census("typed-buffer", r, r->ntview);
         if (said_ok++ < 12)
             d3d12_log("[madeira-d3d12] typed buffer view: fmt %u first %llu num %llu%s -> %ux1 texture buffer, element offset %llu\n",
                       (unsigned)fmt, (unsigned long long)first, (unsigned long long)num, uav ? " (UAV)" : "",
                       (unsigned)width, (unsigned long long)elem_off);
     }
-    aligned = r->tview[k].off & ~(UINT64)63; elem_off = (r->tview[k].off - aligned) / bytes;
     e->gpu_va = r->gpu_address + r->tview[k].off;
     e->texture_view_id = r->tview[k].id;
-    e->metadata = ((num * bytes) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);
+    e->metadata = ((vnum * bytes) & 0xffffffffull) | ((elem_off & 0x7fffffffull) << 32) | (1ull << 63);
     LeaveCriticalSection(&d->view_lock);
     return 1;
 }

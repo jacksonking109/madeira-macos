@@ -49,7 +49,11 @@
  *
  *   14  buffer-view description edges with no Metal equivalent: an R32_FLOAT
  *       view that also sets StructureByteStride (invalid D3D12; native drivers
- *       and vkd3d-proton go by the format) reads as a typed view
+ *       and vkd3d-proton go by the format) reads as a typed view; an R32_FLOAT
+ *       view running 904 elements past its buffer's end reports and reads only
+ *       the 96 that exist (0 past them: a Metal texture buffer clips there); an R8_UINT view wider than a Metal
+ *       texture buffer (2^28 texels; D3D12 allows 2^27, so not valid either)
+ *       is clipped to 2^28 instead of becoming a raw descriptor
  *
  *  With madeira.cfg rgb32-shader = 1 (the default) RGB32 views are read in the
  *  shader from their own memory (src/unix/madeira_air_rewrite.cpp): cases 9 and
@@ -84,7 +88,7 @@ enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FI
 enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_UAV0, S_UAV1, S_STRIDE, S_COUNT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_UAV0, S_UAV1, S_STRIDE, S_PAST, S_WIDE, S_COUNT };
 enum { NG = 1 << 20, NCOPY = 40, CPYN = 1200 };   /* case 9: big buffer elements, copies, elements per copy */
 static UINT big_first(UINT k) { return k * 12007u + 5u; }
 static UINT big_num(UINT k) { return 100u + 13u * k; }
@@ -602,6 +606,68 @@ static void desc_edges(void) {
         verify_r32("R32_FLOAT view with StructureByteStride 12", 0, 3000);
         verify_dims("R32_FLOAT view with StructureByteStride 12", 1, 3000);
     } else CHECK(0, "case 14a submitted");
+
+    {   /* b: FirstElement 3 NF - 96 (64-byte aligned), NumElements 1000 over fbuf (3 NF floats) */
+        const UINT *o = NULL; UINT t, bad = 0, badz = 0;
+        ZeroMemory(&d, sizeof d);
+        d.Format = DXGI_FORMAT_R32_FLOAT; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Buffer.FirstElement = 3 * NF - 96; d.Buffer.NumElements = 1000;
+        heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(heap, &h); h.ptr += (SIZE_T)S_PAST * inc;
+        ID3D12Device_CreateShaderResourceView(dev, fbuf, &d, h);
+        read_view(K_FLOAT, S_PAST, 1000, 0);
+        read_view(3, S_PAST, 1, 1);
+        if (finish(2)) {
+            ID3D12Resource_Map(rb, 0, NULL, (void **)&o);
+            if (o) {
+                for (t = 0; t < 96; t++) {
+                    UINT f = 3 * NF - 96 + t, v[4] = { fbits(f / 3, f % 3, -7.0f), 0, 0, ONE_F };
+                    if (memcmp(&o[4 * t], v, 16) && !bad++)
+                        printf("        element %u: got (%#x %#x %#x %#x), expected (%#x 0 0 %#x)\n", t, o[4 * t], o[4 * t + 1], o[4 * t + 2], o[4 * t + 3], v[0], ONE_F);
+                }
+                for (t = 96; t < 1000; t++)
+                    if ((o[4 * t] || o[4 * t + 1] || o[4 * t + 2] || (o[4 * t + 3] && o[4 * t + 3] != ONE_F)) && !badz++)   /* 0 (w 0 or 1): no memory read */
+                        printf("        element %u (past the end): got (%#x %#x %#x %#x), expected 0\n", t, o[4 * t], o[4 * t + 1], o[4 * t + 2], o[4 * t + 3]);
+                ID3D12Resource_Unmap(rb, 0, NULL);
+                CHECK(!bad, "view past the buffer's end: its 96 elements exact (%u wrong)", bad);
+                CHECK(!badz, "view past the buffer's end: the 904 past it read no memory (%u did)", badz);
+            } else CHECK(0, "case 14b readback mapped");
+            verify_dims("view past the buffer's end", 1, 96);
+        } else CHECK(0, "case 14b submitted");
+    }
+    {   /* c: an R8_UINT view of 2^28 + 4096 elements over a buffer that size, its first 64 bytes from stage A */
+        enum { WIDE = (1 << 28) + 4096 };
+        ID3D12Resource *wbuf = make_buffer(D3D12_HEAP_TYPE_DEFAULT, WIDE, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        const UINT *o = NULL; const BYTE *src = NULL; UINT t, bad = 0;
+        CHECK(wbuf != NULL, "256 MB + 4 KB buffer created");
+        if (!wbuf) return;
+        ID3D12GraphicsCommandList_CopyBufferRegion(list, wbuf, 0, stage, ST_A, 64);
+        barrier(wbuf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ZeroMemory(&d, sizeof d);
+        d.Format = DXGI_FORMAT_R8_UINT; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Buffer.FirstElement = 0; d.Buffer.NumElements = WIDE;
+        heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(heap, &h); h.ptr += (SIZE_T)S_WIDE * inc;
+        ID3D12Device_CreateShaderResourceView(dev, wbuf, &d, h);
+        read_view(K_UINT, S_WIDE, 64, 0);
+        read_view(3, S_WIDE, 1, 1);
+        if (finish(2)) {
+            ID3D12Resource_Map(stage, 0, NULL, (void **)&src);
+            ID3D12Resource_Map(rb, 0, NULL, (void **)&o);
+            if (o && src) {
+                for (t = 0; t < 64; t++) {
+                    UINT v[4] = { src[ST_A + t], 0, 0, 1 };
+                    if (memcmp(&o[4 * t], v, 16) && !bad++)
+                        printf("        element %u: got (%#x %#x %#x %#x), expected (%#x 0 0 1)\n", t, o[4 * t], o[4 * t + 1], o[4 * t + 2], o[4 * t + 3], v[0]);
+                }
+                CHECK(!bad, "R8_UINT view of 2^28 + 4096 elements: first 64 read typed (%u wrong)", bad);
+            } else CHECK(0, "case 14c readback mapped");
+            if (o) ID3D12Resource_Unmap(rb, 0, NULL);
+            if (src) ID3D12Resource_Unmap(stage, 0, NULL);
+            verify_dims("R8_UINT view of 2^28 + 4096 elements, clipped", 1, 1u << 28);
+        } else CHECK(0, "case 14c submitted");
+        ID3D12Resource_Release(wbuf);
+    }
 }
 
 static void cases(void) {
