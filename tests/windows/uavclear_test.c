@@ -38,7 +38,8 @@
  *       view.
  *
  *    8  80 raw-view clears with distinct values, more than the runtime's
- *       pattern cache (64) holds: each stays exact.
+ *       pattern cache (64) holds: each stays exact; then texture clears to
+ *       two values not in the full cache (they were skipped).
  *
  *  Exit code = number of failed checks.
  */
@@ -455,6 +456,13 @@ int main(void) {
                 snprintf(nm, sizeof nm, "raw view, distinct value #%u (%#x)", i, v4[0]);
                 buffer_case(nm, b_args, DXGI_FORMAT_R32_TYPELESS, TRUE, 0, BUF_DWORDS, FALSE, v4, want);
             }
+        }
+        {   /* the cache is full now: a texture clear to a value not in it was skipped */
+            static const UINT pi[4] = { 0x40490fdbu, 0, 0, 0 }, h3[4] = { 0x3555u, 0, 0, 0 };
+            clear_case("R32_FLOAT texture, new value 0x40490fdb after the cache filled", t_f32, DXGI_FORMAT_R32_FLOAT, t_f32,
+                       DXGI_FORMAT_R32_FLOAT, 4, FALSE, pi, 0x40490fdbu, 10);
+            clear_case("R16_FLOAT texture, new value 0x3555 after the cache filled", t_h16, DXGI_FORMAT_R16_FLOAT, t_h16,
+                       DXGI_FORMAT_R16_FLOAT, 2, FALSE, h3, 0x3555u, 11);
         }
     }
 

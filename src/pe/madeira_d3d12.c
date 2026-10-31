@@ -1400,7 +1400,7 @@ struct mad_cmd {
         struct { UINT x, y, z; } dispatch;
         struct { struct mad_resource *args; UINT64 off; UINT count; UINT stride; struct mad_resource *cnt; UINT64 cnt_off; } ind;
         struct { struct mad_resource *res; UINT64 off, len; UINT8 byte, ring; obj_handle_t pattern; UINT32 pat[12]; } fill;   /* ml1151: pattern = exact 32-bit source; wine-lab port: ring = pat[] goes through the list ring at replay */
-        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; UINT x0, y0, x1, y1; } filltex;   /* MC_FILL_TEX: mip, slices, texel size; x1 = 0: the whole mip, else the rectangle [x0,x1) x [y0,y1) */
+        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; UINT x0, y0, x1, y1; UINT8 ring; UINT32 pat[4]; } filltex;   /* MC_FILL_TEX: mip, slices, texel size; x1 = 0: the whole mip, else the rectangle [x0,x1) x [y0,y1); ring = pat[] (16-byte period) goes through the list ring at replay */
         struct { float rgba[4]; } blend;
         struct { struct mad_resource *res; UINT8 unk; } shadow;   /* MC_SHADOW; unk = left a write state other than COPY_DEST */
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
@@ -6198,7 +6198,8 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         const struct mad_resource *r = c->u.filltex.res;
         struct wmtcmd_blit_copy_from_buffer_to_texture k;
         UINT w, h, d, row, band, s, z, y, nsl, is3d, x0 = 0, y0 = 0;
-        if (!r || !r->texture || !c->u.filltex.pattern) { MAD_SKIP(e); return; }
+        obj_handle_t src = c->u.filltex.pattern; UINT64 src_off = 0;
+        if (!r || !r->texture || (!src && !c->u.filltex.ring)) { MAD_SKIP(e); return; }
         mad_mip_dims(r, c->u.filltex.level, &w, &h, &d);
         if (c->u.filltex.x1) {   /* wine-lab port: a clear rectangle, clipped to the mip */
             UINT x1 = c->u.filltex.x1 < w ? c->u.filltex.x1 : w, y1 = c->u.filltex.y1 < h ? c->u.filltex.y1 : h;
@@ -6209,6 +6210,11 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         row = w * c->u.filltex.bpp;
         if (!row || row > MAD_FILLPAT_BYTES || c->u.filltex.level >= r->tex_mips) { MAD_SKIP(e); return; }
         band = MAD_FILLPAT_BYTES / row;
+        if (!src) {   /* wine-lab port: pattern cache full -- a slice of the list ring holding the pattern */
+            UINT64 rgpu; void *cpu; UINT32 *pw; unsigned j;
+            if (!exec_ring_take_z(e, MAD_FILLPAT_BYTES, 0, &src, &src_off, &cpu, &rgpu)) { MAD_SKIP(e); return; }
+            pw = cpu; for (j = 0; j < MAD_FILLPAT_BYTES / 4; j++) pw[j] = c->u.filltex.pat[j & 3];
+        }
         is3d = r->tex_type == WMTTextureType3D;
         nsl = is3d ? 1 : r->tex_layers > c->u.filltex.sl0 ? r->tex_layers - c->u.filltex.sl0 : 0;
         if (c->u.filltex.nsl < nsl) nsl = c->u.filltex.nsl;
@@ -6218,7 +6224,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
                     UINT n = h - y < band ? h - y : band;
                     memset(&k, 0, sizeof k);
                     k.type = WMTBlitCommandCopyFromBufferToTexture;
-                    k.src = c->u.filltex.pattern; k.src_offset = 0;
+                    k.src = src; k.src_offset = src_off;
                     k.bytes_per_row = row; k.bytes_per_image = row * n;
                     k.size.width = w; k.size.height = n; k.size.depth = 1;
                     k.dst = r->texture; k.slice = is3d ? 0 : c->u.filltex.sl0 + s; k.level = c->u.filltex.level;
@@ -14481,7 +14487,7 @@ static UINT mad_pack_clear(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, uns
 }
 static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct mad_resource *res, const UINT32 v[4], int is_float,
                                      UINT nrect, const D3D12_RECT *rects, const char *what) {
-    static unsigned said_miss, said_fmt, said_ok;
+    static unsigned said_miss, said_fmt, said_ok, said_ring;
     struct mad_uavtex u; unsigned char px[16]; UINT bpp, rbytes = 0, rblock = 0, i; UINT32 pat, w[4], per[4];
     obj_handle_t pattern; struct mad_cmd *c;
     {
@@ -14552,8 +14558,12 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
                       v[0], v[1], v[2], v[3]);
         return;
     }
+    /* wine-lab port: a full pattern cache (64 values: TLOU Part I clears to
+     * 0xDEAD0000 + n, n growing) skipped the clear of every new texture value */
     pattern = mad_fill_pattern16(l->device, per);
-    if (!pattern) return;
+    if (!pattern && said_ring++ < 4)
+        d3d12_log("[madeira-d3d12] %s on texture '%s' value %#x: pattern cache full, written exactly through the ring\n",
+                  what, u.res->name ? u.res->name : "?", pat);
     if (!rects) nrect = 0;
     /* wine-lab port: NumRects 0 clears the whole view, else only the rectangles
      * (in the view's mip, every slice of it); the replay clips them to the mip.
@@ -14571,6 +14581,7 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
         c->u.filltex.res = u.res; c->u.filltex.level = u.level; c->u.filltex.sl0 = u.sl0; c->u.filltex.nsl = u.nsl;
         c->u.filltex.bpp = bpp; c->u.filltex.pattern = pattern;
         c->u.filltex.x0 = x0; c->u.filltex.y0 = y0; c->u.filltex.x1 = x1; c->u.filltex.y1 = y1;
+        if (!pattern) { c->u.filltex.ring = 1; memcpy(c->u.filltex.pat, per, 16); }
     }
     if (said_ok++ < 8)
         d3d12_log("[madeira-d3d12] %s on texture '%s' %ux%u mip %u slices %u+%d, format %u -> texel %#x x%u bytes%s\n",
