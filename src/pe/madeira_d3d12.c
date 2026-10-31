@@ -9163,6 +9163,23 @@ static void mad_stride_and_format(const char *what, DXGI_FORMAT fmt, UINT stride
                   what, (unsigned)fmt, stride);
 }
 #define MAD_TBUF_MAX_TEXELS (1u << 28)
+/* wine-lab port: where a texture-buffer view may start: the device's linear
+ * texture alignment for the format (16 bytes for every format on Apple GPUs
+ * here), 64 when it gives nothing sensible. The converter does NOT apply the
+ * element offset left over below the start (metadata bits 32..39) to typed
+ * loads, so a view started at a 64-byte boundary read up to 63 bytes early:
+ * an R32_FLOAT view at FirstElement 12 read elements 0.. . Views whose offset
+ * is not a multiple of this still read early (the DXBC path applies the
+ * offset through the view map). */
+static UINT64 mad_tbuf_align(struct mad_device *d, enum WMTPixelFormat pf) {
+    static UINT8 cache[1024];   /* log2 of the alignment + 1, 0 = not asked yet */
+    UINT64 a;
+    if ((unsigned)pf < 1024 && cache[pf]) return (UINT64)1 << (cache[pf] - 1);
+    a = MTLDevice_minimumLinearTextureAlignmentForPixelFormat(d->mtl_device, pf);
+    if (!a || a > 64 || (a & (a - 1))) a = 64;
+    if ((unsigned)pf < 1024) { UINT8 l = 0; while (((UINT64)1 << l) < a) l++; cache[pf] = l + 1; }
+    return a;
+}
 static int mad_is_rgb32(DXGI_FORMAT f) {
     return f == DXGI_FORMAT_R32G32B32_TYPELESS || f == DXGI_FORMAT_R32G32B32_FLOAT || f == DXGI_FORMAT_R32G32B32_UINT || f == DXGI_FORMAT_R32G32B32_SINT;
 }
@@ -9225,7 +9242,7 @@ static int mad_typed_buffer_view(struct mad_device *d, struct mad_resource *r, D
      * descriptor's size and the DXBC count said the requested num, so reads
      * past the clip passed the converter's bounds check and read past the
      * texture; a too-wide view became a raw descriptor without a word. */
-    aligned = byte_off & ~(UINT64)63;                   /* linear texture alignment on Apple GPUs is <= 64 */
+    aligned = byte_off & ~(mad_tbuf_align(d, pf) - 1);
     elem_off = (byte_off - aligned) / bytes;
     width = aligned < r->size ? (r->size - aligned) / bytes : 0;
     if (width > MAD_TBUF_MAX_TEXELS) width = MAD_TBUF_MAX_TEXELS;

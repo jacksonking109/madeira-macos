@@ -53,7 +53,11 @@
  *       view running 904 elements past its buffer's end reports and reads only
  *       the 96 that exist (0 past them: a Metal texture buffer clips there); an R8_UINT view wider than a Metal
  *       texture buffer (2^28 texels; D3D12 allows 2^27, so not valid either)
- *       is clipped to 2^28 instead of becoming a raw descriptor
+ *       is clipped to 2^28 instead of becoming a raw descriptor; an R32_FLOAT
+ *       view at FirstElement 12 (48 bytes: not on 64, on the 16 the GPU needs)
+ *       reads from element 12. A view whose offset is not a multiple of 16
+ *       still reads from below it (the converter does not apply the
+ *       remainder; not tested here)
  *
  *  With madeira.cfg rgb32-shader = 1 (the default) RGB32 views are read in the
  *  shader from their own memory (src/unix/madeira_air_rewrite.cpp): cases 9 and
@@ -88,7 +92,7 @@ enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FI
 enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_UAV0, S_UAV1, S_STRIDE, S_PAST, S_WIDE, S_COUNT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_UAV0, S_UAV1, S_STRIDE, S_PAST, S_WIDE, S_ODD, S_COUNT };
 enum { NG = 1 << 20, NCOPY = 40, CPYN = 1200 };   /* case 9: big buffer elements, copies, elements per copy */
 static UINT big_first(UINT k) { return k * 12007u + 5u; }
 static UINT big_num(UINT k) { return 100u + 13u * k; }
@@ -607,6 +611,30 @@ static void desc_edges(void) {
         verify_dims("R32_FLOAT view with StructureByteStride 12", 1, 3000);
     } else CHECK(0, "case 14a submitted");
 
+    {   /* an in-range R32_FLOAT view at FirstElement 12: 48 bytes in, on the device's 16-byte alignment, not on 64 */
+        const UINT *o = NULL; UINT t, bad = 0;
+        ZeroMemory(&d, sizeof d);
+        d.Format = DXGI_FORMAT_R32_FLOAT; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        d.Buffer.FirstElement = 12; d.Buffer.NumElements = 100;
+        heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(heap, &h); h.ptr += (SIZE_T)S_ODD * inc;
+        ID3D12Device_CreateShaderResourceView(dev, fbuf, &d, h);
+        read_view(K_FLOAT, S_ODD, 100, 0);
+        read_view(3, S_ODD, 1, 1);
+        if (finish(2)) {
+            ID3D12Resource_Map(rb, 0, NULL, (void **)&o);
+            if (o) {
+                for (t = 0; t < 100; t++) {
+                    UINT f = 12 + t, v[4] = { fbits(f / 3, f % 3, -7.0f), 0, 0, ONE_F };
+                    if (memcmp(&o[4 * t], v, 16) && !bad++)
+                        printf("        element %u: got (%#x %#x %#x %#x), expected (%#x 0 0 %#x)\n", t, o[4 * t], o[4 * t + 1], o[4 * t + 2], o[4 * t + 3], v[0], ONE_F);
+                }
+                ID3D12Resource_Unmap(rb, 0, NULL);
+                CHECK(!bad, "R32_FLOAT view at FirstElement 12: 100 elements exact (%u wrong)", bad);
+            } else CHECK(0, "case 14 FirstElement 12 readback mapped");
+            verify_dims("R32_FLOAT view at FirstElement 12", 1, 100);
+        } else CHECK(0, "case 14 FirstElement 12 submitted");
+    }
     {   /* b: FirstElement 3 NF - 96 (64-byte aligned), NumElements 1000 over fbuf (3 NF floats) */
         const UINT *o = NULL; UINT t, bad = 0, badz = 0;
         ZeroMemory(&d, sizeof d);
