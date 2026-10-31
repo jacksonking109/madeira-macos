@@ -87,8 +87,8 @@ then re-sign it ad hoc: `codesign --force -s - ~/wine-lab/wine11/lib/wine/x86_64
 running, copy each file to a temporary name in the same directory (sign the .so there) and rename it over the
 installed one, so the running process keeps its mapped copy intact.
 
-Tests (from out/, after `. ~/wine-lab/env11.sh`): d3d12-m2-x64.exe (expect 2 known failures: the stale fence-cycles
-check, and "unclaimed feature level 12_1" since madeira.cfg claims 12_1); d3d12-dxbc-x64.exe (68 checks; SM 5.0 DXBC through
+Tests (from out/, after `. ~/wine-lab/env11.sh`): d3d12-m2-x64.exe (90 checks, 0 failures; the unclaimed level it
+probes is 12_2, since madeira.cfg may claim 12_1, and the fence cycles wait for each signal); d3d12-dxbc-x64.exe (68 checks; SM 5.0 DXBC through
 airconv: root constants/CBV, SRV table + static sampler, vertex buffer input layout;
 plus tier-0 render passes, GetCachedBlob/CachedPSO, the pipeline library, and a bound render target the pipeline does
 not write keeping its contents); d3d12-bindless-x64.exe (tests/windows/bindless_test.c, 0 failures: SM 6.6

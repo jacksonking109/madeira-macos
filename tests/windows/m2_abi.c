@@ -81,10 +81,11 @@ int main(void) {
     HRESULT hr = create(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, NULL);
     CHECK(hr == S_FALSE, "null-device support probe returns S_FALSE (got %#lx)", hr);
 
-    /* A level we do not claim must be refused, not silently accepted. */
+    /* A level we do not claim must be refused, not silently accepted. 12_2:
+     * madeira.cfg d3d12-max-feature-level may raise the ceiling to 12_1, never higher. */
     ID3D12Device *bogus = NULL;
-    hr = create(NULL, D3D_FEATURE_LEVEL_12_1, &IID_ID3D12Device, (void **)&bogus);
-    CHECK(FAILED(hr) && bogus == NULL, "unclaimed feature level 12_1 refused (%#lx)", hr);
+    hr = create(NULL, D3D_FEATURE_LEVEL_12_2, &IID_ID3D12Device, (void **)&bogus);
+    CHECK(FAILED(hr) && bogus == NULL, "unclaimed feature level 12_2 refused (%#lx)", hr);
 
     ID3D12Device *dev = NULL;
     hr = create(NULL, D3D_FEATURE_LEVEL_11_0, &IID_ID3D12Device, (void **)&dev);
@@ -231,14 +232,18 @@ int main(void) {
         if (ba.ready) CloseHandle(ba.ready);
     }
 
-    /* Repeated cycles: reset, record, close, execute, signal again. */
+    /* Repeated cycles: reset, record, close, execute, signal again. A queue
+     * Signal completes on the GPU timeline, so wait for each value rather than
+     * expecting it the moment Signal returns. */
     int cycles_ok = 1;
     for (UINT64 n = 43; n <= 46; n++) {
         if (FAILED(ID3D12GraphicsCommandList_Reset(list, alloc, NULL))) { cycles_ok = 0; break; }
         if (FAILED(ID3D12GraphicsCommandList_Close(list))) { cycles_ok = 0; break; }
         ID3D12CommandQueue_ExecuteCommandLists(queue, 1, lists);
         if (FAILED(ID3D12CommandQueue_Signal(queue, fence, n))) { cycles_ok = 0; break; }
-        if (ID3D12Fence_GetCompletedValue(fence) != n) { cycles_ok = 0; break; }
+        if (FAILED(ID3D12Fence_SetEventOnCompletion(fence, n, ev)) ||
+            WaitForSingleObject(ev, 5000) != WAIT_OBJECT_0 ||
+            ID3D12Fence_GetCompletedValue(fence) != n) { cycles_ok = 0; break; }
     }
     CHECK(cycles_ok && ID3D12Fence_GetCompletedValue(fence) == 46,
           "four more record/close/execute/signal cycles");
