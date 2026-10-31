@@ -69,6 +69,16 @@ shaders reading such a view get a shadow made on first use. MAD_RGB32_VERSION (m
 with every change to madeira_air_rewrite.cpp. rgb32-shader = 0 restores the shadows for every view (refresh rules:
 struct mad_shadow; rgb32-big-mb, rgb32-big-frames, rgb32-big-exact).
 
+Texture-buffer view offsets (madeira.cfg tbuf-view-offset, default 1): a typed buffer view (and a UAV counter) is a
+texture buffer that starts on the device's linear-texture alignment (MTLDevice minimumLinearTextureAlignment, 16 bytes
+here), with the elements between that start and the view's first element in descriptor metadata bits 32..39 (MSC's
+textureViewOffsetInElements). MSC writes that field but its code never reads it: loads, stores and atomics use the
+shader's coordinate as is, IncrementCounter uses 0, GetDimensions the texture's width. The same AIR pass adds the
+offset to argument 1 of every air.*_texture_buffer_1d read, write and atomic whose texture comes from a descriptor
+field, and takes it off get_width (the RGB32 read path keeps its index: it reads the exact gpuVA). Raw descriptors keep
+those bits 0. The pass runs when rgb32-shader or tbuf-view-offset is on and is keyed in the DXIL cache with both. Test:
+d3d12-tbufoff-x64.exe (tests/windows/tbufoff_test.c; 52 of its 75 checks fail with tbuf-view-offset = 0).
+
 Loop watchdog: Metal never times out a command buffer, so a compute kernel stuck in a loop holds the GPU until the
 WindowServer watchdog reboots the Mac (TLOU Part I's CS_ComputeVolProbeBufferWriteCache BVH walk). Every natural loop of
 a compute shader gets a pass counter at its header; at loop-watchdog-cap passes per loop entry (default 1048576) the

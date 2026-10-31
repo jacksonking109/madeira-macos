@@ -10,7 +10,11 @@
  * the texture from: set, it loads x, y, z from the descriptor's gpuVA at
  * element * 12 and returns (x, y, z, 1); clear, it reads the texture exactly as
  * before. GetDimensions returns size / 12 for such a view. Genuine typed views
- * never have the bit, so they cannot be confused with it. */
+ * never have the bit, so they cannot be confused with it.
+ *
+ * Texture-view offsets (MADEIRA_AIR_VIEW_OFFSET): metadata bits 32..39, which
+ * MSC writes into its descriptors but never reads, are added to the coordinate
+ * of every texture-buffer access and taken off get_width; see the .cpp. */
 #ifndef MADEIRA_AIR_REWRITE_H
 #define MADEIRA_AIR_REWRITE_H
 
@@ -18,6 +22,8 @@
 #include <stdint.h>
 
 #define MADEIRA_DESC_RGB32 (1ull << 62)
+#define MADEIRA_AIR_RGB32       1u   /* what: the RGB32 read path */
+#define MADEIRA_AIR_VIEW_OFFSET 2u   /* what: texture-view offsets */
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +36,9 @@ struct madeira_air_rgb32_info {
                              an RGB32 view as R32 data */
     unsigned uav;         /* typed UAV accesses, left alone: D3D12 has no RGB32 UAVs */
     unsigned traced;      /* of reads + widths: descriptor found through a phi or select */
+    unsigned offsets;     /* texture-buffer accesses given the view offset */
+    unsigned off_unmatched;   /* texture-buffer accesses (other than RGB32-unmatched ones) whose descriptor could not be found:
+                                 no offset */
     char name[128];       /* the library's function */
     char note[160];
 };
@@ -38,7 +47,7 @@ struct madeira_air_rgb32_info {
  * library has no typed-buffer access (nothing allocated), -1 when it has some
  * but could not be rewritten (note says why; unmatched counts it). */
 int madeira_air_rgb32_rewrite(const void *lib, size_t len, void **out, size_t *out_len,
-                              struct madeira_air_rgb32_info *info);
+                              struct madeira_air_rgb32_info *info, unsigned what);
 
 #ifdef __cplusplus
 }

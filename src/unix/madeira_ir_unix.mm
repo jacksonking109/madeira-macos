@@ -1494,7 +1494,7 @@ static uint32_t mad_loop_watchdog_cap(int kind)
  * (madeira_air_rewrite.h); the runtime binds those views accordingly when the
  * same key says so. MAD_RGB32_VERSION goes into every DXIL cache key while it is
  * on; bump it when the rewrite's output changes. */
-#define MAD_RGB32_VERSION 3u   /* bump with every change to madeira_air_rewrite.cpp (not part of the build stamp) */
+#define MAD_RGB32_VERSION 4u   /* bump with every change to madeira_air_rewrite.cpp (not part of the build stamp) */
 static unsigned g_rgb32_said;
 static int mad_rgb32_shader_enabled(void)
 {
@@ -1505,6 +1505,26 @@ static int mad_rgb32_shader_enabled(void)
     if (on < 0) on = madeira_cfg_int("rgb32-shader", 1) ? 1 : 0;
 #endif
     return on;
+}
+/* wine-lab port: madeira.cfg tbuf-view-offset (default 1): the same AIR pass
+ * adds each texture-buffer view's element offset (descriptor metadata bits
+ * 32..39), which MSC never applies, to every typed-buffer and counter access
+ * (madeira_air_rewrite.h). Off, a typed view or UAV counter whose offset is
+ * not a multiple of 16 bytes reads and writes below its first element. */
+static int mad_view_offset_enabled(void)
+{
+    static int on = -1;
+#ifdef MADEIRA_NO_AIRCONV
+    on = 0;
+#else
+    if (on < 0) on = madeira_cfg_int("tbuf-view-offset", 1) ? 1 : 0;
+#endif
+    return on;
+}
+/* What the AIR pass does, and so the DXIL cache key: 0 when it does not run. */
+static unsigned mad_air_what(void)
+{
+    return (mad_rgb32_shader_enabled() ? MADEIRA_AIR_RGB32 : 0) | (mad_view_offset_enabled() ? MADEIRA_AIR_VIEW_OFFSET : 0);
 }
 
 /* 1 the first time a shader (by content hash) is reported, so a shader
@@ -1694,7 +1714,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
         env.atomic64 = a64 ? MAD_A64_VERSION : 0;
         env.loop_watchdog = lwd_cap ? MAD_LWD_VERSION : 0;
         env.loop_cap = lwd_cap;
-        env.rgb32 = mad_rgb32_shader_enabled() ? MAD_RGB32_VERSION : 0;
+        env.rgb32 = mad_air_what() ? MAD_RGB32_VERSION | (mad_air_what() << 16) : 0;
         mad_dxc_key(a, &env, &dxc_key, &dxc_check);
         if (dxc_slot) hit = mad_dxc_slot_take(dxc_key, dxc_check, &hit_len);
         if (!hit && dxc_disk) {
@@ -1952,22 +1972,22 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     if (!lib_bytes) { status = MADEIRA_IR_NO_MEMORY; goto done; }
     need = g_ir.IRMetalLibGetBytecode(lib, lib_bytes);
     if (!need) { status = MADEIRA_IR_NO_METALLIB; goto done; }
-    if (mad_rgb32_shader_enabled()) {   /* wine-lab port: RGB32 typed buffers read in the shader */
+    if (mad_air_what()) {   /* wine-lab port: RGB32 typed buffers read in the shader; texture-view offsets */
         struct madeira_air_rgb32_info ri;
         void *nb = NULL; size_t nl = 0;
 #ifdef MADEIRA_NO_AIRCONV
         int rc = 0; memset(&ri, 0, sizeof ri);
 #else
-        int rc = madeira_air_rgb32_rewrite(lib_bytes, need, &nb, &nl, &ri);
+        int rc = madeira_air_rgb32_rewrite(lib_bytes, need, &nb, &nl, &ri, mad_air_what());
 #endif
         if (rc > 0) { free(lib_bytes); lib_bytes = (uint8_t *)nb; need = nl; a->ret_len = need; }
         rgb32_word = (uint32_t)(ri.reads + ri.widths > 0xffff ? 0xffff : ri.reads + ri.widths) |
                      ((uint32_t)(ri.unmatched > 0xffff ? 0xffff : ri.unmatched) << 16);
-        if (rc != 0 && (ri.unmatched || g_rgb32_said++ < 8))
-            fprintf(stderr, "[madeira-ir] rgb32-shader: %s: %u typed SRV reads and %u widths rewritten (%u through a phi/select), "
-                            "%u typed UAV accesses left alone, %u SRV accesses unreachable%s%s\n",
+        if (rc != 0 && (ri.unmatched || ri.off_unmatched || g_rgb32_said++ < 8))
+            fprintf(stderr, "[madeira-ir] air rewrite: %s: rgb32 %u typed SRV reads and %u widths (%u through a phi/select), "
+                            "%u typed UAV accesses, %u SRV accesses unreachable; view offset on %u accesses, %u unreachable%s%s\n",
                     ri.name[0] ? ri.name : a->entry_point ? (const char *)(uintptr_t)a->entry_point : "?",
-                    ri.reads, ri.widths, ri.traced, ri.uav, ri.unmatched, ri.note[0] ? ": " : "", ri.note);
+                    ri.reads, ri.widths, ri.traced, ri.uav, ri.unmatched, ri.offsets, ri.off_unmatched, ri.note[0] ? ": " : "", ri.note);
     }
 
     /* The converter RENAMES entry points, so the name to give Metal comes from

@@ -12,6 +12,17 @@
  * size / 12. A read whose texture does not come straight from such a field is
  * left alone and counted as unmatched.
  *
+ * Texture-view offset (every texture-buffer access, SRV or UAV: read, write,
+ * atomic, GetDimensions). A view starts on the device's linear-texture
+ * alignment and metadata bits 32..39 hold the elements between that start and
+ * the view's first element (IRBufferView textureViewOffsetInElements). MSC
+ * writes that field but its code never reads it: typed loads, stores and
+ * atomics use the coordinate as is, IncrementCounter uses 0, get_width the
+ * texture's width. The rewrite adds the offset to the coordinate (argument 1
+ * of every such call) and subtracts it from get_width. Raw descriptors keep
+ * those bits 0; the RGB32 path above reads from gpuVA, which is exact, and
+ * keeps its index.
+ *
  * The metallib is then repacked around the new bitcode: header sizes, the
  * function's HASH (SHA-256 of the bitcode section) and MDSZ, and the offset of
  * any extended-header section placed after the bitcode (RLST). One function per
@@ -56,8 +67,7 @@ const char *kRead = "air.read_texture_buffer_1d.";
 const char *kWidth = "air.get_width_texture_buffer_1d";
 
 bool has_typed_buffer_access(const void *lib, size_t len) {
-    const char *b = (const char *)lib;
-    return memmem(b, len, "read_texture_buffer_1d", 22) || memmem(b, len, "get_width_texture_buffer_1d", 27);
+    return memmem(lib, len, "texture_buffer_1d", 17) != nullptr;
 }
 
 /* v == 24 * n + k for some n, k constant. */
@@ -177,12 +187,32 @@ bool rewrite_read(CallInst *call, Value *A) {
     return true;
 }
 
-bool rewrite_width(CallInst *call, Value *A) {
+/* The texture-view offset in elements: metadata bits 32..39. */
+Value *view_offset(IRBuilder<> &b, Value *md) {
+    return b.CreateTrunc(b.CreateAnd(b.CreateLShr(md, b.getInt64(32)), b.getInt64(0xff)), b.getInt32Ty(), "tbuf.off");
+}
+
+/* Coordinate (argument 1) + offset, before the call; past 2^32 stays out of range. */
+bool offset_coord(CallInst *call, Value *A) {
+    if (call->arg_size() < 2 || !call->getArgOperand(1)->getType()->isIntegerTy(32)) return false;
+    IRBuilder<> b(call);
+    Value *i = call->getArgOperand(1);
+    Value *j = b.CreateAdd(i, view_offset(b, load_desc(b, A).md), "tbuf.coord");
+    call->setArgOperand(1, b.CreateSelect(b.CreateICmpULT(j, i), b.getInt32(~0u), j));
+    return true;
+}
+
+/* GetDimensions: the texture's width less the offset (with the RGB32 count
+ * when `rgb32` and the view is one). */
+bool rewrite_width(CallInst *call, Value *A, bool rgb32) {
     if (!call->getType()->isIntegerTy(32)) return false;
     IRBuilder<> b(call->getNextNode());
     DescParts d = load_desc(b, A);
-    Value *sel = b.CreateSelect(d.flag, d.n, call, "rgb32.width");
-    call->replaceUsesWithIf(sel, [&](Use &u) { return u.getUser() != sel; });
+    Value *off = view_offset(b, d.md);
+    Value *w = b.CreateSelect(b.CreateICmpUGT(call, off), b.CreateSub(call, off), b.getInt32(0), "tbuf.width");
+    if (rgb32) w = b.CreateSelect(d.flag, d.n, w, "rgb32.width");
+    Instruction *last = cast<Instruction>(w);
+    call->replaceUsesWithIf(w, [&](Use &u) { Instruction *ui = dyn_cast<Instruction>(u.getUser()); return !ui || ui->getParent() != last->getParent() || last->comesBefore(ui); });
     return true;
 }
 
@@ -250,9 +280,10 @@ Value *field_ptr(Value *t, DenseMap<Value *, Value *> &memo, bool &via) {
     return nullptr;
 }
 
-int rewrite_module(Module &m, madeira_air_rgb32_info *info) {
-    std::vector<CallInst *> reads, widths;
+int rewrite_module(Module &m, madeira_air_rgb32_info *info, unsigned what) {
+    std::vector<CallInst *> reads, widths, others;
     DenseMap<Value *, Value *> memo;
+    const bool rgb32 = what & MADEIRA_AIR_RGB32, offs = what & MADEIRA_AIR_VIEW_OFFSET;
     for (Function &f : m) {
         if (!f.isDeclaration() && !info->name[0]) snprintf(info->name, sizeof info->name, "%s", f.getName().str().c_str());
         for (BasicBlock &bb : f)
@@ -262,24 +293,42 @@ int rewrite_module(Module &m, madeira_air_rgb32_info *info) {
                         StringRef n = cf->getName();
                         if (n.startswith(kRead)) reads.push_back(ci);
                         else if (n == kWidth) widths.push_back(ci);
+                        else if ((n.startswith("air.write_") || n.startswith("air.atomic_")) && n.contains("texture_buffer_1d"))
+                            others.push_back(ci);
                     }
     }
     int changed = 0;
     for (CallInst *ci : reads) {
         auto *acc = ci->arg_size() >= 3 ? dyn_cast<ConstantInt>(ci->getArgOperand(2)) : nullptr;
-        if (!acc || !acc->isZero() || is_uav_texture(ci->getArgOperand(0))) { info->uav++; continue; }
-        bool via = false;
+        bool srv = acc && acc->isZero() && !is_uav_texture(ci->getArgOperand(0)), via = false;
+        if (!srv) info->uav++;
+        if (!srv && !offs) continue;
         Value *A = field_ptr(ci->getArgOperand(0), memo, via);
-        if (A && rewrite_read(ci, A)) { info->reads++; info->traced += via; changed = 1; }
-        else info->unmatched++;
+        if (!A) { if (srv && rgb32) info->unmatched++; else info->off_unmatched++; continue; }
+        if (srv && rgb32 && rewrite_read(ci, A)) { info->reads++; info->traced += via; changed = 1; }   /* ci now runs only for other views */
+        else if (srv && rgb32) info->unmatched++;
+        if (offs && offset_coord(ci, A)) { info->offsets++; changed = 1; }
     }
     for (CallInst *ci : widths) {
-        if (is_uav_texture(ci->getArgOperand(0))) { info->uav++; continue; }
-        bool via = false;
+        bool srv = !is_uav_texture(ci->getArgOperand(0)), via = false;
+        if (!srv) info->uav++;
+        if (!srv && !offs) continue;
         Value *A = field_ptr(ci->getArgOperand(0), memo, via);
-        if (A && rewrite_width(ci, A)) { info->widths++; info->traced += via; changed = 1; }
-        else info->unmatched++;
+        if (!A) { if (srv && rgb32) info->unmatched++; else info->off_unmatched++; continue; }
+        if (offs || (srv && rgb32)) {
+            if (!rewrite_width(ci, A, srv && rgb32)) { if (srv && rgb32) info->unmatched++; continue; }
+            if (srv && rgb32) { info->widths++; info->traced += via; }
+            if (offs) info->offsets++;
+            changed = 1;
+        }
     }
+    if (offs)
+        for (CallInst *ci : others) {
+            bool via = false;
+            Value *A = field_ptr(ci->getArgOperand(0), memo, via);
+            if (A && offset_coord(ci, A)) { info->offsets++; changed = 1; }
+            else info->off_unmatched++;
+        }
     return changed;
 }
 
@@ -297,7 +346,7 @@ size_t tags_end(const unsigned char *b, size_t o, size_t lim) {
 } // namespace
 
 extern "C" int madeira_air_rgb32_rewrite(const void *lib, size_t len, void **out, size_t *out_len,
-                                         struct madeira_air_rgb32_info *info) {
+                                         struct madeira_air_rgb32_info *info, unsigned what) {
     const unsigned char *b = (const unsigned char *)lib;
     MTLBHeader h;
     *out = nullptr; *out_len = 0;
@@ -357,7 +406,7 @@ extern "C" int madeira_air_rgb32_rewrite(const void *lib, size_t len, void **out
     ctx.setOpaquePointers(false);
     auto mod = parseBitcodeFile(MemoryBufferRef(StringRef((const char *)bc, bclen), "air"), ctx);
     if (!mod) { std::string e = toString(mod.takeError()); FAIL("bitcode: %s", e.c_str()); }
-    if (!rewrite_module(**mod, info)) {
+    if (!rewrite_module(**mod, info, what)) {
         if (info->unmatched) snprintf(info->note, sizeof info->note, "%u typed SRV accesses without a descriptor field", info->unmatched);
         return info->unmatched ? -1 : 0;
     }
