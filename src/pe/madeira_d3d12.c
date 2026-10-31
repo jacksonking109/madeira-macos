@@ -675,6 +675,8 @@ struct mad_memheap;
 struct mad_resource;
 static int mad_placed_reuse_on(void);   /* wine-lab port: placed-texture reuse */
 static void mad_grave_park(struct mad_memheap *h, struct mad_resource *r);
+struct mad_resource;
+static void mad_lone_del(struct mad_resource *r, const struct mad_memheap *h);   /* wine-lab port: placements with their own storage */
 struct mad_resource {
     ID3D12Resource2Vtbl *vtbl;   /* ml886: Resource2-sized slot table */
     LONG refs;
@@ -682,6 +684,7 @@ struct mad_resource {
     const char *name;
     struct mad_memheap *placed_heap;   /* ml1145: set when the storage IS the heap's, at the placement offset */
     UINT64 placed_off, placed_size;    /* wine-lab port: where in placed_heap, for the placed-texture reuse below */
+    UINT8 lone;                        /* wine-lab port: placed, but on its own storage: in the mad_lone table */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
@@ -10233,6 +10236,7 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
     if (n == 0) { mad_pd_purge(This);   /* ml1143 */
         /* The backend owns the storage, so releasing the buffer is the whole
          * teardown; there is no separate free to order against it. */
+        if (r->lone) mad_lone_del(r, NULL);
         mad_untrack(r->owner, r);
         if (r->owner) {   /* ml920: srv_res / uav_res kept freed resources; the residency
                            * loops read r->texture from them, and a longer walk
@@ -10962,6 +10966,7 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
     if (n == 0) { mad_pd_purge(This);   /* ml1143 */
         struct mad_memheap *h = (struct mad_memheap *)This;
         static unsigned said;
+        mad_lone_del(NULL, h);   /* wine-lab port: placements that outlive their heap stop counting */
         if (h->desc.Alignment == 4194304 && (h->desc.Flags & 0x1000) && said++ < 200)
             d3d12_log("[transient] list#%u heap %p DESTROYED (%llu KB)\n", g_list_seq, (void *)h,
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
@@ -11044,6 +11049,57 @@ static HRESULT STDMETHODCALLTYPE device_CreateHeap(ID3D12Device *This, const D3D
     return hr;
 }
 
+/* wine-lab port: a placed resource that did not land in its heap's memory --
+ * every one in an UPLOAD, READBACK or CUSTOM heap (only DEFAULT heaps are
+ * Metal placement heaps, ml1145), or in a DEFAULT heap that could not be
+ * backed -- has storage of its own, so two such resources the application
+ * overlaps do NOT alias: a write through one is not seen through the other.
+ * Aliasing there would need the heap backed by our own memory with no-copy
+ * buffers over it (64 KB placements fit Apple's 16 KB pages), but the heap
+ * would then have to outlive every GPU use of its resources; not done. This
+ * keeps the live ones and says once when two overlap. */
+struct mad_lone { const struct mad_memheap *heap; const struct mad_resource *r; UINT64 off, end; };
+#define MAD_LONE_CAP 8192u
+static SRWLOCK g_lone_lock = SRWLOCK_INIT;
+static struct mad_lone *g_lone;
+static unsigned g_nlone;
+static LONG g_lone_overlaps;
+static void mad_lone_add(struct mad_memheap *h, struct mad_resource *r, UINT64 off, const D3D12_RESOURCE_DESC *desc) {
+    static unsigned said_full, said_overlap;
+    UINT64 size = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? desc->Width : r->size;
+    const struct mad_lone *hit = NULL; unsigned i;
+    if (!size) return;
+    AcquireSRWLockExclusive(&g_lone_lock);
+    for (i = 0; i < g_nlone; i++)
+        if (g_lone[i].heap == h && g_lone[i].off < off + size && off < g_lone[i].end) { hit = &g_lone[i]; break; }
+    if (hit) {
+        InterlockedIncrement(&g_lone_overlaps);
+        if (!said_overlap++)
+            d3d12_log("[madeira-d3d12] placed resources overlap in a heap of type %u (%llu KB) that is not a Metal heap: "
+                      "'%s' +%llu..%llu and '%s' +%llu..%llu have separate storage and do NOT alias (logged once)\n",
+                      (unsigned)h->desc.Properties.Type, (unsigned long long)(h->desc.SizeInBytes >> 10),
+                      hit->r->name ? hit->r->name : "?", (unsigned long long)hit->off, (unsigned long long)hit->end,
+                      r->name ? r->name : "?", (unsigned long long)off, (unsigned long long)(off + size));
+    }
+    if (g_nlone < MAD_LONE_CAP) {
+        if (!g_lone) g_lone = malloc(MAD_LONE_CAP * sizeof *g_lone);
+        if (g_lone) { g_lone[g_nlone].heap = h; g_lone[g_nlone].r = r; g_lone[g_nlone].off = off; g_lone[g_nlone].end = off + size; g_nlone++; r->lone = 1; }
+    } else if (!said_full++)
+        d3d12_log("[madeira-d3d12] %u placed resources on their own storage are live; later ones are not checked for overlaps\n", MAD_LONE_CAP);
+    ReleaseSRWLockExclusive(&g_lone_lock);
+}
+/* Drops resource r's entry, or every entry of heap h. */
+static void mad_lone_del(struct mad_resource *r, const struct mad_memheap *h) {
+    unsigned i;
+    AcquireSRWLockExclusive(&g_lone_lock);
+    for (i = 0; i < g_nlone; )
+        if ((r && g_lone[i].r == r) || (h && g_lone[i].heap == h)) {
+            if (g_lone[i].r) ((struct mad_resource *)g_lone[i].r)->lone = 0;
+            g_lone[i] = g_lone[--g_nlone];
+            if (r) break;
+        } else i++;
+    ReleaseSRWLockExclusive(&g_lone_lock);
+}
 static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(ID3D12Device *This, ID3D12Heap *heap,
         UINT64 offset, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES state,
         const D3D12_CLEAR_VALUE *clear, REFIID riid, void **out) {
@@ -11053,6 +11109,7 @@ static HRESULT STDMETHODCALLTYPE device_CreatePlacedResource(ID3D12Device *This,
     (void)state; (void)clear;
     if (!h || !desc || !out) { if (said++ < 8) d3d12_log("[madeira-d3d12] CreatePlacedResource: null heap/desc/out\n"); return E_INVALIDARG; }
     hr = mad_create_resource_at((struct mad_device *)This, h->desc.Properties.Type, desc, riid, out, h, offset);   /* ml1145 */
+    if (SUCCEEDED(hr) && *out && !((struct mad_resource *)*out)->placed_heap) mad_lone_add(h, (struct mad_resource *)*out, offset, desc);
     /* ml895: every placement inside a TRANSIENT heap (4 MB aligned, NOT_ZEROED)
      * with the list sequence, so a heap's occupancy can be replayed offline.
      * The RenderThread fault behind every menu crash is UE's transient

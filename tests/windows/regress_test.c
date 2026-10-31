@@ -35,6 +35,10 @@
  *       writes through a root UAV 256 bytes into a buffer, kernel B reads it back through a
  *       raw root SRV at the same address and writes through another root UAV. The DXBC
  *       backend used to refuse them ("root SRV/UAV has no length") and skip the dispatch.
+ *    9  Two buffers placed at overlapping offsets of one UPLOAD heap: both are created and
+ *       each maps and keeps its own bytes. D3D12 makes them ALIAS (one memory); here only
+ *       DEFAULT heaps are Metal heaps, so they do not, which the runtime logs once
+ *       ("placed resources overlap ... do NOT alias"). Printed as a KNOWN GAP, not counted.
  *
  *  Shaders are compiled at run time by Wine's d3dcompiler_47 (SM 5.0 DXBC, the
  *  airconv path ROTTR uses). Exit code = number of failed checks.
@@ -737,6 +741,37 @@ static void case_root_buffers(void) {
     ID3D12RootSignature_Release(rs);
 }
 
+static void case_upload_alias(void) {
+    D3D12_HEAP_DESC hd; D3D12_RESOURCE_DESC d; ID3D12Heap *heap = NULL; ID3D12Resource *a = NULL, *b = NULL;
+    UINT32 *pa = NULL, *pb = NULL; HRESULT ha, hb;
+    printf("\n[9] overlapping buffers placed in an UPLOAD heap\n");
+    ZeroMemory(&hd, sizeof hd);
+    hd.SizeInBytes = 192 * 1024; hd.Properties.Type = D3D12_HEAP_TYPE_UPLOAD; hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    if (FAILED(ID3D12Device_CreateHeap(dev, &hd, &IID_ID3D12Heap, (void **)&heap)) || !heap) { CHECK(0, "UPLOAD heap created"); return; }
+    ZeroMemory(&d, sizeof d);
+    d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; d.Width = 128 * 1024; d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+    d.SampleDesc.Count = 1; d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ha = ID3D12Device_CreatePlacedResource(dev, heap, 0, &d, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&a);
+    hb = ID3D12Device_CreatePlacedResource(dev, heap, 64 * 1024, &d, D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void **)&b);
+    CHECK(SUCCEEDED(ha) && SUCCEEDED(hb) && a && b, "two 128 KB buffers placed at +0 and +64 KB (%#lx, %#lx)", ha, hb);
+    if (a && b) {
+        ID3D12Resource_Map(a, 0, NULL, (void **)&pa); ID3D12Resource_Map(b, 0, NULL, (void **)&pb);
+        CHECK(pa && pb, "both map");
+        if (pa && pb) {
+            pa[0] = 0x11111111u; pb[0] = 0x22222222u; pa[16384] = 0x33333333u;   /* a +64 KB is b +0 in D3D12 */
+            CHECK(pa[0] == 0x11111111u && (pb[0] == 0x22222222u || pb[0] == 0x33333333u),
+                  "a +0 keeps its dword, b +0 holds its own or the aliased one (%#x)", pb[0]);
+            if (pb[0] == 0x33333333u) printf("  ok    (aliased: a +64 KB is b +0)\n");
+            else printf("  KNOWN GAP  not aliased: b +0 reads %#x after a +64 KB was written 0x33333333 (only DEFAULT heaps alias)\n", pb[0]);
+        }
+        if (pa) ID3D12Resource_Unmap(a, 0, NULL);
+        if (pb) ID3D12Resource_Unmap(b, 0, NULL);
+    }
+    if (b) ID3D12Resource_Release(b);
+    if (a) ID3D12Resource_Release(a);
+    ID3D12Heap_Release(heap);
+}
+
 int main(void) {
     HRESULT hr;
     printf("wine-lab d3d12: regression checks for the 2026-10-12/13 ROTTR fixes and the 2026-10-16 stub audit\n\n");
@@ -782,6 +817,7 @@ int main(void) {
     case_ecl_pair(0);
     case_ecl_pair(1);
     case_root_buffers();
+    case_upload_alias();
 done:
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails;
