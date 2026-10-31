@@ -1400,7 +1400,7 @@ struct mad_cmd {
         struct { UINT x, y, z; } dispatch;
         struct { struct mad_resource *args; UINT64 off; UINT count; UINT stride; struct mad_resource *cnt; UINT64 cnt_off; } ind;
         struct { struct mad_resource *res; UINT64 off, len; UINT8 byte, ring; obj_handle_t pattern; UINT32 pat[12]; } fill;   /* ml1151: pattern = exact 32-bit source; wine-lab port: ring = pat[] goes through the list ring at replay */
-        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; } filltex;   /* MC_FILL_TEX: mip, slices, texel size */
+        struct { struct mad_resource *res; UINT level, sl0, nsl, bpp; obj_handle_t pattern; UINT x0, y0, x1, y1; } filltex;   /* MC_FILL_TEX: mip, slices, texel size; x1 = 0: the whole mip, else the rectangle [x0,x1) x [y0,y1) */
         struct { float rgba[4]; } blend;
         struct { struct mad_resource *res; UINT8 unk; } shadow;   /* MC_SHADOW; unk = left a write state other than COPY_DEST */
         struct { struct mad_queryheap *heap; UINT type, index, count; struct mad_resource *dst; UINT64 off; } query;   /* ml1088 */
@@ -6197,9 +6197,15 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
     case MC_FILL_TEX: {   /* texture UAV clear, copied from a pattern buffer in row bands */
         const struct mad_resource *r = c->u.filltex.res;
         struct wmtcmd_blit_copy_from_buffer_to_texture k;
-        UINT w, h, d, row, band, s, z, y, nsl, is3d;
+        UINT w, h, d, row, band, s, z, y, nsl, is3d, x0 = 0, y0 = 0;
         if (!r || !r->texture || !c->u.filltex.pattern) { MAD_SKIP(e); return; }
         mad_mip_dims(r, c->u.filltex.level, &w, &h, &d);
+        if (c->u.filltex.x1) {   /* wine-lab port: a clear rectangle, clipped to the mip */
+            UINT x1 = c->u.filltex.x1 < w ? c->u.filltex.x1 : w, y1 = c->u.filltex.y1 < h ? c->u.filltex.y1 : h;
+            x0 = c->u.filltex.x0; y0 = c->u.filltex.y0;
+            if (x0 >= x1 || y0 >= y1) return;
+            w = x1 - x0; h = y1;
+        }
         row = w * c->u.filltex.bpp;
         if (!row || row > MAD_FILLPAT_BYTES || c->u.filltex.level >= r->tex_mips) { MAD_SKIP(e); return; }
         band = MAD_FILLPAT_BYTES / row;
@@ -6208,7 +6214,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
         if (c->u.filltex.nsl < nsl) nsl = c->u.filltex.nsl;
         for (s = 0; s < nsl; s++)
             for (z = 0; z < (is3d ? d : 1); z++)
-                for (y = 0; y < h; y += band) {
+                for (y = y0; y < h; y += band) {
                     UINT n = h - y < band ? h - y : band;
                     memset(&k, 0, sizeof k);
                     k.type = WMTBlitCommandCopyFromBufferToTexture;
@@ -6216,7 +6222,7 @@ static void exec_copy(struct mad_exec *e, const struct mad_cmd *c) {
                     k.bytes_per_row = row; k.bytes_per_image = row * n;
                     k.size.width = w; k.size.height = n; k.size.depth = 1;
                     k.dst = r->texture; k.slice = is3d ? 0 : c->u.filltex.sl0 + s; k.level = c->u.filltex.level;
-                    k.origin.x = 0; k.origin.y = y; k.origin.z = is3d ? z : 0;
+                    k.origin.x = x0; k.origin.y = y; k.origin.z = is3d ? z : 0;
                     MTLBlitCommandEncoder_encodeCommands(e->benc, (const struct wmtcmd_base *)&k);
                 }
         return;
@@ -14473,9 +14479,10 @@ static UINT mad_pack_clear(DXGI_FORMAT fmt, const UINT32 v[4], int is_float, uns
     }
     return nch * bits / 8;
 }
-static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct mad_resource *res, const UINT32 v[4], int is_float, const char *what) {
+static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct mad_resource *res, const UINT32 v[4], int is_float,
+                                     UINT nrect, const D3D12_RECT *rects, const char *what) {
     static unsigned said_miss, said_fmt, said_ok;
-    struct mad_uavtex u; unsigned char px[16]; UINT bpp, rbytes = 0, rblock = 0; UINT32 pat, w[4], per[4];
+    struct mad_uavtex u; unsigned char px[16]; UINT bpp, rbytes = 0, rblock = 0, i; UINT32 pat, w[4], per[4];
     obj_handle_t pattern; struct mad_cmd *c;
     {
         /* A view we did not record, or one recorded for another resource
@@ -14547,14 +14554,28 @@ static void mad_record_uav_tex_clear(struct mad_list *l, UINT64 view_id, struct 
     }
     pattern = mad_fill_pattern16(l->device, per);
     if (!pattern) return;
-    c = mad_list_push(l, MC_FILL_TEX);
-    if (!c) return;
-    c->u.filltex.res = u.res; c->u.filltex.level = u.level; c->u.filltex.sl0 = u.sl0; c->u.filltex.nsl = u.nsl;
-    c->u.filltex.bpp = bpp; c->u.filltex.pattern = pattern;
+    if (!rects) nrect = 0;
+    /* wine-lab port: NumRects 0 clears the whole view, else only the rectangles
+     * (in the view's mip, every slice of it); the replay clips them to the mip.
+     * They were ignored: a partial clear wiped the whole texture. */
+    for (i = 0; i < (nrect ? nrect : 1); i++) {
+        UINT x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+        if (nrect) {
+            const D3D12_RECT *rc = &rects[i];
+            x0 = rc->left > 0 ? (UINT)rc->left : 0; y0 = rc->top > 0 ? (UINT)rc->top : 0;
+            x1 = rc->right > 0 ? (UINT)rc->right : 0; y1 = rc->bottom > 0 ? (UINT)rc->bottom : 0;
+            if (x0 >= x1 || y0 >= y1) continue;   /* empty */
+        }
+        c = mad_list_push(l, MC_FILL_TEX);
+        if (!c) return;
+        c->u.filltex.res = u.res; c->u.filltex.level = u.level; c->u.filltex.sl0 = u.sl0; c->u.filltex.nsl = u.nsl;
+        c->u.filltex.bpp = bpp; c->u.filltex.pattern = pattern;
+        c->u.filltex.x0 = x0; c->u.filltex.y0 = y0; c->u.filltex.x1 = x1; c->u.filltex.y1 = y1;
+    }
     if (said_ok++ < 8)
-        d3d12_log("[madeira-d3d12] %s on texture '%s' %ux%u mip %u slices %u+%d, format %u -> texel %#x x%u bytes\n",
+        d3d12_log("[madeira-d3d12] %s on texture '%s' %ux%u mip %u slices %u+%d, format %u -> texel %#x x%u bytes%s\n",
                   what, u.res->name ? u.res->name : "?", u.res->width, u.res->height, u.level, u.sl0,
-                  u.nsl == ~0u ? -1 : (int)u.nsl, (unsigned)u.fmt, pat, bpp);
+                  u.nsl == ~0u ? -1 : (int)u.nsl, (unsigned)u.fmt, pat, bpp, nrect ? " (rectangles)" : "");
 }
 /* wine-lab port: a typed buffer view is cleared element by element in its
  * format (mad_pack_clear), through a pattern holding whole elements; 0 when
@@ -14581,30 +14602,11 @@ static int mad_record_typed_buffer_clear(struct mad_list *l, struct mad_cmd *c, 
                   c->u.fill.res->name ? c->u.fill.res->name : "?", (unsigned long long)c->u.fill.off, (unsigned long long)c->u.fill.len);
     return 1;
 }
-static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res, const UINT32 v[4], int is_float, const char *what) {
-    struct mad_list *l = (struct mad_list *)This;
-    struct mad_descriptor *e = (struct mad_descriptor *)cpu.ptr;
-    struct mad_resource *r; UINT64 off = 0; UINT64 len;
+/* One buffer range [off, off + len) of r cleared through a view of format typed (UNKNOWN: raw or structured). */
+static void mad_record_uav_buf_fill(struct mad_list *l, struct mad_resource *r, UINT64 off, UINT64 len, DXGI_FORMAT typed,
+                                    const UINT32 v[4], int is_float, const char *what) {
     struct mad_cmd *c;
-    DXGI_FORMAT typed;
-    static unsigned said_tex, said_unused, said_approx;
-    if (!e || !l) return;
-    if (!e->gpu_va) {   /* a texture view */
-        if (e->texture_view_id) mad_record_uav_tex_clear(l, e->texture_view_id, (struct mad_resource *)res, v, is_float, what);
-        else if (said_tex++ < 2) d3d12_log("[madeira-d3d12] %s on a null view; skipped\n", what);
-        return;
-    }
-    /* ml1157: the application names the resource; use it. Resolving the view's
-     * address picked whichever placed resource aliased it, which could be one
-     * the application frees before this list runs. */
-    r = (struct mad_resource *)res;
-    if (r && r->buffer && r->gpu_address && e->gpu_va >= r->gpu_address && e->gpu_va < r->gpu_address + r->size) off = e->gpu_va - r->gpu_address;
-    else r = mad_resolve_address(l->device, e->gpu_va, &off);
-    if (!r || !r->buffer) return;
-    len = e->metadata & 0xffffffffu;
-    if (!len || off + len > r->size) len = r->size > off ? r->size - off : 0;
-    if (!len) return;
-    typed = mad_uavfmt_get(e);   /* wine-lab port */
+    static unsigned said_unused, said_approx;
     c = mad_list_push(l, MC_FILL_BB);
     if (!c) return;
     c->u.fill.res = r; c->u.fill.off = off; c->u.fill.len = len;
@@ -14635,19 +14637,62 @@ static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESC
                       x, v[1], v[2], v[3], r->name ? r->name : "?", (unsigned long long)off, (unsigned long long)len);
     }
 }
+static void mad_record_uav_clear(ID3D12GraphicsCommandList *This, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res, const UINT32 v[4], int is_float,
+                                 UINT nrect, const D3D12_RECT *rects, const char *what) {
+    struct mad_list *l = (struct mad_list *)This;
+    struct mad_descriptor *e = (struct mad_descriptor *)cpu.ptr;
+    struct mad_resource *r; UINT64 off = 0; UINT64 len, esz = 4, nel; UINT i;
+    DXGI_FORMAT typed;
+    static unsigned said_tex, said_rect;
+    if (!e || !l) return;
+    if (!rects) nrect = 0;
+    if (!e->gpu_va) {   /* a texture view */
+        if (e->texture_view_id) mad_record_uav_tex_clear(l, e->texture_view_id, (struct mad_resource *)res, v, is_float, nrect, rects, what);
+        else if (said_tex++ < 2) d3d12_log("[madeira-d3d12] %s on a null view; skipped\n", what);
+        return;
+    }
+    /* ml1157: the application names the resource; use it. Resolving the view's
+     * address picked whichever placed resource aliased it, which could be one
+     * the application frees before this list runs. */
+    r = (struct mad_resource *)res;
+    if (r && r->buffer && r->gpu_address && e->gpu_va >= r->gpu_address && e->gpu_va < r->gpu_address + r->size) off = e->gpu_va - r->gpu_address;
+    else r = mad_resolve_address(l->device, e->gpu_va, &off);
+    if (!r || !r->buffer) return;
+    len = e->metadata & 0xffffffffu;
+    if (!len || off + len > r->size) len = r->size > off ? r->size - off : 0;
+    if (!len) return;
+    typed = mad_uavfmt_get(e);   /* wine-lab port */
+    if (!nrect) { mad_record_uav_buf_fill(l, r, off, len, typed, v, is_float, what); return; }
+    /* wine-lab port: the rectangles of a buffer view are element ranges: each is
+     * clipped to [0, elements) x [0, 1), as vkd3d-proton does; an element is the
+     * typed view's format, else a dword (raw; structured views take none in D3D12) */
+    if (typed != DXGI_FORMAT_UNKNOWN) { UINT b = 0, blk = 0; mad_format_info(typed, &b, &blk); if (b && blk == 1) esz = b; }
+    nel = len / esz;
+    for (i = 0; i < nrect; i++) {
+        const D3D12_RECT *rc = &rects[i];
+        UINT64 a = rc->left > 0 ? (UINT64)rc->left : 0, b = rc->right > 0 ? (UINT64)rc->right : 0;
+        if (b > nel) b = nel;
+        if (a >= b || rc->top > 0 || rc->bottom < 1) continue;   /* empty once clipped */
+        mad_record_uav_buf_fill(l, r, off + a * esz, (b - a) * esz, typed, v, is_float, what);
+    }
+    if (said_rect++ < 8)
+        d3d12_log("[madeira-d3d12] %s on a buffer view with %u rectangle(s) (%llu elements of %llu bytes, first [%ld, %ld)) of '%s'\n",
+                  what, nrect, (unsigned long long)nel, (unsigned long long)esz, (long)rects[0].left, (long)rects[0].right,
+                  r->name ? r->name : "?");
+}
 static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewUint(ID3D12GraphicsCommandList *This,
         D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res,
         const UINT values[4], UINT n, const D3D12_RECT *rects) {
-    (void)gpu; (void)n; (void)rects;
-    mad_record_uav_clear(This, cpu, res, values, 0, "ClearUnorderedAccessViewUint");
+    (void)gpu;
+    mad_record_uav_clear(This, cpu, res, values, 0, n, rects, "ClearUnorderedAccessViewUint");
 }
 static void STDMETHODCALLTYPE list_ClearUnorderedAccessViewFloat(ID3D12GraphicsCommandList *This,
         D3D12_GPU_DESCRIPTOR_HANDLE gpu, D3D12_CPU_DESCRIPTOR_HANDLE cpu, ID3D12Resource *res,
         const FLOAT values[4], UINT n, const D3D12_RECT *rects) {
     UINT32 u[4]; int i;
-    (void)gpu; (void)n; (void)rects;
+    (void)gpu;
     for (i = 0; i < 4; i++) memcpy(&u[i], &values[i], 4);
-    mad_record_uav_clear(This, cpu, res, u, 1, "ClearUnorderedAccessViewFloat");
+    mad_record_uav_clear(This, cpu, res, u, 1, n, rects, "ClearUnorderedAccessViewFloat");
 }
 static void STDMETHODCALLTYPE list_OMSetBlendFactor(ID3D12GraphicsCommandList *This, const FLOAT f[4]) {
     struct mad_cmd *c = mad_list_push((struct mad_list *)This, MC_BLEND_FACTOR);

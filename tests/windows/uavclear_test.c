@@ -30,6 +30,15 @@
  *       R32G32B32A32_UINT 1..4 to (5, 6, 7, 8), R16G16_UINT 0..7 to (1, 2),
  *       R32G32_FLOAT 3..6 to (1.5, -2.0) by a Float clear, R32_UINT to 4 with
  *       Values[1..3] = 1, and a raw view to Values[0] = 9.
+ *    7  clear RECTANGLES (NumRects > 0): only they are written. A texture
+ *       takes two rectangles, one past the right and bottom edges (clipped),
+ *       plus an empty one; a typed buffer view takes element ranges (left..right,
+ *       top 0, bottom 1) relative to its FirstElement, one past its end; a raw
+ *       view takes a dword range. The runtime ignored them and cleared the whole
+ *       view.
+ *
+ *    8  80 raw-view clears with distinct values, more than the runtime's
+ *       pattern cache (64) holds: each stays exact.
  *
  *  Exit code = number of failed checks.
  */
@@ -237,8 +246,8 @@ static void put_buf_uav(ID3D12Resource *buf, DXGI_FORMAT fmt, BOOL raw, UINT fir
 /* Fills `buf` with 0xAAAAAAAA through a raw view (slot 8), clears it through
  * the view described (slot 9), reads it back and compares every dword with
  * `want`. */
-static void buffer_case(const char *name, ID3D12Resource *buf, DXGI_FORMAT fmt, BOOL raw, UINT first, UINT num,
-                        BOOL is_float, const void *values, const UINT32 *want) {
+static void buffer_case_r(const char *name, ID3D12Resource *buf, DXGI_FORMAT fmt, BOOL raw, UINT first, UINT num,
+                          BOOL is_float, const void *values, const UINT32 *want, UINT nrect, const D3D12_RECT *rects) {
     static const UINT fill[4] = { 0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu, 0xAAAAAAAAu };
     D3D12_CPU_DESCRIPTOR_HANDLE cpu;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu;
@@ -251,8 +260,8 @@ static void buffer_case(const char *name, ID3D12Resource *buf, DXGI_FORMAT fmt, 
     ZeroMemory(&b, sizeof b); b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; b.UAV.pResource = buf;
     ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
     put_buf_uav(buf, fmt, raw, first, num, 9, &cpu, &gpu);
-    if (is_float) ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(list, gpu, cpu, buf, values, 0, NULL);
-    else ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, gpu, cpu, buf, values, 0, NULL);
+    if (is_float) ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(list, gpu, cpu, buf, values, nrect, rects);
+    else ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, gpu, cpu, buf, values, nrect, rects);
     barrier(buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, buf, 0, BUF_BYTES);
     barrier(buf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -263,6 +272,51 @@ static void buffer_case(const char *name, ID3D12Resource *buf, DXGI_FORMAT fmt, 
     CHECK(bad == 0, "%s: %d of %d dwords differ", name, bad, BUF_DWORDS);
     if (bad) printf("        first differing dword %d: %#x, expected %#x\n", firstbad, p[firstbad], want[firstbad]);
     ID3D12Resource_Unmap(rb, 0, NULL);
+}
+
+static void buffer_case(const char *name, ID3D12Resource *buf, DXGI_FORMAT fmt, BOOL raw, UINT first, UINT num,
+                        BOOL is_float, const void *values, const UINT32 *want) {
+    buffer_case_r(name, buf, fmt, raw, first, num, is_float, values, want, 0, NULL);
+}
+
+/* Case 7: clears `tex` (R32_FLOAT) whole to 0, then the rectangles to 1.0f, and
+ * checks every texel against the rectangles clipped to the texture. */
+static void tex_rect_case(const char *name, ID3D12Resource *tex, UINT nrect, const D3D12_RECT *rects, UINT slot) {
+    static const UINT zero[4] = { 0, 0, 0, 0 };
+    static const FLOAT one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu; D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+    D3D12_TEXTURE_COPY_LOCATION dl, sl; D3D12_RESOURCE_BARRIER b;
+    BYTE *p = NULL; UINT x, y, i; int bad = 0, inside = 0; UINT32 firstv = 0, firstx = 0, firsty = 0;
+    put_uav(tex, DXGI_FORMAT_R32_FLOAT, slot, &cpu, &gpu);
+    ID3D12GraphicsCommandList_SetDescriptorHeaps(list, 1, &gpuh);
+    ID3D12GraphicsCommandList_ClearUnorderedAccessViewUint(list, gpu, cpu, tex, zero, 0, NULL);
+    ZeroMemory(&b, sizeof b); b.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; b.UAV.pResource = tex;
+    ID3D12GraphicsCommandList_ResourceBarrier(list, 1, &b);
+    ID3D12GraphicsCommandList_ClearUnorderedAccessViewFloat(list, gpu, cpu, tex, one, nrect, rects);
+    ZeroMemory(&dl, sizeof dl); ZeroMemory(&sl, sizeof sl);
+    dl.pResource = rb; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_FLOAT;
+    dl.PlacedFootprint.Footprint.Width = W; dl.PlacedFootprint.Footprint.Height = H;
+    dl.PlacedFootprint.Footprint.Depth = 1; dl.PlacedFootprint.Footprint.RowPitch = PITCH;
+    sl.pResource = tex; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    barrier(tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    ID3D12GraphicsCommandList_CopyTextureRegion(list, &dl, 0, 0, 0, &sl, NULL);
+    barrier(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!submit_and_wait()) { CHECK(FALSE, "%s: nothing read back", name); return; }
+    ID3D12Resource_Map(rb, 0, NULL, (void **)&p);
+    if (!p) { CHECK(FALSE, "%s: readback Map failed", name); return; }
+    for (y = 0; y < H; y++)
+        for (x = 0; x < W; x++) {
+            UINT32 v, want = 0;
+            for (i = 0; i < nrect; i++)
+                if ((LONG)x >= rects[i].left && (LONG)x < rects[i].right && (LONG)y >= rects[i].top && (LONG)y < rects[i].bottom) want = 0x3f800000u;
+            if (want) inside++;
+            memcpy(&v, p + (SIZE_T)y * PITCH + (SIZE_T)x * 4, 4);
+            if (v != want) { if (!bad) { firstv = v; firstx = x; firsty = y; } bad++; }
+        }
+    ID3D12Resource_Unmap(rb, 0, NULL);
+    CHECK(bad == 0, "%s: %d of %d texels wrong (%d inside the rectangles)", name, bad, W * H, inside);
+    if (bad) printf("        first wrong texel (%u, %u): %#x\n", firstx, firsty, firstv);
 }
 
 /* The expected buffer: 0xAAAAAAAA outside dwords [d0, d0 + n), `per` repeating inside. */
@@ -369,6 +423,28 @@ int main(void) {
         buffer_case("R32_UINT whole buffer, Uint (4, 1, 1, 1)", b_args, DXGI_FORMAT_R32_UINT, FALSE, 0, BUF_DWORDS, FALSE, r32, want);
         expect(want, 0, BUF_DWORDS, p_raw, 1);
         buffer_case("raw view whole buffer, Uint (9, 1, 2, 3)", b_args, DXGI_FORMAT_R32_TYPELESS, TRUE, 0, BUF_DWORDS, FALSE, rawv, want);
+    }
+    printf("\n[7] Clear rectangles: textures by region, buffer views by element range\n");
+    if (b_args) {
+        static const D3D12_RECT trc[3] = { { 4, 2, 20, 10 }, { 50, 12, 100, 40 }, { 30, 5, 30, 9 } };
+        static const D3D12_RECT brc[2] = { { 2, 0, 4, 1 }, { 11, 0, 99, 1 } }, rrc[1] = { { 5, 0, 9, 1 } };
+        static const UINT rgba[4] = { 5, 6, 7, 8 }, rawv[4] = { 9, 9, 9, 9 };
+        UINT32 want[BUF_DWORDS]; UINT i;
+        tex_rect_case("R32_FLOAT texture, rectangles (4,2)-(20,10), (50,12)-(100,40) clipped, an empty one", t_f32, 3, trc, 6);
+        /* R32G32B32A32_UINT view of elements 1..14 (16 bytes each): view elements 2..3 and 11..13 (clipped) are buffer elements 3..4 and 12..14 */
+        for (i = 0; i < BUF_DWORDS; i++) want[i] = 0xAAAAAAAAu;
+        for (i = 3 * 4; i < 5 * 4; i++) want[i] = rgba[i % 4];
+        for (i = 12 * 4; i < 15 * 4; i++) want[i] = rgba[i % 4];
+        buffer_case_r("R32G32B32A32_UINT elements 1..14, element ranges [2,4) and [11,99)", b_args, DXGI_FORMAT_R32G32B32A32_UINT, FALSE,
+                      1, 14, FALSE, rgba, want, 2, brc);
+        /* raw view of dwords 8..39: dwords 13..16 */
+        for (i = 0; i < BUF_DWORDS; i++) want[i] = 0xAAAAAAAAu;
+        for (i = 13; i < 17; i++) want[i] = 9;
+        buffer_case_r("raw view dwords 8..39, dword range [5,9)", b_args, DXGI_FORMAT_R32_TYPELESS, TRUE, 8, 32, FALSE, rawv, want, 1, rrc);
+    }
+    printf("\n[8] More distinct clear values than the pattern cache holds\n");
+    if (b_args) {
+        UINT32 want[BUF_DWORDS];
         {   /* wine-lab port: more distinct values than the runtime's pattern cache (64) stay exact -- TLOU Part I
              * clears its ray-cast results to 0xDEAD0000 + n with n growing without bound and checks the 0xDEAD half */
             UINT i; char nm[64];
