@@ -9150,6 +9150,18 @@ static void mad_shadow_free(struct mad_device *d, struct mad_resource *r) {
     }
     LeaveCriticalSection(&d->view_lock);
 }
+/* wine-lab port: a buffer view with both a Format and a StructureByteStride is
+ * invalid D3D12 (the debug layer rejects it). The stride won here, so the view
+ * became a raw descriptor and typed loads through it read texture id 0. Native
+ * drivers and vkd3d-proton (vkd3d_create_buffer_view_for_resource: a structured
+ * view only when Format is UNKNOWN; is_typed = Format && !RAW) go by the
+ * format, so the format wins and the stride is ignored. */
+static void mad_stride_and_format(const char *what, DXGI_FORMAT fmt, UINT stride) {
+    static unsigned said;
+    if (stride && !said++)
+        d3d12_log("[madeira-d3d12] buffer %s with Format %u AND StructureByteStride %u (invalid D3D12): the format wins, the stride is ignored\n",
+                  what, (unsigned)fmt, stride);
+}
 static int mad_is_rgb32(DXGI_FORMAT f) {
     return f == DXGI_FORMAT_R32G32B32_TYPELESS || f == DXGI_FORMAT_R32G32B32_FLOAT || f == DXGI_FORMAT_R32G32B32_UINT || f == DXGI_FORMAT_R32G32B32_SINT;
 }
@@ -9542,11 +9554,11 @@ static void STDMETHODCALLTYPE device_CreateUnorderedAccessView(ID3D12Device *Thi
         if (desc && desc->ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
             UINT bytes, block;
             first = desc->Buffer.FirstElement; num = desc->Buffer.NumElements;
-            if (desc->Buffer.StructureByteStride) stride = desc->Buffer.StructureByteStride;
-            else if (desc->Format != DXGI_FORMAT_UNKNOWN) {
+            if (desc->Format != DXGI_FORMAT_UNKNOWN) {   /* the format wins over a stride (mad_stride_and_format) */
+                mad_stride_and_format("UAV", desc->Format, desc->Buffer.StructureByteStride);
                 mad_format_info(desc->Format, &bytes, &block); stride = bytes;
                 if (!(desc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW)) typed = desc->Format;
-            }
+            } else if (desc->Buffer.StructureByteStride) stride = desc->Buffer.StructureByteStride;
         }
         if (typed != DXGI_FORMAT_UNKNOWN && mad_typed_buffer_view((struct mad_device *)This, r, typed, first, num, 1, e)) {   /* ml905 */
             mad_uavfmt_put(e, typed);   /* wine-lab port: for ClearUnorderedAccessView* */
@@ -12175,12 +12187,12 @@ static void STDMETHODCALLTYPE device_CreateShaderResourceView(ID3D12Device *This
         if (desc && desc->ViewDimension == D3D12_SRV_DIMENSION_BUFFER) {
             UINT bytes, block;
             first = desc->Buffer.FirstElement; num = desc->Buffer.NumElements;
-            if (desc->Buffer.StructureByteStride) stride = desc->Buffer.StructureByteStride;
-            else if (desc->Format != DXGI_FORMAT_UNKNOWN) {
+            if (desc->Format != DXGI_FORMAT_UNKNOWN) {   /* the format wins over a stride (mad_stride_and_format) */
+                mad_stride_and_format("SRV", desc->Format, desc->Buffer.StructureByteStride);
                 mad_format_info(desc->Format, &bytes, &block); stride = bytes;
                 if (!(desc->Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) &&
                     mad_typed_buffer_view((struct mad_device *)This, r, desc->Format, first, num, 0, e)) return;   /* ml905 */
-            }
+            } else if (desc->Buffer.StructureByteStride) stride = desc->Buffer.StructureByteStride;
         }
         mad_set_buffer_descriptor(e, r->gpu_address + first * stride, num * stride);
         return;

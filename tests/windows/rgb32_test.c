@@ -47,6 +47,10 @@
  *       an RGB32 SRV read in one kernel (rgb32_uav.hlsl): the RGB32 read stays
  *       on the shader path and no pipeline reports an untraceable read
  *
+ *   14  buffer-view description edges with no Metal equivalent: an R32_FLOAT
+ *       view that also sets StructureByteStride (invalid D3D12; native drivers
+ *       and vkd3d-proton go by the format) reads as a typed view
+ *
  *  With madeira.cfg rgb32-shader = 1 (the default) RGB32 views are read in the
  *  shader from their own memory (src/unix/madeira_air_rewrite.cpp): cases 9 and
  *  10 then check that no shadow exists and nothing is copied, and the run ends
@@ -80,7 +84,7 @@ enum { NF = 40000, NI = 4096, NN = 512, NP = 256, OFF = 37, NOFF = 1000, LATE_FI
 enum { NR = 3000, NSLOT = 3, NFRAMES = 24, NREAD = 4 };   /* case 8: elements per slot, slots = frames in flight */
 enum { K_FLOAT, K_UINT, K_SINT };
 /* heap slots */
-enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_UAV0, S_UAV1, S_COUNT };
+enum { S_F, S_FOFF, S_U, S_I, S_P, S_N, S_LATE, S_RING, S_SLOT0, S_BIG0 = S_SLOT0 + NSLOT, NBIGV = 80, S_WHOLE = S_BIG0 + NBIGV, S_USI, S_R32, S_UAV0, S_UAV1, S_STRIDE, S_COUNT };
 enum { NG = 1 << 20, NCOPY = 40, CPYN = 1200 };   /* case 9: big buffer elements, copies, elements per copy */
 static UINT big_first(UINT k) { return k * 12007u + 5u; }
 static UINT big_num(UINT k) { return 100u + 13u * k; }
@@ -583,6 +587,23 @@ static void uav_next_to_rgb32(void) {
                            (unsigned long long)st.untraced_pipes, (unsigned long long)st.live);
 }
 
+static void desc_edges(void) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC d; D3D12_CPU_DESCRIPTOR_HANDLE h;
+    printf("\n[14] buffer-view description edges\n");
+    ZeroMemory(&d, sizeof d);
+    d.Format = DXGI_FORMAT_R32_FLOAT; d.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    d.Buffer.FirstElement = 0; d.Buffer.NumElements = 3000; d.Buffer.StructureByteStride = 12;
+    heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(heap, &h); h.ptr += (SIZE_T)S_STRIDE * inc;
+    ID3D12Device_CreateShaderResourceView(dev, fbuf, &d, h);
+    read_view(K_FLOAT, S_STRIDE, 3000, 0);
+    read_view(3, S_STRIDE, 1, 1);
+    if (finish(2)) {
+        verify_r32("R32_FLOAT view with StructureByteStride 12", 0, 3000);
+        verify_dims("R32_FLOAT view with StructureByteStride 12", 1, 3000);
+    } else CHECK(0, "case 14a submitted");
+}
+
 static void cases(void) {
     struct expect A = { K_FLOAT, 0.25f, 0 }, Aoff = { K_FLOAT, 0.25f, OFF }, B = { K_FLOAT, -7.0f, 0 }, Boff = { K_FLOAT, -7.0f, OFF };
     struct expect U = { K_UINT, 0, 0 }, I = { K_SINT, 0, 0 }, C = { K_FLOAT, 1000.0f, 0 }, Blate = { K_FLOAT, -7.0f, LATE_FIRST };
@@ -652,6 +673,7 @@ static void cases(void) {
     dedupe_and_big();
     r32_and_heap();
     uav_next_to_rgb32();
+    desc_edges();
     if (shader_mode) {
         struct shadow_stats st = stats2();
         CHECK(!st.live && !st.copied && !st.unsafe, "rgb32-shader: the whole run made no shadow and copied nothing (%llu live, %llu bytes; %llu views read in the shader)",
