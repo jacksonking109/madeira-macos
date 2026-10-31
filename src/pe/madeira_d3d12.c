@@ -672,12 +672,16 @@ static void mad_note_sampler(struct mad_device *d, obj_handle_t smp) {
  * DXMT's ring allocator uses and the one the remote shadow machinery already
  * understands. DEFAULT is GPU-private and deliberately not mappable. */
 struct mad_memheap;
+struct mad_resource;
+static int mad_placed_reuse_on(void);   /* wine-lab port: placed-texture reuse */
+static void mad_grave_park(struct mad_memheap *h, struct mad_resource *r);
 struct mad_resource {
     ID3D12Resource2Vtbl *vtbl;   /* ml886: Resource2-sized slot table */
     LONG refs;
     const IID *iid;
     const char *name;
     struct mad_memheap *placed_heap;   /* ml1145: set when the storage IS the heap's, at the placement offset */
+    UINT64 placed_off, placed_size;    /* wine-lab port: where in placed_heap, for the placed-texture reuse below */
     void *own_mem;                     /* ml1154: our VirtualAlloc'd storage behind a CPU-visible buffer */
     unsigned track_seq;                /* ml1157: creation order in the address index (newest alias wins) */
     obj_handle_t buffer;
@@ -7669,6 +7673,9 @@ static void mad_dfree_reclaim(struct mad_device *d, int all) {
 static void mad_dfree_arm(struct mad_device *d, UINT64 g) {
     UINT64 lag = mad_async_on() ? 2 : 1, serial = (UINT64)d->gpu_serial; unsigned i;
     static LONG said;
+    static int hold = -1;   /* wine-lab port: dfree-hold (experiment) -- keep released objects N more generations, so Metal reuses their resource ids later */
+    if (hold < 0) { hold = (int)mad_cfg_int_pe("dfree-hold", 0); if (hold < 0) hold = 0; if (hold) d3d12_log("[madeira-d3d12] dfree-hold = %d generations\n", hold); }
+    lag += (UINT64)hold;
     if (!d->ndfree) return;
     EnterCriticalSection(&d->heap_lock);
     for (i = 0; i < d->ndfree; i++)
@@ -10190,6 +10197,8 @@ static ULONG STDMETHODCALLTYPE res_Release(ID3D12Resource *This) {
             for (k = 0; k < r->nxview; k++) mad_uavtex_forget(r, r->xview[k].id);
         }
         if (r->nshadow && r->owner) mad_shadow_free(r->owner, r);   /* wine-lab port */
+        if (r->placed_heap && r->texture && !r->borrowed && r->placed_size && mad_placed_reuse_on())
+            mad_grave_park(r->placed_heap, r);   /* wine-lab port: placed-texture reuse; takes the texture and its views */
         if (r->owner) {   /* wine-lab port: deferred teardown (mad_dfree_push): work already recorded may still read these */
             struct mad_device *od = r->owner; unsigned k;
             for (k = 0; k < r->ntview; k++) if (r->tview[k].tex) { mad_dfree_push(od, r->tview[k].tex, 0, NULL); InterlockedDecrement(&g_tview_live); }   /* ml905; ml1126 */
@@ -10393,12 +10402,86 @@ static void mad_refuse_log(const D3D12_RESOURCE_DESC *desc, D3D12_HEAP_TYPE heap
  * now real Metal placement heaps. CUSTOM heaps (a DXBC title's hundreds of
  * small CPU-page texture heaps, ~1.7 GB of mostly empty space) stay
  * description-only. madeira.cfg heap-backing = 0 restores the old behaviour. */
+/* wine-lab port: PLACED-TEXTURE REUSE. A D3D12 descriptor of a placed texture
+ * effectively names memory in the application's heap; ours names a Metal texture
+ * object by its resource id, and Metal hands a freed texture's id to the next
+ * texture it makes. The Last of Us Part I destroys and re-creates its eight
+ * per-object probe textures every frame at the same heap offsets and still reads
+ * through descriptors it made for the previous ones -- harmless on Windows (same
+ * memory), but here those ids had already been reused by OTHER probe textures, so
+ * whole objects took another object's lighting for a frame (green, blue, magenta,
+ * orange). A released placed texture is therefore parked with its views, per heap,
+ * and a new placed texture with the same description at the same offset adopts
+ * the Metal object and keeps its ids. A parked one is freed (after the GPU) when
+ * something else is placed over its memory, when the heap goes, or past a cap.
+ * madeira.cfg placed-reuse = 0 turns it off. */
+struct mad_grave {
+    UINT64 off, size, seq;
+    D3D12_RESOURCE_DESC desc;   /* Alignment zeroed */
+    obj_handle_t tex; UINT64 id;
+    struct mad_xview *xview; unsigned nxview, xview_cap;
+};
 struct mad_memheap {
     ID3D12HeapVtbl *vtbl; LONG refs; const IID *iid; const char *name;
     struct mad_device *device;
     D3D12_HEAP_DESC desc;
     obj_handle_t mtl;   /* ml1145: the Metal placement heap, or 0 */
+    struct mad_grave *grave; unsigned ngrave, grave_cap; UINT64 grave_seq;   /* wine-lab port: parked placed textures */
 };
+#define MAD_GRAVE_CAP 512u
+static SRWLOCK g_grave_lock = SRWLOCK_INIT;
+static LONG g_grave_parked, g_grave_adopted, g_grave_freed;
+static int mad_placed_reuse_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("placed-reuse", 1) ? 1 : 0; d3d12_log("[madeira-d3d12] placed-reuse = %d\n", on); }
+    return on;
+}
+static void mad_grave_free(struct mad_device *d, struct mad_grave *g) {   /* g_grave_lock held; dfree takes only heap_lock */
+    unsigned k;
+    for (k = 0; k < g->nxview; k++) if (g->xview[k].tex) { mad_dfree_push(d, g->xview[k].tex, 1, NULL); InterlockedDecrement(&g_xview_live); }
+    free(g->xview);
+    if (g->tex) mad_dfree_push(d, g->tex, 0, NULL);
+    InterlockedIncrement(&g_grave_freed);
+}
+static void mad_grave_drop(struct mad_memheap *h, unsigned i) {
+    mad_grave_free(h->device, &h->grave[i]);
+    h->grave[i] = h->grave[--h->ngrave];
+}
+/* Free every parked texture overlapping [off, off+size); hand back one with exactly this
+ * description at exactly this offset. */
+static int mad_grave_take(struct mad_memheap *h, UINT64 off, UINT64 size, const D3D12_RESOURCE_DESC *desc, struct mad_grave *out) {
+    D3D12_RESOURCE_DESC want = *desc; unsigned i; int got = 0;
+    want.Alignment = 0;
+    AcquireSRWLockExclusive(&g_grave_lock);
+    for (i = h->ngrave; i-- > 0; ) {
+        struct mad_grave *g = &h->grave[i];
+        if (!got && g->off == off && g->size == size && !memcmp(&g->desc, &want, sizeof want)) {
+            *out = *g; h->grave[i] = h->grave[--h->ngrave]; got = 1;
+        } else if (g->off < off + size && off < g->off + g->size) mad_grave_drop(h, i);
+    }
+    ReleaseSRWLockExclusive(&g_grave_lock);
+    return got;
+}
+static void mad_grave_park(struct mad_memheap *h, struct mad_resource *r) {
+    struct mad_grave g; unsigned i;
+    memset(&g, 0, sizeof g);
+    g.off = r->placed_off; g.size = r->placed_size; g.desc = r->desc; g.desc.Alignment = 0;
+    g.tex = r->texture; g.id = r->gpu_resource_id;
+    g.xview = r->xview; g.nxview = r->nxview; g.xview_cap = r->xview_cap;
+    r->texture = 0; r->xview = NULL; r->nxview = 0; r->xview_cap = 0;
+    AcquireSRWLockExclusive(&g_grave_lock);
+    for (i = h->ngrave; i-- > 0; )
+        if (h->grave[i].off < g.off + g.size && g.off < h->grave[i].off + h->grave[i].size) mad_grave_drop(h, i);
+    if (h->ngrave >= MAD_GRAVE_CAP) {   /* the oldest goes */
+        unsigned o = 0;
+        for (i = 1; i < h->ngrave; i++) if (h->grave[i].seq < h->grave[o].seq) o = i;
+        mad_grave_drop(h, o);
+    }
+    g.seq = ++h->grave_seq;
+    if (mad_grow((void **)&h->grave, &h->grave_cap, h->ngrave + 1, sizeof *h->grave)) { h->grave[h->ngrave++] = g; InterlockedIncrement(&g_grave_parked); }
+    else mad_grave_free(h->device, &g);
+    ReleaseSRWLockExclusive(&g_grave_lock);
+}
 static LONG g_placed_in_heap, g_placed_fallback;
 static void mad_placed_fallback(const struct mad_memheap *h, const D3D12_RESOURCE_DESC *desc, UINT64 off, UINT64 msz, UINT64 mal) {
     LONG n = InterlockedIncrement(&g_placed_fallback);
@@ -10630,9 +10713,22 @@ static HRESULT mad_create_resource_at_impl(struct mad_device *d, D3D12_HEAP_TYPE
         if (ph && ph->mtl) {   /* ml1145: inside the application's heap, at its offset */
             UINT64 psz = 0, pal = 0;
             MTLDevice_heapTextureSizeAndAlign(d->mtl_device, &ti, &psz, &pal);
-            if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes)
-                r->texture = MTLHeap_newTextureAtOffset(ph->mtl, &ti, poff);
-            if (r->texture) { r->placed_heap = ph; ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
+            if (psz && pal && !(poff % pal) && poff + psz <= ph->desc.SizeInBytes) {
+                struct mad_grave g;
+                if (mad_placed_reuse_on() && mad_grave_take(ph, poff, psz, &r->desc, &g)) {   /* wine-lab port: placed-texture reuse */
+                    unsigned k; LONG n = InterlockedIncrement(&g_grave_adopted);
+                    r->texture = g.tex; ti.gpu_resource_id = g.id;
+                    r->xview = g.xview; r->nxview = g.nxview; r->xview_cap = g.xview_cap;
+                    EnterCriticalSection(&d->view_lock);
+                    for (k = 0; k < r->nxview; k++) mad_vmap_put_locked(d, r->xview[k].id, r->xview[k].nsl ? r->xview[k].nsl : 1, 0);
+                    LeaveCriticalSection(&d->view_lock);
+                    if (n <= 4 || !(n % 5000))
+                        d3d12_log("[madeira-d3d12] placed-reuse: texture %llux%u at +%llu re-created with the same description: kept its Metal object and ids "
+                                  "(%ld adopted, %ld parked, %ld freed)\n", (unsigned long long)desc->Width, desc->Height, (unsigned long long)poff,
+                                  n, (long)g_grave_parked, (long)g_grave_freed);
+                } else r->texture = MTLHeap_newTextureAtOffset(ph->mtl, &ti, poff);
+            }
+            if (r->texture) { r->placed_heap = ph; r->placed_off = poff; r->placed_size = psz; ID3D12Heap_AddRef((ID3D12Heap *)ph); InterlockedIncrement(&g_placed_in_heap); }
             else mad_placed_fallback(ph, desc, poff, psz, pal);
         }
         if (!r->texture && !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -10807,6 +10903,14 @@ static ULONG STDMETHODCALLTYPE memheap_Release(ID3D12Heap *This) {
         if (h->desc.Alignment == 4194304 && (h->desc.Flags & 0x1000) && said++ < 200)
             d3d12_log("[transient] list#%u heap %p DESTROYED (%llu KB)\n", g_list_seq, (void *)h,
                       (unsigned long long)h->desc.SizeInBytes >> 10);   /* ml895 */
+        if (h->ngrave) {   /* wine-lab port: parked placed textures go with their heap */
+            unsigned k;
+            AcquireSRWLockExclusive(&g_grave_lock);
+            for (k = 0; k < h->ngrave; k++) mad_grave_free(h->device, &h->grave[k]);
+            h->ngrave = 0;
+            ReleaseSRWLockExclusive(&g_grave_lock);
+        }
+        free(h->grave); h->grave = NULL;
         if (h->mtl) {   /* ml1145: every placed resource held a reference, so none is left; ml1148: but the GPU may still hold them */
             struct mad_device *hd = h->device; int queued = 0;
             EnterCriticalSection(&hd->heap_lock);
