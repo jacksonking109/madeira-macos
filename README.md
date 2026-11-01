@@ -1,18 +1,29 @@
-# madeira-d3d12 for macOS (Wine)
+# madeira-macos
 
-Direct3D 12 on Metal for Windows games running in Wine on macOS: a port of the D3D12 layer from
+Direct3D 12 on Metal for Windows games running in Wine on macOS: an **unofficial** port of the D3D12 layer from
 [Madeira](https://github.com/willfaust/Madeira) (Will Faust and contributors), which runs Windows games on
 iPhone. This port targets x86_64 Wine under Rosetta 2 with [DXMT](https://github.com/3Shain/dxmt) on Apple Silicon.
+It is not affiliated with or endorsed by the Madeira project.
 
-Hobby project, early stage. Madeira's original README is in [README.madeira.md](README.madeira.md).
+Hobby project. Madeira's original README is in [README.madeira.md](README.madeira.md).
 
 ## Status
 
-- Madeira's API test passes 89/90 (the one failure is a stale synchronous-fence expectation); its D3D12 cube renders.
+Tested on an M3 Pro MacBook Pro (macOS 26), Wine 11.18 under Rosetta 2:
+
+| Game (D3D12) | State |
+|---|---|
+| PEAK | Playable, ~60 fps |
+| Rise of the Tomb Raider (DX12 mode) | Built-in benchmark runs, ~48 fps at 1920x1200 |
+| The Last of Us Part I | Playable at ~18-22 fps (3024x1688 output, FSR 3.1 at 50%); GPU-bound |
+| Red Dead Redemption 2 | Boots and plays its intro; benchmark ~24 fps at 1920x1200 |
+
 - Shaders: DXIL through Apple's Metal Shader Converter; DXBC (shader model 5.x) through DXMT's airconv, linked
-  into `d3d12.so` (needs dxmt-src's `d3d12-airconv` APIs). The DXBC test (root constants/CBV, SRV table + static
-  sampler, vertex-buffer input layout) passes; real games' DXBC is still largely untried.
-- Geometry/tessellation emulation pipelines build but are untested with real shaders.
+  into `d3d12.so` (needs dxmt-src's `d3d12-airconv` APIs).
+- Tests: `tests/windows/` holds the D3D12 test programs (API coverage, bindless, UAV clears, readback,
+  typed-buffer views, RW formats, parallel encoding and more); they run under Wine against the installed DLL.
+- Known issue: in The Last of Us Part I, a single very long frame (shader compilation at startup, extremely fast
+  camera turns) can still tint an object for a frame.
 
 ## How it differs from Madeira
 
@@ -46,4 +57,9 @@ Do not take this as some sort of poke at crossover or other vibecoded translatio
 
 GPL-3.0-or-later with the Madeira Converter Exception ([LICENSE](LICENSE), [LICENSE-EXCEPTION.md](LICENSE-EXCEPTION.md)),
 as in Madeira. Parts of `src/unix/d3d12_unix.m` follow DXMT's winemetal (MIT, Feifan He). Apple's Metal Shader
-Converter headers in `third_party/` are Apple's.
+Converter headers in `third_party/` are Copyright Apple Inc. under the Apache License 2.0 (full text in each
+header folder); Apple's converter library itself is not included and is under Apple's own terms.
+
+**Modified version.** This is a modified version of Madeira's D3D12 runtime, changed by Jackson King from
+October 2026 onward (port changes are marked `wine-lab port:` in the source; see the git history). The
+modifications are released under the same licence, and the Madeira Converter Exception applies to them as well.
