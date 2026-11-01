@@ -202,15 +202,19 @@ bool offset_coord(CallInst *call, Value *A) {
     return true;
 }
 
-/* GetDimensions: the texture's width less the offset (with the RGB32 count
- * when `rgb32` and the view is one). */
-bool rewrite_width(CallInst *call, Value *A, bool rgb32) {
+/* GetDimensions: the texture's width less the offset when `offs` (with the
+ * RGB32 count when `rgb32` and the view is one). */
+bool rewrite_width(CallInst *call, Value *A, bool rgb32, bool offs) {
     if (!call->getType()->isIntegerTy(32)) return false;
     IRBuilder<> b(call->getNextNode());
     DescParts d = load_desc(b, A);
-    Value *off = view_offset(b, d.md);
-    Value *w = b.CreateSelect(b.CreateICmpUGT(call, off), b.CreateSub(call, off), b.getInt32(0), "tbuf.width");
+    Value *w = call;
+    if (offs) {
+        Value *off = view_offset(b, d.md);
+        w = b.CreateSelect(b.CreateICmpUGT(call, off), b.CreateSub(call, off), b.getInt32(0), "tbuf.width");
+    }
     if (rgb32) w = b.CreateSelect(d.flag, d.n, w, "rgb32.width");
+    if (w == call) return true;
     Instruction *last = cast<Instruction>(w);
     call->replaceUsesWithIf(w, [&](Use &u) { Instruction *ui = dyn_cast<Instruction>(u.getUser()); return !ui || ui->getParent() != last->getParent() || last->comesBefore(ui); });
     return true;
@@ -316,7 +320,7 @@ int rewrite_module(Module &m, madeira_air_rgb32_info *info, unsigned what) {
         Value *A = field_ptr(ci->getArgOperand(0), memo, via);
         if (!A) { if (srv && rgb32) info->unmatched++; else info->off_unmatched++; continue; }
         if (offs || (srv && rgb32)) {
-            if (!rewrite_width(ci, A, srv && rgb32)) { if (srv && rgb32) info->unmatched++; continue; }
+            if (!rewrite_width(ci, A, srv && rgb32, offs)) { if (srv && rgb32) info->unmatched++; continue; }
             if (srv && rgb32) { info->widths++; info->traced += via; }
             if (offs) info->offsets++;
             changed = 1;
