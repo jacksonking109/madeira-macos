@@ -1506,7 +1506,8 @@ static int mad_rgb32_shader_enabled(void)
 #endif
     return on;
 }
-/* wine-lab port: madeira.cfg tbuf-view-offset (default 1): the same AIR pass
+/* wine-lab port: madeira.cfg tbuf-view-offset (default 0 since 2026-10-31: with it on, The Last of Us
+ * Part I shows per-object wrong-lighting flashes again; under investigation): the same AIR pass
  * adds each texture-buffer view's element offset (descriptor metadata bits
  * 32..39), which MSC never applies, to every typed-buffer and counter access
  * (madeira_air_rewrite.h). Off, a typed view or UAV counter whose offset is
@@ -1517,7 +1518,7 @@ static int mad_view_offset_enabled(void)
 #ifdef MADEIRA_NO_AIRCONV
     on = 0;
 #else
-    if (on < 0) on = madeira_cfg_int("tbuf-view-offset", 1) ? 1 : 0;
+    if (on < 0) on = madeira_cfg_int("tbuf-view-offset", 0) ? 1 : 0;
 #endif
     return on;
 }
