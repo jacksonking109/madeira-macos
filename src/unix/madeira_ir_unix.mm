@@ -1309,7 +1309,7 @@ static int mad_airconv_convert(struct madeira_ir_convert_args *a, const unsigned
  *   - a persistent, content-keyed entry per conversion in the same shadercache
  *     directory as the DXBC cache (.mdxc), bounded by size with LRU eviction;
  *     MADEIRA_D3D12_DXIL_CACHE=0 disables it, MADEIRA_D3D12_DXIL_CACHE_MB sets
- *     the bound (default 512).
+ *     the bound (default 2048).
  *   - a few in-memory slots holding a finished conversion whose caller's buffer
  *     was too small, so the immediate retry with a bigger buffer does not run
  *     the compiler a second time; MADEIRA_D3D12_ONEPASS=0 disables it (the PE
@@ -1338,7 +1338,7 @@ static void mad_dxc_init_once(void)
 {
     char dir[1200];
     const char *mb = getenv("MADEIRA_D3D12_DXIL_CACHE_MB");
-    unsigned long long cap_mb = 512;
+    unsigned long long cap_mb = 2048;   /* wine-lab port: was 512; TLOU1 alone is ~460 MB, so a key change churned it (evict, re-convert, long frames) */
     if (mb && *mb) { char *end = NULL; unsigned long long v = strtoull(mb, &end, 10); if (end && !*end && v) cap_mb = v; }
     g_dxc_cap = cap_mb << 20;
     g_dxc_target = g_dxc_cap / 4 * 3;
