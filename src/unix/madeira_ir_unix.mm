@@ -1471,7 +1471,30 @@ static int mad_atomic64_enabled(void)
  * every shader it guards; bump the version when the rewrite's output changes.
  * Returns the cap for a shader of this DXIL kind, or 0. */
 #define MAD_LWD_VERSION 1u
-static uint32_t mad_loop_watchdog_cap(int kind)
+/* wine-lab port: madeira.cfg loop-watchdog-skip = <entry names, comma list>: shaders that
+ * are converted WITHOUT the guard, so its per-iteration check does not cost them (a
+ * measurement aid first; only list shaders known to terminate). */
+static int mad_lwd_skipped(const char *entry)
+{
+    static char list[512]; static int loaded;
+    if (!loaded) {
+        if (madeira_cfg_get("loop-watchdog-skip", list, sizeof list) <= 0) list[0] = 0;
+        if (list[0]) fprintf(stderr, "[madeira-ir] loop watchdog skips: %s\n", list);
+        loaded = 1;
+    }
+    if (!list[0] || !entry || !entry[0]) return 0;
+    size_t n = strlen(entry);
+    for (const char *p = list; *p; ) {
+        const char *q = strchr(p, ','); size_t len = q ? (size_t)(q - p) : strlen(p);
+        while (len && *p == ' ') { p++; len--; }
+        while (len && p[len - 1] == ' ') len--;
+        if (len == n && !memcmp(p, entry, n)) return 1;
+        if (!q) break;
+        p = q + 1;
+    }
+    return 0;
+}
+static uint32_t mad_loop_watchdog_cap(int kind, const char *entry)
 {
     static int cs = -1, ps;
     static uint32_t cap;
@@ -1484,6 +1507,7 @@ static uint32_t mad_loop_watchdog_cap(int kind)
                         "(madeira.cfg loop-watchdog, loop-watchdog-ps, loop-watchdog-cap)\n",
                 cs ? "on" : "off", ps ? "on" : "off", cap);
     }
+    if ((kind == 5 || kind == 0) && mad_lwd_skipped(entry)) return 0;
     if (kind == 5) return cs ? cap : 0;
     if (kind == 0) return ps ? cap : 0;
     return 0;
@@ -1696,7 +1720,7 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     const int a64 = mad_atomic64_enabled() &&
                     madeira_atomic64_candidate((const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
     const uint32_t lwd_cap = mad_loop_watchdog_cap(madeira_dxil_shader_kind((const void *)(uintptr_t)a->dxil,
-                                                                            (size_t)a->dxil_len));
+                                                                            (size_t)a->dxil_len), entry);
 
     /* ml1990: a conversion already done -- by this caller's too-small first
      * call, or by any earlier run -- is handed back without the compiler. */
