@@ -1471,30 +1471,46 @@ static int mad_atomic64_enabled(void)
  * every shader it guards; bump the version when the rewrite's output changes.
  * Returns the cap for a shader of this DXIL kind, or 0. */
 #define MAD_LWD_VERSION 1u
-/* wine-lab port: madeira.cfg loop-watchdog-skip = <entry names, comma list>: shaders that
- * are converted WITHOUT the guard, so its per-iteration check does not cost them (a
- * measurement aid first; only list shaders known to terminate). */
-static int mad_lwd_skipped(const char *entry)
+/* wine-lab port: madeira.cfg loop-watchdog-skip = <shader hashes, comma list>: shaders converted
+ * WITHOUT the guard, so its per-iteration check does not slow them down (The Last of Us Part I's
+ * deferred lighting: 14.3 -> 8.6 ms per frame). A hash is the 16-digit FNV-1a of the shader's
+ * bytecode, the name the loop-watchdog and ml1149 logs use, so an entry matches that one shader
+ * of that one game and nothing else; list only shaders whose loops are known to end.
+ * loop-watchdog-find = <entry names>: logs the hash of every shader with one of those names (it
+ * skips nothing) -- how to find what to put in the skip list. */
+static int mad_rewrite_first_report(uint64_t h);
+static int mad_cfg_list_has(const char *list, const char *item)
 {
-    static char list[512]; static int loaded;
-    if (!loaded) {
-        if (madeira_cfg_get("loop-watchdog-skip", list, sizeof list) <= 0) list[0] = 0;
-        if (list[0]) fprintf(stderr, "[madeira-ir] loop watchdog skips: %s\n", list);
-        loaded = 1;
-    }
-    if (!list[0] || !entry || !entry[0]) return 0;
-    size_t n = strlen(entry);
+    size_t n = strlen(item);
     for (const char *p = list; *p; ) {
         const char *q = strchr(p, ','); size_t len = q ? (size_t)(q - p) : strlen(p);
         while (len && *p == ' ') { p++; len--; }
         while (len && p[len - 1] == ' ') len--;
-        if (len == n && !memcmp(p, entry, n)) return 1;
+        if (len == n && !strncasecmp(p, item, n)) return 1;
         if (!q) break;
         p = q + 1;
     }
     return 0;
 }
-static uint32_t mad_loop_watchdog_cap(int kind, const char *entry)
+static int mad_lwd_skipped(const char *entry, const void *dxil, size_t len)
+{
+    static char skip[1024], find[512]; static int loaded;
+    char hex[17];
+    if (!loaded) {
+        if (madeira_cfg_get("loop-watchdog-skip", skip, sizeof skip) <= 0) skip[0] = 0;
+        if (madeira_cfg_get("loop-watchdog-find", find, sizeof find) <= 0) find[0] = 0;
+        if (skip[0]) fprintf(stderr, "[madeira-ir] loop watchdog skips shaders: %s\n", skip);
+        loaded = 1;
+    }
+    if (!skip[0] && !find[0]) return 0;
+    uint64_t h = 1469598103934665603ull;
+    mad_sc_hash_add(&h, dxil, len);
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    if (find[0] && entry && entry[0] && mad_cfg_list_has(find, entry) && mad_rewrite_first_report(h ^ 0x5eedull))
+        fprintf(stderr, "[madeira-ir] loop-watchdog-find: '%s' is shader %s\n", entry, hex);
+    return skip[0] && mad_cfg_list_has(skip, hex);
+}
+static uint32_t mad_loop_watchdog_cap(int kind, const char *entry, const void *dxil, size_t len)
 {
     static int cs = -1, ps;
     static uint32_t cap;
@@ -1507,7 +1523,7 @@ static uint32_t mad_loop_watchdog_cap(int kind, const char *entry)
                         "(madeira.cfg loop-watchdog, loop-watchdog-ps, loop-watchdog-cap)\n",
                 cs ? "on" : "off", ps ? "on" : "off", cap);
     }
-    if ((kind == 5 || kind == 0) && mad_lwd_skipped(entry)) return 0;
+    if ((kind == 5 || kind == 0) && mad_lwd_skipped(entry, dxil, len)) return 0;
     if (kind == 5) return cs ? cap : 0;
     if (kind == 0) return ps ? cap : 0;
     return 0;
@@ -1720,7 +1736,8 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
     const int a64 = mad_atomic64_enabled() &&
                     madeira_atomic64_candidate((const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
     const uint32_t lwd_cap = mad_loop_watchdog_cap(madeira_dxil_shader_kind((const void *)(uintptr_t)a->dxil,
-                                                                            (size_t)a->dxil_len), entry);
+                                                                            (size_t)a->dxil_len), entry,
+                                                   (const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
 
     /* ml1990: a conversion already done -- by this caller's too-small first
      * call, or by any earlier run -- is handed back without the compiler. */
