@@ -15,6 +15,10 @@ AGS rewriting stays compiled out). Needs dxmt-src on branch wine-lab-local (or d
 uses (SM50GetRangeInfo, SM50_SHADER_PSO_VERTEX_INTERFACE) and SM 5.1 constant-buffer operands, built by
 ~/wine-lab/build-dxmt.sh into dxmt-src/build-full (libairconv.a, libDXBCParserNative.a):
 
+    ./build-so.sh    # does all of the below, plus MADEIRA_IR_CONVERTER_ID (see the script): use this
+
+The steps it runs, for reference (without the converter id, every rebuild starts the shader caches over):
+
     DX=~/wine-lab/dxmt-src; LL=~/wine-lab/deps/llvm15-x86_64
     D=(-DMADEIRA_WINE_MACOS -DMADEIRA_NO_AGS)
     I=(-Isrc -Isrc/unix -I$DX/src/winemetal -I$DX/src/airconv -Ithird_party/metal-shader-converter/include)
