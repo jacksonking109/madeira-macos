@@ -2270,13 +2270,15 @@ static void exec_bat_submit(struct mad_exec *e, struct wmtcmd_base *head) {
  * command buffer. When the command buffer has finished (mad_perf_cb), the
  * samples become per-pass times, scaled by the command buffer's own GPU start
  * and end, and are summed by pass name; the 5 s perf report lists the 25
- * costliest names in ms per frame. */
+ * costliest names in ms per frame. Render passes also sample the end of their
+ * vertex stage and the start of their fragment stage, for a vertex / fragment
+ * split (on Apple GPUs the vertex stage includes tiling). */
 #define MAD_PROF_MAXP 256    /* passes per command buffer (ROTTR: ~80) */
 #define MAD_PROF_RECS 1024   /* command buffers in flight (TLOU1 submits ~290 a frame) */
-struct mad_prof_rec { obj_handle_t cb, sb; unsigned n; char name[MAD_PROF_MAXP][64]; };
+struct mad_prof_rec { obj_handle_t cb, sb; unsigned n; char name[MAD_PROF_MAXP][64]; unsigned char rnd[MAD_PROF_MAXP]; };   /* rnd: a render pass */
 static struct mad_prof_rec *g_prof_rec[MAD_PROF_RECS]; static obj_handle_t g_prof_sb_pool[MAD_PROF_RECS]; static unsigned g_prof_nsb;
 static SRWLOCK g_prof_lock = SRWLOCK_INIT; static int g_prof_on = -1;
-static struct { char name[64]; double ms, xms; unsigned n; } g_prof_top[512]; static unsigned g_prof_ntop;
+static struct { char name[64]; double ms, xms, sms, vms, fms; unsigned n, nst; } g_prof_top[512]; static unsigned g_prof_ntop;   /* sms/vms/fms: passes with both stages sampled */
 /* Every timed pass of the report period as a [start, end] GPU interval (ns) and its name slot, for the exclusive attribution below. */
 struct mad_prof_iv { UINT64 a, b; unsigned k; };
 static struct mad_prof_iv *g_prof_iv; static unsigned g_prof_niv, g_prof_ivcap;
@@ -2296,7 +2298,7 @@ static struct mad_prof_rec *mad_prof_slot(struct mad_device *d, obj_handle_t cb,
         for (i = 0; i < MAD_PROF_RECS && g_prof_rec[i]; i++) ;
         if (i < MAD_PROF_RECS && (r = calloc(1, sizeof *r))) {
             r->cb = cb;
-            r->sb = g_prof_nsb ? g_prof_sb_pool[--g_prof_nsb] : MTLCounterSampleBuffer_newTimestampBuffer(d->mtl_device, 2 * MAD_PROF_MAXP, true);
+            r->sb = g_prof_nsb ? g_prof_sb_pool[--g_prof_nsb] : MTLCounterSampleBuffer_newTimestampBuffer(d->mtl_device, 4 * MAD_PROF_MAXP, true);
             if (!r->sb) { free(r); r = NULL; } else g_prof_rec[i] = r;
         }
     }
@@ -2308,36 +2310,49 @@ static struct mad_prof_rec *mad_prof_slot(struct mad_device *d, obj_handle_t cb,
 static obj_handle_t mad_prof_render(struct mad_exec *e, struct WMTRenderPassInfo *rpi, const char *name) {
     struct mad_prof_rec *r; unsigned slot;
     if (!mad_prof_enabled() || !(r = mad_prof_slot(e->q->device, e->cb, &slot, name))) return MTLCommandBuffer_renderCommandEncoder(e->cb, rpi);
-    return madeira_render_encoder_sampled(e->cb, rpi, r->sb, 2 * slot, 2 * slot + 1);
+    r->rnd[slot] = 1;
+    return madeira_render_encoder_sampled(e->cb, rpi, r->sb, 4 * slot, 4 * slot + 3, 1);
 }
 static obj_handle_t mad_prof_compute(struct mad_exec *e, const char *name) {
     struct mad_prof_rec *r; unsigned slot;
     if (!mad_prof_enabled() || !(r = mad_prof_slot(e->q->device, e->cb, &slot, name))) return MTLCommandBuffer_computeCommandEncoder(e->cb, false);
-    return madeira_compute_encoder_sampled(e->cb, 0, r->sb, 2 * slot, 2 * slot + 1);
+    return madeira_compute_encoder_sampled(e->cb, 0, r->sb, 4 * slot, 4 * slot + 3);
 }
-/* cb has finished: its passes' times into the totals (gpu_s = its GPU time, from Metal). */
+/* A sampled interval [a, b] that can be real: no pass outlasts its command buffer (lim, ns), so anything longer
+ * holds a stale sample, left in the pooled buffer by an earlier pass, of a stage that did not run (a clear has no vertex stage). */
+static int mad_prof_ok(UINT64 a, UINT64 b, UINT64 lim) { return a && b && a != ~0ull && b != ~0ull && b > a && b - a <= lim; }
+/* cb has finished: its passes' times into the totals (gpu_s = its GPU time, from Metal). Samples per pass: start of the
+ * vertex stage (compute: of the pass), end of the vertex stage, start of the fragment stage, end of the fragment stage
+ * (compute: of the pass). Apple GPU timestamps are nanoseconds, so the passes sum to the measured GPU time; the report
+ * keeps a calibration check (command-buffer time over the span of its passes, 1 or a little more). */
 static void mad_prof_retire(obj_handle_t cb, double gpu_s) {
-    struct mad_prof_rec *r = NULL; unsigned i, k; UINT64 *ts, lo = ~0ull, hi = 0; double scale;
+    struct mad_prof_rec *r = NULL; unsigned i, k; UINT64 *ts, lo = ~0ull, hi = 0, lim = (UINT64)(gpu_s * 1e9) + 100000;
     if (g_prof_on <= 0) return;
     AcquireSRWLockExclusive(&g_prof_lock);
     for (i = 0; i < MAD_PROF_RECS; i++) if (g_prof_rec[i] && g_prof_rec[i]->cb == cb) { r = g_prof_rec[i]; g_prof_rec[i] = NULL; break; }
     ReleaseSRWLockExclusive(&g_prof_lock);
     if (!r) return;
-    if (r->n && (ts = malloc(16 * r->n))) {
-        MTLCounterSampleBuffer_resolveCounterRange(r->sb, 0, 2 * r->n, ts, 16 * (UINT64)r->n);
-        for (i = 0; i < 2 * r->n; i++) if (ts[i] && ts[i] != ~0ull) { if (ts[i] < lo) lo = ts[i]; if (ts[i] > hi) hi = ts[i]; }
+    if (r->n && (ts = malloc(32 * r->n))) {
+        MTLCounterSampleBuffer_resolveCounterRange(r->sb, 0, 4 * r->n, ts, 32 * (UINT64)r->n);
         AcquireSRWLockExclusive(&g_prof_lock);
-        if (hi > lo && gpu_s > 0) { g_prof_ns_sum += gpu_s * 1e9; g_prof_tick_sum += (double)(hi - lo); }
-        scale = 1.0;   /* Apple GPU timestamps are nanoseconds: the passes then sum to the measured GPU time. (The command-buffer calibration
-                        * above read 0.41, skewed by stale samples of passes with no vertex stage; it stays in the report as a check.) */
         for (i = 0; i < r->n; i++) {
-            UINT64 a = ts[2 * i], b = ts[2 * i + 1];
-            if (!a || !b || a == ~0ull || b == ~0ull || b <= a) continue;
+            const UINT64 *t = &ts[4 * i]; UINT64 a = t[0], b = t[3]; int vok = 0, fok = 0;
+            if (r->rnd[i]) {
+                vok = mad_prof_ok(t[0], t[1], lim) && t[1] <= b; fok = mad_prof_ok(t[2], t[3], lim);
+                if (!vok && fok) a = t[2];   /* no vertex stage: the pass starts with its fragment stage */
+            }
+            if (!mad_prof_ok(a, b, lim)) continue;
+            if (a < lo) lo = a; if (b > hi) hi = b;
             for (k = 0; k < g_prof_ntop; k++) if (!strcmp(g_prof_top[k].name, r->name[i])) break;
-            if (k == g_prof_ntop) { if (k == 512) continue; snprintf(g_prof_top[k].name, sizeof g_prof_top[k].name, "%s", r->name[i]); g_prof_top[k].ms = 0; g_prof_top[k].xms = 0; g_prof_top[k].n = 0; g_prof_ntop++; }
-            g_prof_top[k].ms += (double)(b - a) * scale / 1e6; g_prof_top[k].n++;
+            if (k == g_prof_ntop) { if (k == 512) continue; memset(&g_prof_top[k], 0, sizeof g_prof_top[k]); snprintf(g_prof_top[k].name, sizeof g_prof_top[k].name, "%s", r->name[i]); g_prof_ntop++; }
+            g_prof_top[k].ms += (double)(b - a) / 1e6; g_prof_top[k].n++;
+            if (vok && fok) {
+                g_prof_top[k].sms += (double)(b - a) / 1e6; g_prof_top[k].nst++;
+                g_prof_top[k].vms += (double)(t[1] - t[0]) / 1e6; g_prof_top[k].fms += (double)(t[3] - t[2]) / 1e6;
+            }
             if (mad_grow((void **)&g_prof_iv, &g_prof_ivcap, g_prof_niv + 1, sizeof *g_prof_iv)) { g_prof_iv[g_prof_niv].a = a; g_prof_iv[g_prof_niv].b = b; g_prof_iv[g_prof_niv].k = k; g_prof_niv++; }
         }
+        if (hi > lo) { g_prof_ns_sum += gpu_s * 1e9; g_prof_tick_sum += (double)(hi - lo); }
         ReleaseSRWLockExclusive(&g_prof_lock);
         free(ts);
     }
@@ -2388,7 +2403,7 @@ static void mad_prof_report(double frames) {
     AcquireSRWLockExclusive(&g_prof_lock);
     busy = mad_prof_exclusive();
     for (a = 0; a < g_prof_ntop; a++) total += g_prof_top[a].ms;
-    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes overlap: %.2f ms/frame is exclusive, the GPU busy time between the first and last pass; %.3f ns/tick); %ld passes timed, %ld NOT timed; "
+    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes overlap: %.2f ms/frame is exclusive, the GPU busy time between the first and last pass; command buffers %.3fx their passes' span); %ld passes timed, %ld NOT timed; "
               "%.1f compute encoders/frame split per pipeline for timing\n",
               total / frames, g_prof_ntop, busy / frames, g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0, (long)g_prof_timed, (long)g_prof_missed,
               g_prof_csplits / frames);
@@ -2398,6 +2413,9 @@ static void mad_prof_report(double frames) {
         if (m != a) { char t[sizeof g_prof_top[0]]; memcpy(t, &g_prof_top[a], sizeof t); memcpy(&g_prof_top[a], &g_prof_top[m], sizeof t); memcpy(&g_prof_top[m], t, sizeof t); }
         d3d12_log("[perf] pass-top %2u: %6.2f ms/frame %5.1f%% in %5.1f passes/frame, exclusive %6.2f ms/frame: %s\n", a + 1, g_prof_top[a].ms / frames,
                   total > 0 ? 100.0 * g_prof_top[a].ms / total : 0.0, g_prof_top[a].n / frames, g_prof_top[a].xms / frames, g_prof_top[a].name);
+        if (g_prof_top[a].nst)   /* vertex + fragment over the pass time: more = the stages overlapped (partial renders), less = a wait between them */
+            d3d12_log("[perf] pass-top %2u   stages: vertex %.2f + fragment %.2f of %.2f ms/frame (%.1f passes/frame)\n", a + 1, g_prof_top[a].vms / frames,
+                      g_prof_top[a].fms / frames, g_prof_top[a].sms / frames, g_prof_top[a].nst / frames);
     }
     g_prof_ntop = 0;
     ReleaseSRWLockExclusive(&g_prof_lock);
@@ -7361,6 +7379,33 @@ static void mad_vis_retire(struct mad_device *d, obj_handle_t cb);
 static LONG g_perf_lock; static int g_perf_enabled = -1;
 static double g_perf_gpu_sum, g_perf_gpu_union, g_perf_last_end, g_perf_first_start, g_perf_wait_s;
 static LONG g_perf_cbs, g_perf_presents; static LONGLONG g_perf_t0;
+/* wine-lab port: every command buffer's GPU interval of the period, for gpu-idle below (the union above assumes they
+ * finish in start order; across queues they need not) */
+struct mad_perf_iv { double a, b; };
+static struct mad_perf_iv *g_perf_iv; static unsigned g_perf_niv, g_perf_ivcap;
+static int mad_perf_iv_cmp(const void *x, const void *y) { double p = ((const struct mad_perf_iv *)x)->a, q = ((const struct mad_perf_iv *)y)->a; return (p > q) - (p < q); }
+/* When nothing ran on the GPU, by gap length: one long gap a frame = the GPU waiting for the game's next frame,
+ * many short ones = gaps between our submissions. Gaps at the period's edges are not seen. */
+static void mad_perf_idle_report(LONG presents) {
+    static const double edge[4] = { 0.0001, 0.001, 0.004, 1e30 }; static const char *nm[4] = { "<0.1 ms", "0.1-1 ms", "1-4 ms", ">=4 ms" };
+    double busy = 0, idle = 0, end, gap, big = 0, gs[4] = { 0 }; unsigned i, b, gn[4] = { 0 }, ngap = 0;
+    if (!g_perf_niv || presents <= 0) { g_perf_niv = 0; return; }
+    qsort(g_perf_iv, g_perf_niv, sizeof *g_perf_iv, mad_perf_iv_cmp);
+    end = g_perf_iv[0].a;
+    for (i = 0; i < g_perf_niv; i++) {
+        if (g_perf_iv[i].a > end) {
+            gap = g_perf_iv[i].a - end; idle += gap; ngap++; if (gap > big) big = gap;
+            for (b = 0; gap >= edge[b]; b++) ;
+            gn[b]++; gs[b] += gap;
+        }
+        if (g_perf_iv[i].b > end) { busy += g_perf_iv[i].b - (g_perf_iv[i].a > end ? g_perf_iv[i].a : end); end = g_perf_iv[i].b; }
+    }
+    d3d12_log("[perf] gpu-idle per frame: busy %.1f ms, idle %.1f ms in %.1f gaps (%s %.1f = %.2f ms, %s %.1f = %.2f ms, %s %.1f = %.2f ms, "
+              "%s %.1f = %.2f ms); longest %.2f ms\n", busy * 1000 / presents, idle * 1000 / presents, (double)ngap / presents,
+              nm[0], (double)gn[0] / presents, gs[0] * 1000 / presents, nm[1], (double)gn[1] / presents, gs[1] * 1000 / presents,
+              nm[2], (double)gn[2] / presents, gs[2] * 1000 / presents, nm[3], (double)gn[3] / presents, gs[3] * 1000 / presents, big * 1000);
+    g_perf_niv = 0;
+}
 
 /* wine-lab port: with flight-recorder = 1, each command buffer's GPU time is charged to the first pass or
  * dispatch recorded in it, and the 5 s report lists the 12 costliest (batch-lists = 1 makes a command buffer
@@ -7392,6 +7437,7 @@ static void mad_perf_cb(obj_handle_t cb, double wait_s) {
     if (a.ret && t.end > t.start) {
         double s0 = t.start, e0 = t.end;
         g_perf_gpu_sum += e0 - s0;
+        if (mad_grow((void **)&g_perf_iv, &g_perf_ivcap, g_perf_niv + 1, sizeof *g_perf_iv)) { g_perf_iv[g_perf_niv].a = s0; g_perf_iv[g_perf_niv].b = e0; g_perf_niv++; }
         if (g_flight > 0) mad_perf_charge(cb, e0 - s0);   /* wine-lab port */
         mad_perf_unlock(); mad_prof_retire(cb, e0 - s0); mad_perf_lock();   /* wine-lab port: gpu-pass-profile */
         if (!g_perf_first_start) g_perf_first_start = s0;
@@ -7486,6 +7532,7 @@ static void mad_perf_present(void) {
                   g_perf_gpu_sum * 1000, g_perf_wait_s * 1000, 100.0 * g_perf_wait_s / wall,
                   g_perf_presents ? g_perf_gpu_union * 1000 / g_perf_presents : 0.0, g_perf_presents ? g_perf_wait_s * 1000 / g_perf_presents : 0.0);
         mad_ft_report();
+        mad_perf_idle_report(g_perf_presents);
         if (g_perf_presents) {   /* wine-lab port: store-defer and gpu-pass-profile */
             LONG64 sk = InterlockedExchange64(&g_store_skipped, 0);
             if (g_store_defer > 0) d3d12_log("[perf] store-defer: %.1f MB/frame of render-target stores skipped (cleared next)\n", (double)sk / 1048576.0 / g_perf_presents);

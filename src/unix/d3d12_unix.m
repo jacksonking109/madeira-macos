@@ -603,7 +603,8 @@ static NTSTATUS command_buffer_enqueue(void *args)
 /* wine-lab port: the render pass descriptor exactly as winemetal builds it
  * (_MTLCommandBuffer_renderCommandEncoder), plus one timestamp sample buffer
  * attachment: start of the vertex stage and end of the fragment stage, the
- * stage boundaries Apple GPUs can sample. Autoreleased, like winemetal's. */
+ * stage boundaries Apple GPUs can sample (with p->stages, the two between them
+ * too). Autoreleased, like winemetal's. */
 static NTSTATUS render_encoder_sampled(void *args)
 {
     struct madeira_unix_sampled_encoder_params *p = args;
@@ -652,8 +653,8 @@ static NTSTATUS render_encoder_sampled(void *args)
         MTLRenderPassSampleBufferAttachmentDescriptor *sa = d.sampleBufferAttachments[0];
         sa.sampleBuffer = (id<MTLCounterSampleBuffer>)p->sample_buffer;
         sa.startOfVertexSampleIndex = p->start_index;
-        sa.endOfVertexSampleIndex = MTLCounterDontSample;
-        sa.startOfFragmentSampleIndex = MTLCounterDontSample;
+        sa.endOfVertexSampleIndex = p->stages ? p->start_index + 1 : MTLCounterDontSample;
+        sa.startOfFragmentSampleIndex = p->stages ? p->start_index + 2 : MTLCounterDontSample;
         sa.endOfFragmentSampleIndex = p->end_index;
     }
     p->ret = (obj_handle_t)[(id<MTLCommandBuffer>)p->cmdbuf renderCommandEncoderWithDescriptor:d];

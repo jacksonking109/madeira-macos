@@ -119,11 +119,11 @@ obj_handle_t madeira_cb_with_error_info(obj_handle_t queue)
     return p.b;
 }
 
-obj_handle_t madeira_render_encoder_sampled(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index)
+obj_handle_t madeira_render_encoder_sampled(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index, int stages)
 {
     struct madeira_unix_sampled_encoder_params p;
     memset(&p, 0, sizeof p);
-    p.cmdbuf = cmdbuf; p.info = P(info); p.sample_buffer = sample_buffer; p.start_index = start_index; p.end_index = end_index;
+    p.cmdbuf = cmdbuf; p.info = P(info); p.sample_buffer = sample_buffer; p.start_index = start_index; p.end_index = end_index; p.stages = stages ? 1 : 0;
     CALL(renderEncoderSampled, &p);
     return p.ret;
 }

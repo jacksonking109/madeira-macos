@@ -105,7 +105,7 @@ obj_handle_t madeira_cb_with_error_info(obj_handle_t queue);
 /* [MTLCommandBuffer enqueue] for n buffers, in array order: reserves their places
  * in the queue's GPU order before any of them is encoded (parallel-encode). */
 void madeira_cb_enqueue(const obj_handle_t *cbs, unsigned n);
-obj_handle_t madeira_render_encoder_sampled(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index);
+obj_handle_t madeira_render_encoder_sampled(obj_handle_t cmdbuf, struct WMTRenderPassInfo *info, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index, int stages);
 obj_handle_t madeira_compute_encoder_sampled(obj_handle_t cmdbuf, int concurrent, obj_handle_t sample_buffer, uint32_t start_index, uint32_t end_index);
 void madeira_render_set_store_actions(obj_handle_t encoder, const uint8_t color[8], uint8_t depth, uint8_t stencil);
 /* wine-lab port: fencepost (~/wine-lab/fencepost, a Metal race detector) when it is injected.
@@ -165,14 +165,16 @@ struct madeira_unix_pair_params {
 /* wine-lab port: an encoder whose pass samples GPU timestamps into sample_buffer
  * at start_index (start of the vertex stage / of the compute pass) and end_index
  * (end of the fragment stage / of the compute pass). info: a WMTRenderPassInfo
- * for render; for compute, concurrent selects the dispatch type. */
+ * for render; for compute, concurrent selects the dispatch type. Render with
+ * stages = 1: also the end of the vertex stage at start_index + 1 and the start
+ * of the fragment stage at start_index + 2. */
 struct madeira_unix_sampled_encoder_params {
     obj_handle_t cmdbuf;
     uint64_t info;          /* struct WMTRenderPassInfo * (render) */
     obj_handle_t sample_buffer;
     uint32_t start_index, end_index;
     uint32_t concurrent;    /* compute */
-    uint32_t pad;
+    uint32_t stages;        /* render */
     obj_handle_t ret;
 };
 /* wine-lab port: store actions decided at the END of a render pass whose
