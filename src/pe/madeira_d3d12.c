@@ -1745,6 +1745,7 @@ struct mad_exec {
     UINT32 cconsts[MAD_ROOT_PARAM_MAX][64];
     obj_handle_t cenc;
     struct mad_pso *cenc_pso;   /* wine-lab port: the pipeline the open compute encoder is named after (gpu-pass-profile split) */
+    int cenc_bar;               /* wine-lab port: compute-concurrent: a barrier was kept open in cenc, the next dispatch waits */
     struct mad_heap *srv, *smp;
     D3D12_VIEWPORT vp; int has_vp;
     D3D12_RECT sc; int has_sc;
@@ -2313,10 +2314,22 @@ static obj_handle_t mad_prof_render(struct mad_exec *e, struct WMTRenderPassInfo
     r->rnd[slot] = 1;
     return madeira_render_encoder_sampled(e->cb, rpi, r->sb, 4 * slot, 4 * slot + 3, 1);
 }
+/* wine-lab port: madeira.cfg compute-concurrent = 1 makes compute encoders concurrent. A serial encoder runs every
+ * dispatch after the previous one has finished, which D3D12 asks for only across a barrier: TLOU1 deforms each mesh
+ * in its own small dispatch (60+ a frame, 2-300 groups), and serial order leaves the GPU mostly idle between them
+ * (native test of those sizes: serial 0.65 ms, concurrent 0.33, concurrent with a memory barrier between every
+ * dispatch 0.44). Only game dispatches go into these encoders; a barrier that keeps one open (fence-chain 6,
+ * f6-compute-open) becomes a memory barrier before the next dispatch (exec_dispatch). */
+static int g_compute_conc = -1;
+static int mad_compute_conc_on(void) {
+    if (g_compute_conc < 0) { g_compute_conc = mad_cfg_int_pe("compute-concurrent", 0) ? 1 : 0;
+                              d3d12_log("[madeira-d3d12] compute-concurrent = %d (compute encoders %s)\n", g_compute_conc, g_compute_conc ? "concurrent, memory barriers at kept-open barriers" : "serial"); }
+    return g_compute_conc;
+}
 static obj_handle_t mad_prof_compute(struct mad_exec *e, const char *name) {
-    struct mad_prof_rec *r; unsigned slot;
-    if (!mad_prof_enabled() || !(r = mad_prof_slot(e->q->device, e->cb, &slot, name))) return MTLCommandBuffer_computeCommandEncoder(e->cb, false);
-    return madeira_compute_encoder_sampled(e->cb, 0, r->sb, 4 * slot, 4 * slot + 3);
+    struct mad_prof_rec *r; unsigned slot; int conc = mad_compute_conc_on();
+    if (!mad_prof_enabled() || !(r = mad_prof_slot(e->q->device, e->cb, &slot, name))) return MTLCommandBuffer_computeCommandEncoder(e->cb, conc != 0);
+    return madeira_compute_encoder_sampled(e->cb, conc, r->sb, 4 * slot, 4 * slot + 3);
 }
 /* A sampled interval [a, b] that can be real: no pass outlasts its command buffer (lim, ns), so anything longer
  * holds a stale sample, left in the pooled buffer by an earlier pass, of a stage that did not run (a clear has no vertex stage). */
@@ -6489,7 +6502,8 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_compute_useresource ur[256];
     struct wmtcmd_compute_dispatch c_disp;
     struct wmtcmd_compute_dispatch_indirect c_dispi;
-    struct wmtcmd_base *tail;
+    struct wmtcmd_compute_memory_barrier c_bar;   /* wine-lab port: compute-concurrent */
+    struct wmtcmd_base *tail, *head;
     obj_handle_t argbuf = 0; UINT64 argoff = 0;
     obj_handle_t air_cb = 0, air_arg = 0; UINT64 air_cboff = 0, air_argoff = 0;   /* ml1008 */
     unsigned nsb = 0, nur = 0, i;
@@ -6535,6 +6549,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
         {   /* wine-lab port: gpu-pass-profile */
             char pn[64]; snprintf(pn, sizeof pn, "C %s", e->cpso->vs_name);
             e->cenc = mad_prof_compute(e, pn); if (e->cenc) g_enc_seq++;
+            e->cenc_bar = 0;
         }
         if (g_enc_labels) mad_label(e->cenc, "C#%u %s", g_enc_seq, e->cpso->vs_name);   /* ml1142 */
         if (!e->cenc) { d3d12_log("[madeira-d3d12] no compute encoder\n"); MAD_SKIP(e); return; }
@@ -6568,7 +6583,13 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     memset(&c_pso, 0, sizeof c_pso);
     c_pso.type = WMTComputeCommandSetPSO; c_pso.pso = e->cpso->cps;
     c_pso.threadgroup_size.width = e->cpso->tg[0]; c_pso.threadgroup_size.height = e->cpso->tg[1]; c_pso.threadgroup_size.depth = e->cpso->tg[2];
-    tail = (struct wmtcmd_base *)&c_pso;
+    head = tail = (struct wmtcmd_base *)&c_pso;
+    if (e->cenc_bar) {   /* wine-lab port: compute-concurrent - the barrier kept open in this encoder */
+        memset(&c_bar, 0, sizeof c_bar);
+        c_bar.type = WMTComputeCommandMemoryBarrier; c_bar.scope = WMTBarrierScopeBuffers | WMTBarrierScopeTextures;
+        c_bar.next.ptr = &c_pso; head = (struct wmtcmd_base *)&c_bar;
+        e->cenc_bar = 0;
+    }
 #define MAD_APPEND(node) do { tail->next.ptr = (node); tail = (struct wmtcmd_base *)(node); } while (0)
     memset(sb, 0, sizeof sb);
 #define MAD_CSETBUF(buf_, off_, idx_) do { sb[nsb].type = WMTComputeCommandSetBuffer; sb[nsb].buffer = (buf_); \
@@ -6615,7 +6636,7 @@ static void exec_dispatch(struct mad_exec *e, const struct mad_cmd *c) {
     }
     tail->next.ptr = NULL;
 #undef MAD_APPEND
-    MTLComputeCommandEncoder_encodeCommands(e->cenc, (const struct wmtcmd_base *)&c_pso);
+    MTLComputeCommandEncoder_encodeCommands(e->cenc, head);
     if (g_flight) {
         if (c->kind == MC_DISPATCH_INDIRECT) mad_flight(e->cb, "dispatch %s (indirect)", e->cpso ? e->cpso->vs_name : "?");
         else mad_flight(e->cb, "dispatch %s (%ux%ux%u)", e->cpso ? e->cpso->vs_name : "?", c->u.dispatch.x, c->u.dispatch.y, c->u.dispatch.z);
@@ -6819,7 +6840,7 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
                 f7_census_barrier(&e, c);   /* ml1137: counts only */
                 if (g_f6_compute_open < 0) g_f6_compute_open = mad_cfg_int_pe("f6-compute-open", 1) ? 1 : 0;
                 e.f6_sync_needed = 1;
-                if (e.cenc && e.f6_enc_synced && g_f6_compute_open) InterlockedIncrement(&g_f6_kept_open);
+                if (e.cenc && e.f6_enc_synced && g_f6_compute_open) { InterlockedIncrement(&g_f6_kept_open); if (g_compute_conc > 0) e.cenc_bar = 1; }
                 else if (e.cenc || e.benc) exec_end(&e);
                 if (e.renc && (!e.f6_enc_synced || g_barrier_render)) {
                     InterlockedIncrement(&g_barrier_renc_closed);
