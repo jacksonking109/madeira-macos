@@ -3239,10 +3239,23 @@ static void exec_clear_ds_rects(struct mad_exec *e, const struct mad_cmd *c) {
  * D3D12 makes every such use go through a barrier on that resource, so a
  * barrier naming a resource with a pending clear (or naming no resource: UAV,
  * aliasing, overflow) runs that clear now. Test: d3d12-dsplane-x64.exe. */
+/* wine-lab port: madeira.cfg clear-defer (default 1). A pending clear also waits through render
+ * passes that do not bind its target and through barriers made only of null UAV barriers: under
+ * D3D12's state rules nothing can read, copy into or UAV-write a render target or depth buffer
+ * that was just cleared without a transition barrier naming it, which still runs the clear. It
+ * then becomes the load action of the pass that draws into it instead of a pass of its own (The
+ * Last of Us Part I: ~50 clear-only passes, ~2 ms of GPU time per frame). Resources made for
+ * simultaneous access keep the old behaviour. 0 restores it everywhere. */
+static LONG g_clear_kept;
+static int mad_clear_defer_on(void) {
+    static int on = -1;
+    if (on < 0) { on = mad_cfg_int_pe("clear-defer", 1) ? 1 : 0; d3d12_log("[madeira-d3d12] clear-defer = %d\n", on); }
+    return on;
+}
 static void exec_barrier_flush_clears(struct mad_exec *e, const struct mad_cmd *c) {
     unsigned k, b;
     if (!e->npend) return;
-    if (c->u.barrier.all) { while (e->npend) exec_flush_clear(e, 0); return; }
+    if (c->u.barrier.all && !(mad_clear_defer_on() && c->u.barrier.cls_noref == BC_RAW_UAV)) { while (e->npend) exec_flush_clear(e, 0); return; }
     for (k = 0; k < e->npend; ) {
         int hit = 0;
         for (b = 0; b < c->u.barrier.n && !hit; b++) hit = e->pend[k].res == c->u.barrier.res[b];
@@ -3406,11 +3419,16 @@ static int exec_begin_render_impl(struct mad_exec *e) {
         if (!w || !h) return 0;
         attachless = 1;
     }
-    /* Pending clears for targets outside this pass go first, on their own. */
+    /* Pending clears for targets outside this pass go first, on their own -- unless clear-defer
+     * keeps them for the pass that binds their target (see mad_clear_defer_on). */
     for (k = 0; k < e->npend; ) {
         int bound = (e->pend[k].res == e->depth && mad_rtvp_eq(&e->pend[k].v, &e->dp));
         for (i = 0; i < e->nrt && !bound; i++) if (e->rt[i] == e->pend[k].res && mad_rtvp_eq(&e->pend[k].v, &e->rtp[i])) bound = 1;
-        if (!bound) exec_flush_clear(e, (int)k); else k++;
+        if (bound) { k++; continue; }
+        if (mad_clear_defer_on() && e->pend[k].res && !(e->pend[k].res->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) {
+            InterlockedIncrement(&g_clear_kept); k++; continue;
+        }
+        exec_flush_clear(e, (int)k);
     }
     memset(&rpi, 0, sizeof rpi);
     for (i = 0; i < e->nrt; i++) exec_note_write(e, e->rt[i]);   /* ml1116 */
