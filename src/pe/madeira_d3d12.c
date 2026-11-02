@@ -2276,7 +2276,10 @@ static void exec_bat_submit(struct mad_exec *e, struct wmtcmd_base *head) {
 struct mad_prof_rec { obj_handle_t cb, sb; unsigned n; char name[MAD_PROF_MAXP][64]; };
 static struct mad_prof_rec *g_prof_rec[MAD_PROF_RECS]; static obj_handle_t g_prof_sb_pool[MAD_PROF_RECS]; static unsigned g_prof_nsb;
 static SRWLOCK g_prof_lock = SRWLOCK_INIT; static int g_prof_on = -1;
-static struct { char name[64]; double ms; unsigned n; } g_prof_top[512]; static unsigned g_prof_ntop;
+static struct { char name[64]; double ms, xms; unsigned n; } g_prof_top[512]; static unsigned g_prof_ntop;
+/* Every timed pass of the report period as a [start, end] GPU interval (ns) and its name slot, for the exclusive attribution below. */
+struct mad_prof_iv { UINT64 a, b; unsigned k; };
+static struct mad_prof_iv *g_prof_iv; static unsigned g_prof_niv, g_prof_ivcap;
 static double g_prof_ns_sum, g_prof_tick_sum; static LONG g_prof_missed, g_prof_timed;
 static LONG g_prof_csplits;   /* compute encoders ended because the pipeline changed (profiling only) */
 static int mad_prof_enabled(void) {
@@ -2331,8 +2334,9 @@ static void mad_prof_retire(obj_handle_t cb, double gpu_s) {
             UINT64 a = ts[2 * i], b = ts[2 * i + 1];
             if (!a || !b || a == ~0ull || b == ~0ull || b <= a) continue;
             for (k = 0; k < g_prof_ntop; k++) if (!strcmp(g_prof_top[k].name, r->name[i])) break;
-            if (k == g_prof_ntop) { if (k == 512) continue; snprintf(g_prof_top[k].name, sizeof g_prof_top[k].name, "%s", r->name[i]); g_prof_top[k].ms = 0; g_prof_top[k].n = 0; g_prof_ntop++; }
+            if (k == g_prof_ntop) { if (k == 512) continue; snprintf(g_prof_top[k].name, sizeof g_prof_top[k].name, "%s", r->name[i]); g_prof_top[k].ms = 0; g_prof_top[k].xms = 0; g_prof_top[k].n = 0; g_prof_ntop++; }
             g_prof_top[k].ms += (double)(b - a) * scale / 1e6; g_prof_top[k].n++;
+            if (mad_grow((void **)&g_prof_iv, &g_prof_ivcap, g_prof_niv + 1, sizeof *g_prof_iv)) { g_prof_iv[g_prof_niv].a = a; g_prof_iv[g_prof_niv].b = b; g_prof_iv[g_prof_niv].k = k; g_prof_niv++; }
         }
         ReleaseSRWLockExclusive(&g_prof_lock);
         free(ts);
@@ -2342,21 +2346,58 @@ static void mad_prof_retire(obj_handle_t cb, double gpu_s) {
     ReleaseSRWLockExclusive(&g_prof_lock);
     free(r);
 }
+/* Passes overlap on the GPU (independent encoders run side by side), so the raw
+ * per-pass times add up to more than the GPU was busy. Sweep the intervals of
+ * the whole period: every stretch of time is shared equally by the passes
+ * running in it, which gives each name an exclusive time that sums to the
+ * busy time (the same idea as the "exclusive" metric of the Windows capture
+ * decode). Also returns the busy time. A pass whose name slot was reused
+ * after a report keeps nothing: the slots are cleared with the report. */
+struct mad_prof_ev { UINT64 t; int open; unsigned iv; };
+static int mad_prof_ev_cmp(const void *x, const void *y) {
+    const struct mad_prof_ev *p = x, *q = y;
+    if (p->t != q->t) return p->t < q->t ? -1 : 1;
+    return p->open - q->open;   /* closes before opens at the same tick */
+}
+static double mad_prof_exclusive(void) {
+    struct mad_prof_ev *ev; unsigned i, n = 0, nact = 0, *act; UINT64 prev = 0; double busy = 0;
+    if (!g_prof_niv) return 0;
+    ev = malloc(2 * (size_t)g_prof_niv * sizeof *ev); act = malloc((size_t)g_prof_niv * sizeof *act);
+    if (!ev || !act) { free(ev); free(act); g_prof_niv = 0; return 0; }
+    for (i = 0; i < g_prof_niv; i++) {
+        ev[n].t = g_prof_iv[i].a; ev[n].open = 1; ev[n].iv = i; n++;
+        ev[n].t = g_prof_iv[i].b; ev[n].open = 0; ev[n].iv = i; n++;
+    }
+    qsort(ev, n, sizeof *ev, mad_prof_ev_cmp);
+    for (i = 0; i < n; i++) {
+        if (nact && ev[i].t > prev) {
+            double share = (double)(ev[i].t - prev) / 1e6 / nact; unsigned j;
+            busy += (double)(ev[i].t - prev) / 1e6;
+            for (j = 0; j < nact; j++) g_prof_top[g_prof_iv[act[j]].k].xms += share;
+        }
+        prev = ev[i].t;
+        if (ev[i].open) act[nact++] = ev[i].iv;
+        else { unsigned j; for (j = 0; j < nact; j++) if (act[j] == ev[i].iv) { act[j] = act[--nact]; break; } }
+    }
+    free(ev); free(act); g_prof_niv = 0;
+    return busy;
+}
 static void mad_prof_report(double frames) {
-    unsigned a, b, m; double total = 0;
+    unsigned a, b, m; double total = 0, busy;
     if (g_prof_on <= 0 || frames <= 0) return;
     AcquireSRWLockExclusive(&g_prof_lock);
+    busy = mad_prof_exclusive();
     for (a = 0; a < g_prof_ntop; a++) total += g_prof_top[a].ms;
-    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes can overlap; %.3f ns/tick); %ld passes timed, %ld NOT timed; "
+    d3d12_log("[perf] pass-top: %.2f ms/frame of pass time over %u pass names (passes overlap: %.2f ms/frame is exclusive, the GPU busy time between the first and last pass; %.3f ns/tick); %ld passes timed, %ld NOT timed; "
               "%.1f compute encoders/frame split per pipeline for timing\n",
-              total / frames, g_prof_ntop, g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0, (long)g_prof_timed, (long)g_prof_missed,
+              total / frames, g_prof_ntop, busy / frames, g_prof_tick_sum > 0 ? g_prof_ns_sum / g_prof_tick_sum : 0.0, (long)g_prof_timed, (long)g_prof_missed,
               g_prof_csplits / frames);
     g_prof_timed = g_prof_missed = 0; g_prof_csplits = 0;
     for (a = 0; a < g_prof_ntop && a < 25; a++) {
-        for (m = a, b = a + 1; b < g_prof_ntop; b++) if (g_prof_top[b].ms > g_prof_top[m].ms) m = b;
+        for (m = a, b = a + 1; b < g_prof_ntop; b++) if (g_prof_top[b].xms > g_prof_top[m].xms) m = b;
         if (m != a) { char t[sizeof g_prof_top[0]]; memcpy(t, &g_prof_top[a], sizeof t); memcpy(&g_prof_top[a], &g_prof_top[m], sizeof t); memcpy(&g_prof_top[m], t, sizeof t); }
-        d3d12_log("[perf] pass-top %2u: %6.2f ms/frame %5.1f%% in %5.1f passes/frame: %s\n", a + 1, g_prof_top[a].ms / frames,
-                  total > 0 ? 100.0 * g_prof_top[a].ms / total : 0.0, g_prof_top[a].n / frames, g_prof_top[a].name);
+        d3d12_log("[perf] pass-top %2u: %6.2f ms/frame %5.1f%% in %5.1f passes/frame, exclusive %6.2f ms/frame: %s\n", a + 1, g_prof_top[a].ms / frames,
+                  total > 0 ? 100.0 * g_prof_top[a].ms / total : 0.0, g_prof_top[a].n / frames, g_prof_top[a].xms / frames, g_prof_top[a].name);
     }
     g_prof_ntop = 0;
     ReleaseSRWLockExclusive(&g_prof_lock);
@@ -2694,7 +2735,7 @@ static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd
             d3d12_log("[capture-cs] p%u: root %s r%u space%u va=0x%llx -> %s size %llu +%llu\n", i,
                       p->type == MADEIRA_IR_PARAM_CBV ? "CBV" : p->type == MADEIRA_IR_PARAM_SRV ? "SRV" : "UAV", p->shader_register, p->register_space,
                       (unsigned long long)va, r ? (r->name ? r->name : "buffer") : "NOTHING LIVE", r ? (unsigned long long)r->size : 0ull, (unsigned long long)off);
-            if (r && r->buffer && p->type == MADEIRA_IR_PARAM_CBV) mad_capture_buffer(e, benc, r, off, 1024, "cb", i, seq);
+            if (r && r->buffer && p->type == MADEIRA_IR_PARAM_CBV) mad_capture_buffer(e, benc, r, off, 4096, "cb", i, seq);
             else if (r && r->buffer && g_capture_cs_buf)   /* wine-lab port: capture-cs-buf-kb */
                 mad_capture_buffer(e, benc, r, off, g_capture_cs_buf, p->type == MADEIRA_IR_PARAM_SRV ? "srvb" : "uavb_in", i, seq);
             continue;
@@ -2742,7 +2783,7 @@ static void mad_capture_dispatch_inputs(struct mad_exec *e, const struct mad_cmd
                                   rg->range_type == 1 ? 'u' : rg->range_type == 2 ? 'b' : 't', reg, rg->register_space,
                                   br ? (br->name ? br->name : "buffer") : "NOTHING LIVE", br ? (unsigned long long)br->size : 0ull,
                                   (unsigned long long)boff, (unsigned long long)de->metadata, (de->metadata >> 63) ? " (typed)" : "");
-                        if (br && br->buffer && rg->range_type == MADEIRA_IR_RANGE_CBV) mad_capture_buffer(e, benc, br, boff, 1024, "cb", i * 1000 + off + k, seq);
+                        if (br && br->buffer && rg->range_type == MADEIRA_IR_RANGE_CBV) mad_capture_buffer(e, benc, br, boff, 4096, "cb", i * 1000 + off + k, seq);
                         else if (br && br->buffer && g_capture_cs_buf && (rg->range_type == MADEIRA_IR_RANGE_SRV || rg->range_type == MADEIRA_IR_RANGE_UAV))
                             mad_capture_buffer(e, benc, br, boff, g_capture_cs_buf, rg->range_type == MADEIRA_IR_RANGE_SRV ? "srvb" : "uavb_in",
                                                i * 1000 + off + k, seq);   /* wine-lab port: capture-cs-buf-kb */

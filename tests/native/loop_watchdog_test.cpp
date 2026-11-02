@@ -54,20 +54,25 @@ static unsigned convert(const void *b, size_t n)
     return 0;
 }
 
-static void run(const char *name, const void *b, size_t n)
+/* min_clamped / min_guarded: what the rewrite must have done with the loops (a zero minimum asserts nothing). */
+static void run(const char *name, const void *b, size_t n, unsigned min_clamped = 0, unsigned min_guarded = 0)
 {
     madeira_dxil_rewrite_opts o = {};
     madeira_dxil_rewrite_info inf;
     void *nb = nullptr;
     size_t nl = 0;
     o.loop_cap = kCap;
+    o.loop_clamp = 1;
     CHECK(madeira_dxil_shader_kind(b, n) == 5, "%s: a compute shader", name);
     auto t0 = std::chrono::steady_clock::now();
     int rc = madeira_dxil_rewrite(b, n, &o, &nb, &nl, &inf);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
-    CHECK(rc == 1 && nb && inf.loops_guarded && !inf.loops_skipped,
-          "%s: %u loop(s) guarded, %u skipped (rc %d, %zu -> %zu bytes, %lld us)",
-          name, inf.loops_guarded, inf.loops_skipped, rc, n, nl, (long long)us);
+    CHECK(rc == 1 && nb && inf.loops_guarded + inf.loops_clamped && !inf.loops_skipped,
+          "%s: %u loop(s) clamped, %u counter-guarded, %u skipped (rc %d, %zu -> %zu bytes, %lld us)",
+          name, inf.loops_clamped, inf.loops_guarded, inf.loops_skipped, rc, n, nl, (long long)us);
+    if (min_clamped || min_guarded)
+        CHECK(inf.loops_clamped >= min_clamped && inf.loops_guarded >= min_guarded,
+              "%s: at least %u clamped and %u counter-guarded", name, min_clamped, min_guarded);
     unsigned before = convert(b, n);
     CHECK(before == 0, "%s: the original converts (code %u)", name, before);
     if (rc == 1 && nb) {
@@ -81,13 +86,16 @@ int main(int argc, char **argv)
 {
     setbuf(stdout, nullptr);   /* the converter can abort in teardown */
     printf("loop watchdog: converter %d.%d.%d, cap %u\n", IR_VERSION_MAJOR, IR_VERSION_MINOR, IR_VERSION_PATCH, kCap);
-    run("lw_cs_dxil", lw_cs_dxil, sizeof lw_cs_dxil);
+    /* loopwd.hlsl: two canonical counted loops (zero start, and start 4) are
+     * clamped; the step-2 loop and the data-dependent walk keep the counter. */
+    run("lw_cs_dxil", lw_cs_dxil, sizeof lw_cs_dxil, 2, 2);
     {   /* no loops: handed back untouched */
         madeira_dxil_rewrite_opts o = {};
         madeira_dxil_rewrite_info inf;
         void *nb = nullptr;
         size_t nl = 0;
         o.loop_cap = kCap;
+        o.loop_clamp = 1;
         int rc = madeira_dxil_rewrite(a64_vs_dxil, sizeof a64_vs_dxil, &o, &nb, &nl, &inf);
         CHECK(rc == 0 && !nb && !inf.loops_guarded, "a64_vs_dxil: no loops, nothing rewritten (rc %d)", rc);
     }

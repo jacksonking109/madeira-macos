@@ -5,10 +5,13 @@
  *  loop of a compute shader (src/unix/madeira_dxil_rewrite.cpp; madeira.cfg
  *  loop-watchdog, loop-watchdog-cap, default 1048576 passes per loop entry).
  *
- *  The kernel (loopwd.hlsl, DXIL from dxc in loopwd_dxil.h) runs two loops
- *  whose length comes from a buffer: a counted one (`for i < n`, folding an
- *  LCG into acc) and a data-dependent one (walk the LCG from a seed until it
- *  meets a target). Both are FINITE for every input this test feeds -- at most
+ *  The kernel (loopwd.hlsl, DXIL from dxc in loopwd_dxil.h) runs four loops
+ *  whose length comes from a buffer: three counted ones (`for i < n`, folding
+ *  an LCG into acc; the same from a non-zero start; and one with step 2) and
+ *  a data-dependent one (walk the LCG from a seed until it meets a target).
+ *  The first two are canonical counted loops, which the watchdog caps by
+ *  clamping the bound once; the step-2 loop and the walk keep the per-pass
+ *  counter. All are FINITE for every input this test feeds -- at most
  *  16.8 million passes each, on one threadgroup of four threads -- so even
  *  with loop-watchdog = 0 the dispatch ends (measured: 0.52 s on an M3 Pro,
  *  ~7 ms with the watchdog); nothing here can hang the GPU.
@@ -16,7 +19,8 @@
  *  Cases:
  *    1  normal bounds (hundreds of passes): every output exact
  *    2  "garbage" bounds (1 << 24 passes): the loops stop at the default cap,
- *       so acc holds exactly 1 << 20 LCG steps and the walk counts 1 << 20
+ *       so each accumulator holds exactly 1 << 20 LCG steps and the walk
+ *       counts 1 << 20
  *
  *  Exit code = number of failed checks (case 2 fails with loop-watchdog = 0
  *  or another cap; it still completes).
@@ -124,8 +128,8 @@ static ID3D12RootSignature *make_rs(void) {
     return r;
 }
 
-/* One dispatch of the kernel over `in`; the four outputs come back in out. */
-static BOOL dispatch(const struct input in[NT], UINT out[NT][4], double *ms) {
+/* One dispatch of the kernel over `in`; out[t] is the first pair of loops' results, out[NT + t] the second pair's. */
+static BOOL dispatch(const struct input in[NT], UINT out[2 * NT][4], double *ms) {
     void *p = NULL;
     const UINT consts[2] = { LCG_MUL, LCG_INC };
     LARGE_INTEGER f, t0, t1;
@@ -141,7 +145,7 @@ static BOOL dispatch(const struct input in[NT], UINT out[NT][4], double *ms) {
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(list, 2, ID3D12Resource_GetGPUVirtualAddress(outbuf));
     ID3D12GraphicsCommandList_Dispatch(list, 1, 1, 1);
     barrier(outbuf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, outbuf, 0, 16 * NT);
+    ID3D12GraphicsCommandList_CopyBufferRegion(list, rb, 0, outbuf, 0, 32 * NT);
     barrier(outbuf, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
@@ -152,7 +156,7 @@ static BOOL dispatch(const struct input in[NT], UINT out[NT][4], double *ms) {
     p = NULL;
     ID3D12Resource_Map(rb, 0, NULL, &p);
     if (!p) return FALSE;
-    memcpy(out, p, 16 * NT);
+    memcpy(out, p, 32 * NT);
     ID3D12Resource_Unmap(rb, 0, NULL);
     return TRUE;
 }
@@ -161,9 +165,9 @@ static UINT seed_of(int t) { return 0x01234567u * (UINT)(t + 1); }
 
 static void case_normal(void) {
     struct input in[NT];
-    UINT out[NT][4], k[NT];
+    UINT out[2 * NT][4], k[NT];
     double ms = 0;
-    int t, bad = 0;
+    int t, bad = 0, bad_extra = 0;
     printf("\n[1] normal bounds\n");
     for (t = 0; t < NT; t++) {
         k[t] = 500 + 11 * t;
@@ -181,13 +185,24 @@ static void case_normal(void) {
         }
     }
     CHECK(!bad, "counted loop and LCG walk exact on all %d threads (%d wrong)", NT, bad);
+    for (t = 0; t < NT; t++) {
+        UINT n = in[t].n;
+        UINT a2 = lcg_steps(in[t].seed ^ 0x5555u, n - 4);          /* j = 4 .. n-1 */
+        UINT a3 = lcg_steps(in[t].seed ^ 0xaaaau, (n + 1) / 2);    /* k = 0, 2, .. < n */
+        if (out[NT + t][0] != n || out[NT + t][1] != a2 || out[NT + t][2] != 2 * ((n + 1) / 2) || out[NT + t][3] != a3) {
+            if (!bad_extra++)
+                printf("        thread %d: got (j %u, a2 %#x, k %u, a3 %#x), expected (%u, %#x, %u, %#x)\n", t,
+                       out[NT + t][0], out[NT + t][1], out[NT + t][2], out[NT + t][3], n, a2, 2 * ((n + 1) / 2), a3);
+        }
+    }
+    CHECK(!bad_extra, "counted loops from a non-zero start and with step 2 exact on all %d threads (%d wrong)", NT, bad_extra);
 }
 
 static void case_huge(void) {
     struct input in[NT];
-    UINT out[NT][4];
+    UINT out[2 * NT][4];
     double ms = 0;
-    int t, bad_acc = 0, bad_walk = 0;
+    int t, bad_acc = 0, bad_walk = 0, bad_start = 0, bad_step = 0;
     printf("\n[2] garbage bounds: %u passes asked for, cap %u expected\n", HUGE_BOUND, DEFAULT_CAP);
     for (t = 0; t < NT; t++) {
         in[t].n = HUGE_BOUND; in[t].seed = seed_of(t); in[t].target = lcg_steps(in[t].seed, HUGE_BOUND); in[t].pad = 0;
@@ -205,7 +220,16 @@ static void case_huge(void) {
         if (out[t][2] != DEFAULT_CAP && !bad_walk++)
             printf("        thread %d: walk stopped after %u steps, expected %u\n", t, out[t][2], DEFAULT_CAP);
     }
+    for (t = 0; t < NT; t++) {
+        UINT s4 = lcg_steps(in[t].seed ^ 0x5555u, DEFAULT_CAP), s2 = lcg_steps(in[t].seed ^ 0xaaaau, DEFAULT_CAP);
+        if (out[NT + t][1] != s4 && !bad_start++)
+            printf("        thread %d: counted loop from 4 acc %#x, expected %#x (%u passes)\n", t, out[NT + t][1], s4, DEFAULT_CAP);
+        if (out[NT + t][3] != s2 && !bad_step++)
+            printf("        thread %d: step-2 loop acc %#x, expected %#x (%u passes)\n", t, out[NT + t][3], s2, DEFAULT_CAP);
+    }
     CHECK(!bad_acc, "counted loop stopped at the cap on all %d threads (%d wrong)", NT, bad_acc);
+    CHECK(!bad_start, "counted loop from a non-zero start stopped at the cap on all %d threads (%d wrong)", NT, bad_start);
+    CHECK(!bad_step, "step-2 loop (counter guard) stopped at the cap on all %d threads (%d wrong)", NT, bad_step);
     CHECK(!bad_walk, "LCG walk stopped at the cap on all %d threads (%d wrong)", NT, bad_walk);
 }
 

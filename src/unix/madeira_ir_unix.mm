@@ -1470,7 +1470,7 @@ static int mad_atomic64_enabled(void)
  * turns it off. MAD_LWD_VERSION and the cap go into the DXIL cache key of
  * every shader it guards; bump the version when the rewrite's output changes.
  * Returns the cap for a shader of this DXIL kind, or 0. */
-#define MAD_LWD_VERSION 1u
+#define MAD_LWD_VERSION 2u
 /* wine-lab port: madeira.cfg loop-watchdog-skip = <shader hashes, comma list>: shaders converted
  * WITHOUT the guard, so its per-iteration check does not slow them down (The Last of Us Part I's
  * deferred lighting: 14.3 -> 8.6 ms per frame). A hash is the 16-digit FNV-1a of the shader's
@@ -1891,15 +1891,16 @@ extern "C" int madeira_ir_convert_impl(struct madeira_ir_convert_args *a) {
             memset(&o, 0, sizeof o);
             o.atomic64 = a64;
             o.loop_cap = lwd_cap;
+            o.loop_clamp = 1;
             r = madeira_dxil_rewrite(src, src_len, &o, &rw_buf, &rw_len, &inf);
             if (r != 0 || inf.a64_left || inf.a64_refuse || inf.loops_skipped) {
                 uint64_t h = 1469598103934665603ull;   /* the ml1149 log's name for the shader */
                 mad_sc_hash_add(&h, (const void *)(uintptr_t)a->dxil, (size_t)a->dxil_len);
                 if (mad_rewrite_first_report(h)) {
-                    if (inf.loops_guarded || inf.loops_skipped)
-                        dprintf(2, "[madeira-ir] loop watchdog %016llx: %u loop(s) capped at %u passes per entry, "
+                    if (inf.loops_guarded || inf.loops_clamped || inf.loops_skipped)
+                        dprintf(2, "[madeira-ir] loop watchdog %016llx: %u loop(s) capped at %u passes per entry by a counter, %u by clamping a counted loop's bound, "
                                    "%u left unguarded (no exiting branch that every iteration passes)\n",
-                                (unsigned long long)h, inf.loops_guarded, lwd_cap, inf.loops_skipped);
+                                (unsigned long long)h, inf.loops_guarded, lwd_cap, inf.loops_clamped, inf.loops_skipped);
                     if (inf.a64_rewritten)
                         dprintf(2, "[madeira-ir] atomic64 %016llx: %u 64-bit atomics given a non-atomic old-value read "
                                    "(race: another invocation between the read and the atomic can be missed)%s%s\n",

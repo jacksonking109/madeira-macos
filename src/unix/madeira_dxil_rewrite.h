@@ -18,6 +18,7 @@ extern "C" {
 struct madeira_dxil_rewrite_opts {
     int atomic64;        /* 64-bit atomics whose old value is read get it from a load */
     uint32_t loop_cap;   /* loop watchdog: leave every loop after this many passes per entry; 0 = off */
+    int loop_clamp;      /* counted loops (0 up by 1 to an invariant bound) are capped by clamping the bound, not counting */
 };
 
 struct madeira_dxil_rewrite_info {
@@ -25,7 +26,8 @@ struct madeira_dxil_rewrite_info {
     unsigned a64_left;        /* 64-bit atomics left as they were: the converter still refuses them */
     int a64_refuse;           /* the converter would crash on the shader: refuse it unconverted */
     char a64_note[192];       /* why some were left, or why the shader is refused */
-    unsigned loops_guarded;   /* loops given an iteration cap */
+    unsigned loops_guarded;   /* loops given an iteration cap by a pass counter */
+    unsigned loops_clamped;   /* counted loops given a cap by clamping their bound */
     unsigned loops_skipped;   /* loops without an exiting branch every iteration passes */
 };
 

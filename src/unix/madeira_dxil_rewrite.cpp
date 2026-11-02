@@ -307,7 +307,73 @@ static bool find_dxil(const uint8_t *d, size_t len, const uint8_t **dxil, uint32
 
 /* ---- loop watchdog ---- */
 
-static void guard_loops(Module &m, uint32_t cap, unsigned *guarded, unsigned *skipped)
+/* A counted loop -- an i32 header phi that starts at a constant and goes up by
+ * exactly 1 on its one back edge, left through a compare of the phi (or its
+ * increment) with a loop-invariant bound that every pass makes -- is capped by
+ * clamping the bound once, in the preheader: the compare then reads
+ * `iv >= min(bound, start + cap)`. The loop keeps its shape and its single
+ * compare, which the counter below breaks (a second phi, an add and an or per
+ * pass: Apple's compiler stopped optimising the loop, 14.3 ms against 8.6 ms
+ * for TLOU Part I's CS_DeferredLighting). Same worst case as the counter:
+ * `cap` passes. A bound below the start exits at once instead of after 2^32
+ * passes of wrapping. Returns false for any other shape; the caller then
+ * counts. */
+static bool clamp_counted_loop(Loop *l, DominatorTree &dt, BranchInst *xbr, bool exit_on_true, uint32_t cap)
+{
+    BasicBlock *hdr = l->getHeader(), *pre = l->getLoopPreheader();
+    SmallVector<BasicBlock *, 2> latches;
+    l->getLoopLatches(latches);
+    auto *cmp = dyn_cast<ICmpInst>(xbr->getCondition());
+    if (!pre || latches.size() != 1 || !cmp || !cmp->getOperand(0)->getType()->isIntegerTy(32)) return false;
+    BasicBlock *latch = latches[0];
+
+    PHINode *iv = nullptr;
+    Value *next = nullptr;
+    ConstantInt *start = nullptr;
+    for (PHINode &p : hdr->phis()) {
+        if (!p.getType()->isIntegerTy(32) || p.getNumIncomingValues() != 2) continue;
+        auto *s = dyn_cast<ConstantInt>(p.getIncomingValueForBlock(pre));
+        auto *n = dyn_cast<BinaryOperator>(p.getIncomingValueForBlock(latch));
+        if (!s || !n || n->getOpcode() != Instruction::Add) continue;
+        auto *one = dyn_cast<ConstantInt>(n->getOperand(1));
+        if (n->getOperand(0) != &p || !one || !one->isOne()) continue;
+        iv = &p; next = n; start = s;
+        if (cmp->getOperand(0) == next || cmp->getOperand(1) == next || cmp->getOperand(0) == iv || cmp->getOperand(1) == iv) break;
+        iv = nullptr;
+    }
+    if (!iv) return false;
+
+    /* the compare as "exit when v <pred> bound" */
+    CmpInst::Predicate ep = exit_on_true ? cmp->getPredicate() : cmp->getInversePredicate();
+    Value *v = cmp->getOperand(0), *bound = cmp->getOperand(1);
+    if (v != iv && v != next) { std::swap(v, bound); ep = CmpInst::getSwappedPredicate(ep); }
+    if ((v != iv && v != next) || bound == iv || bound == next) return false;
+    if (auto *bi = dyn_cast<Instruction>(bound))
+        if (l->contains(bi->getParent())) return false;   /* not loop-invariant */
+
+    bool is_signed;
+    switch (ep) {
+    case CmpInst::ICMP_EQ: case CmpInst::ICMP_UGE: is_signed = false; break;
+    case CmpInst::ICMP_SGE: is_signed = true; break;
+    default: return false;
+    }
+    uint64_t lim = (uint64_t)start->getZExtValue() + cap;
+    if (lim > (is_signed ? 0x7fffffffull : 0xffffffffull)) return false;
+
+    IRBuilder<> b(pre->getTerminator());
+    Type *i32 = Type::getInt32Ty(l->getHeader()->getContext());
+    Value *limit = ConstantInt::get(i32, lim);
+    Value *small = is_signed ? b.CreateICmpSLT(bound, limit) : b.CreateICmpULT(bound, limit);
+    Value *clamped = b.CreateSelect(small, bound, limit, "wd.bound");
+    b.SetInsertPoint(xbr);
+    Value *c = exit_on_true ? (is_signed ? b.CreateICmpSGE(v, clamped) : b.CreateICmpUGE(v, clamped))
+                            : (is_signed ? b.CreateICmpSLT(v, clamped) : b.CreateICmpULT(v, clamped));
+    xbr->setCondition(c);
+    (void)dt;
+    return true;
+}
+
+static void guard_loops(Module &m, uint32_t cap, int clamp, unsigned *guarded, unsigned *clamped, unsigned *skipped)
 {
     Type *i32 = Type::getInt32Ty(m.getContext());
     for (Function &f : m) {
@@ -336,6 +402,7 @@ static void guard_loops(Module &m, uint32_t cap, unsigned *guarded, unsigned *sk
                 break;
             }
             if (!xbr) { (*skipped)++; continue; }
+            if (clamp && clamp_counted_loop(l, dt, xbr, exit_on_true, cap)) { (*clamped)++; continue; }
 
             /* passes = phi [0 from outside, passes + 1 around the back edges] */
             IRBuilder<> b(hdr, hdr->begin());
@@ -431,8 +498,8 @@ extern "C" int madeira_dxil_rewrite(const void *bc, size_t len, const struct mad
         changed |= n.rewritten != 0;
     }
     if (opts->loop_cap) {
-        guard_loops(**mod, opts->loop_cap, &info->loops_guarded, &info->loops_skipped);
-        changed |= info->loops_guarded != 0;
+        guard_loops(**mod, opts->loop_cap, opts->loop_clamp, &info->loops_guarded, &info->loops_clamped, &info->loops_skipped);
+        changed |= info->loops_guarded != 0 || info->loops_clamped != 0;
     }
     if (!changed) return 0;
 
