@@ -3890,6 +3890,10 @@ static int exec_arg_slot(struct mad_exec *e, obj_handle_t *buf, UINT64 *off) {
 static UINT64 mad_gpu_completed(struct mad_device *d) {
     return d->gpu_event ? MTLSharedEvent_signaledValue(d->gpu_event) : ~(UINT64)0;
 }
+/* wine-lab port: ExecuteIndirect at replay, per frame: each record goes through the whole per-draw path (upstream
+ * Madeira measured ~9,400 records a frame in RDR2 and added a fast path for records 1..n, indirect-fast) */
+static volatile LONG g_ind_calls, g_ind_records, g_ind_disp_records;
+static volatile LONG g_ring_new;   /* wine-lab port: chunks ever created (ml1150 line): growth = replays that never return theirs */
 static int mad_ring_chunk_get(struct mad_device *d, struct mad_ringchunk *out) {
     struct WMTBufferInfo bi;
     int got = 0;
@@ -3913,6 +3917,7 @@ static int mad_ring_chunk_get(struct mad_device *d, struct mad_ringchunk *out) {
     out->buf = MTLDevice_newBuffer(d->mtl_device, &bi);
     if (!out->buf || !bi.memory.ptr) return 0;
     out->cpu = bi.memory.ptr; out->gpu = bi.gpu_address; out->serial = 0;
+    InterlockedIncrement(&g_ring_new);
     return 1;
 }
 static void mad_ring_retire(struct mad_device *d, struct mad_list *l, UINT64 serial) {
@@ -6866,6 +6871,8 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
         case MC_DRAW_INDIRECT: case MC_DRAW_INDEXED_INDIRECT: case MC_DISPATCH_INDIRECT: {
             struct mad_cmd t = *c; UINT k;
             if (!c->u.ind.args || !c->u.ind.args->buffer) { e.skipped++; break; }
+            InterlockedIncrement(&g_ind_calls); InterlockedExchangeAdd(&g_ind_records, (LONG)c->u.ind.count);   /* wine-lab port */
+            if (c->kind == MC_DISPATCH_INDIRECT) InterlockedExchangeAdd(&g_ind_disp_records, (LONG)c->u.ind.count);
             for (k = 0; k < c->u.ind.count; k++) {
                 t.u.ind.off = c->u.ind.off + (UINT64)k * c->u.ind.stride;
                 if (c->kind == MC_DISPATCH_INDIRECT) exec_dispatch(&e, &t); else exec_draw(&e, &t);
@@ -6952,8 +6959,9 @@ static void mad_exec_list_impl(struct mad_queue *q, struct mad_stream *st, struc
                           cb / 1048576.0, cb / 1048576.0 / f, (long long)ch, ch / f);
             }
             if (e.q && e.q->device)
-                d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB\n",
-                          (unsigned long long)(MTLDevice_currentAllocatedSize(e.q->device->mtl_device) >> 20));
+                d3d12_log("[madeira-d3d12] ml1150 Metal currentAllocatedSize %llu MB; argument-ring chunks created %ld (%.0f MB)\n",
+                          (unsigned long long)(MTLDevice_currentAllocatedSize(e.q->device->mtl_device) >> 20), (long)g_ring_new,
+                          (double)g_ring_new * MAD_ARG_RING_BYTES / 1048576.0);
         }
     }
     {
@@ -7555,6 +7563,11 @@ static void mad_perf_present(void) {
                   g_perf_presents ? g_perf_gpu_union * 1000 / g_perf_presents : 0.0, g_perf_presents ? g_perf_wait_s * 1000 / g_perf_presents : 0.0);
         mad_ft_report();
         mad_perf_idle_report(g_perf_presents);
+        if (g_perf_presents) {   /* wine-lab port */
+            LONG ic = InterlockedExchange(&g_ind_calls, 0), ir = InterlockedExchange(&g_ind_records, 0), id = InterlockedExchange(&g_ind_disp_records, 0);
+            if (ic) d3d12_log("[perf] indirect per frame: %.1f ExecuteIndirect calls, %.0f records (%.0f draws, %.0f dispatches)\n", (double)ic / g_perf_presents,
+                              (double)ir / g_perf_presents, (double)(ir - id) / g_perf_presents, (double)id / g_perf_presents);
+        }
         if (g_perf_presents) {   /* wine-lab port: store-defer and gpu-pass-profile */
             LONG64 sk = InterlockedExchange64(&g_store_skipped, 0);
             if (g_store_defer > 0) d3d12_log("[perf] store-defer: %.1f MB/frame of render-target stores skipped (cleared next)\n", (double)sk / 1048576.0 / g_perf_presents);
