@@ -2314,15 +2314,16 @@ static obj_handle_t mad_prof_render(struct mad_exec *e, struct WMTRenderPassInfo
     r->rnd[slot] = 1;
     return madeira_render_encoder_sampled(e->cb, rpi, r->sb, 4 * slot, 4 * slot + 3, 1);
 }
-/* wine-lab port: madeira.cfg compute-concurrent = 1 makes compute encoders concurrent. A serial encoder runs every
+/* wine-lab port: madeira.cfg compute-concurrent (default 1; 0 = serial, as before) makes compute encoders concurrent. A serial encoder runs every
  * dispatch after the previous one has finished, which D3D12 asks for only across a barrier: TLOU1 deforms each mesh
  * in its own small dispatch (60+ a frame, 2-300 groups), and serial order leaves the GPU mostly idle between them
  * (native test of those sizes: serial 0.65 ms, concurrent 0.33, concurrent with a memory barrier between every
  * dispatch 0.44). Only game dispatches go into these encoders; a barrier that keeps one open (fence-chain 6,
- * f6-compute-open) becomes a memory barrier before the next dispatch (exec_dispatch). */
+ * f6-compute-open) becomes a memory barrier before the next dispatch (exec_dispatch). TLOU1: GPU -1.7 ms/frame, no
+ * visible change (11-02). */
 static int g_compute_conc = -1;
 static int mad_compute_conc_on(void) {
-    if (g_compute_conc < 0) { g_compute_conc = mad_cfg_int_pe("compute-concurrent", 0) ? 1 : 0;
+    if (g_compute_conc < 0) { g_compute_conc = mad_cfg_int_pe("compute-concurrent", 1) ? 1 : 0;
                               d3d12_log("[madeira-d3d12] compute-concurrent = %d (compute encoders %s)\n", g_compute_conc, g_compute_conc ? "concurrent, memory barriers at kept-open barriers" : "serial"); }
     return g_compute_conc;
 }
