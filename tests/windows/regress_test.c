@@ -39,6 +39,9 @@
  *       each maps and keeps its own bytes. D3D12 makes them ALIAS (one memory); here only
  *       DEFAULT heaps are Metal heaps, so they do not, which the runtime logs once
  *       ("placed resources overlap ... do NOT alias"). Printed as a KNOWN GAP, not counted.
+ *   10  Zero extents (2026-11-02, from upstream Madeira): a texture with width, height or array size 0, and a
+ *       buffer of width 0, are refused with E_INVALIDARG as D3D12 does. Metal aborts the whole process on a
+ *       zero-sized texture descriptor, so before the guard this case did not return at all.
  *
  *  Shaders are compiled at run time by Wine's d3dcompiler_47 (SM 5.0 DXBC, the
  *  airconv path ROTTR uses). Exit code = number of failed checks.
@@ -741,6 +744,27 @@ static void case_root_buffers(void) {
     ID3D12RootSignature_Release(rs);
 }
 
+static void case_zero_extent(void) {
+    static const struct { D3D12_RESOURCE_DIMENSION dim; UINT64 w; UINT h; UINT16 n; const char *what; } t[] = {
+        { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 64, 1, "2D texture, width 0" },
+        { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 0, 1, "2D texture, height 0" },
+        { D3D12_RESOURCE_DIMENSION_TEXTURE2D, 64, 64, 0, "2D texture, array size 0" },
+        { D3D12_RESOURCE_DIMENSION_BUFFER, 0, 1, 1, "buffer, width 0" },
+    };
+    D3D12_HEAP_PROPERTIES hp; D3D12_RESOURCE_DESC d; unsigned i;
+    printf("\n[10] zero extents are refused\n");
+    ZeroMemory(&hp, sizeof hp); hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    for (i = 0; i < sizeof t / sizeof t[0]; i++) {
+        ID3D12Resource *r = NULL; HRESULT hr;
+        ZeroMemory(&d, sizeof d);
+        d.Dimension = t[i].dim; d.Width = t[i].w; d.Height = t[i].h; d.DepthOrArraySize = t[i].n; d.MipLevels = 1; d.SampleDesc.Count = 1;
+        d.Format = t[i].dim == D3D12_RESOURCE_DIMENSION_BUFFER ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R8G8B8A8_UNORM;
+        d.Layout = t[i].dim == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        hr = ID3D12Device_CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void **)&r);
+        CHECK(hr == E_INVALIDARG && !r, "%s: E_INVALIDARG and no resource (%#lx)", t[i].what, hr);
+        if (r) ID3D12Resource_Release(r);
+    }
+}
 static void case_upload_alias(void) {
     D3D12_HEAP_DESC hd; D3D12_RESOURCE_DESC d; ID3D12Heap *heap = NULL; ID3D12Resource *a = NULL, *b = NULL;
     UINT32 *pa = NULL, *pb = NULL; HRESULT ha, hb;
@@ -818,6 +842,7 @@ int main(void) {
     case_ecl_pair(1);
     case_root_buffers();
     case_upload_alias();
+    case_zero_extent();
 done:
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails;

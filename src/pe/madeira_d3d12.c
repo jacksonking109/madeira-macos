@@ -10889,6 +10889,11 @@ static HRESULT mad_create_resource_at_impl(struct mad_device *d, D3D12_HEAP_TYPE
     struct mad_resource *r;
     HRESULT hr;
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN) { mad_refuse_log(desc, heap_type, "dimension UNKNOWN"); return E_INVALIDARG; }
+    /* wine-lab port (from upstream Madeira's d3d12-zero-extent-guard): D3D12 refuses a zero extent; Metal aborts the
+     * whole process on a texture descriptor with a zero width or height, so it must never get that far */
+    if (!desc->Width || (desc->Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && (!desc->Height || !desc->DepthOrArraySize))) {
+        mad_refuse_log(desc, heap_type, "zero width, height or depth/array size"); return E_INVALIDARG;
+    }
 
     r = calloc(1, sizeof *r);
     if (!r) return E_OUTOFMEMORY;
